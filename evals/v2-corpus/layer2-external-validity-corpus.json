@@ -19,10 +19,22 @@
     "cleanControlsCount": 3,
     "vulnerabilityFamiliesCount": 7,
     "conformance": {
-      "totalCasesRange": [12, 16],
-      "vulnerableCasesRange": [6, 8],
-      "fixedCounterpartsRange": [3, 4],
-      "cleanControlsRange": [3, 4],
+      "totalCasesRange": [
+        12,
+        16
+      ],
+      "vulnerableCasesRange": [
+        6,
+        8
+      ],
+      "fixedCounterpartsRange": [
+        3,
+        4
+      ],
+      "cleanControlsRange": [
+        3,
+        4
+      ],
       "minFamiliesRequired": 7,
       "passed": true
     }
@@ -58,7 +70,8 @@
         "status": "CONFIRMED_VALID",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "Authentic benchmark reproduction modeled after CWE-1333 and inspired by CVE-2020-28500; unanchored greedy whitespace repetition."
-      }
+      },
+      "blobSha256": "15cd80f2270fee66680e80238e93e83bed24cfee0ad7878d3ca3ad0a428c33cf"
     },
     {
       "caseId": "L2-02-FIX-INJECTION",
@@ -81,7 +94,8 @@
         "status": "CONFIRMED_VALID",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "Fixed benchmark counterpart validates complete elimination of regex backtracking mechanism."
-      }
+      },
+      "blobSha256": "2ae7d22114cb97e9186632467fb12fee70273c80bf98e3725bc506218d1a835f"
     },
     {
       "caseId": "L2-03-VULN-AUTHZ",
@@ -103,7 +117,8 @@
         "status": "CONFIRMED_VALID",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "Confirms missing multi-tenant membership validation boundary before data mutation in internal benchmark fixture."
-      }
+      },
+      "blobSha256": "806b85ed9eceda54b0896d7ec65f8e10305a17f1881e5766ca55a4c7a23e5ded"
     },
     {
       "caseId": "L2-04-FIX-AUTHZ",
@@ -125,7 +140,8 @@
         "status": "CONFIRMED_VALID",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "Validates that defenses lens correctly identifies the decisive authorization gate."
-      }
+      },
+      "blobSha256": "5127ebd45ba57edbad8d2c28eb9057180f9c3050018bfe8f0c12d86be1dbd0a2"
     },
     {
       "caseId": "L2-05-VULN-PATHTRAVERSAL",
@@ -148,7 +164,8 @@
         "status": "CONFIRMED_VALID",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "Benchmark reproduction of path traversal and zip-slip directory escape."
-      }
+      },
+      "blobSha256": "7179c8411d4efb13390655639b23d4ba862bfca1d8cfadf8212ac38fd4d7cf0c"
     },
     {
       "caseId": "L2-06-FIX-PATHTRAVERSAL",
@@ -171,7 +188,8 @@
         "status": "CONFIRMED_VALID",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "Confirms strict directory boundary verification suppressing false positives."
-      }
+      },
+      "blobSha256": "adba843ce35fcaea9a37b5877d25455af3999067e02fb2bc138b111e0171ecd6"
     },
     {
       "caseId": "L2-07-VULN-PROTOTYPEPOLLUTION",
@@ -194,7 +212,8 @@
         "status": "CONFIRMED_VALID",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "Missing key sanitizer on recursive property setter allows prototype modification."
-      }
+      },
+      "blobSha256": "eb8c0889e0327885868d9bc967b3c1a5f1563bb59319fa9bc4de72374889ba63"
     },
     {
       "caseId": "L2-08-FIX-PROTOTYPEPOLLUTION",
@@ -240,7 +259,8 @@
         "status": "CONFIRMED_VALID",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "Unsynchronized check-then-act across async I/O delay creates exploitable TOCTOU race condition in benchmark fixture."
-      }
+      },
+      "blobSha256": "bc518e858fb4db0e3fdcfa2af405db39fb7e255cf51e9aae2dd4082ff06fe90b"
     },
     {
       "caseId": "L2-10-VULN-SECRETS",
@@ -262,7 +282,8 @@
         "status": "CONFIRMED_VALID",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "High-entropy production credential committed directly in source code within internal benchmark."
-      }
+      },
+      "blobSha256": "f58f23698b0da651529cd7226340ad4652cc6fa6a479eaf2a65c989eead3ce6d"
     },
     {
       "caseId": "L2-11-VULN-SUPPLYCHAIN",
@@ -285,7 +306,8 @@
         "status": "CONFIRMED_VALID",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "Supply-chain HTTP client benchmark reproduction blindly forwarding confidential headers across origin boundaries."
-      }
+      },
+      "blobSha256": "04c4d8089bcebd493b2d8f56ceba484961a9b6c1b8b907f04f9f177dc74c6bc7"
     },
     {
       "caseId": "L2-12-CLEAN-LODASH-CLAMP",
@@ -307,7 +329,8 @@
         "status": "CONFIRMED_CLEAN",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "Synthetic negative control fixture verifying false-positive suppression on clean code (F08 Closure)."
-      }
+      },
+      "blobSha256": "7cc85f6b6b349a38f61f1278bb94fab69970a68c492899fe6e5a4c6238e2e03e"
     },
     {
       "caseId": "L2-13-CLEAN-MINIMIST-PARSE",
@@ -329,7 +352,8 @@
         "status": "CONFIRMED_CLEAN",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "Synthetic negative control fixture verifying parser lens recognizes Object.create(null) sanitization (F08 Closure)."
-      }
+      },
+      "blobSha256": "735db08614ba6622c61db083db54f386024e356b7cfc961d0001a1c525094a90"
     },
     {
       "caseId": "L2-14-CLEAN-TAR-HEADER",
@@ -351,7 +375,8 @@
         "status": "CONFIRMED_CLEAN",
         "adjudicatedBy": "AppSec Audit Panel",
         "rationale": "Synthetic negative control fixture ensuring filesystem lens does not flag purely in-memory buffer operations as path risks (F08 Closure)."
-      }
+      },
+      "blobSha256": "1efb0d48a85c0bf707d7765e3c76314645bd92091b5d61696b25d67dd50653fe"
     }
   ]
 }

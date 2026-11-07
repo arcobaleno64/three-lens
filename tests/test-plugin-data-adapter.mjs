@@ -1489,3 +1489,188 @@ test('PLUGIN_DATA Governance: R07 F-04 - withGovernanceLock enforces unified exc
   assert.equal(lockAcquiredInside, true);
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
+
+test('PLUGIN_DATA Governance: R08-B01 - WAL recovery strictly rejects path traversal / non-canonical targets', () => {
+  const tempDir = createTempDir('r08-b01-wal-path-');
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true
+  };
+
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const maliciousWal = {
+    txnId: 'TXN-ATTACK-01',
+    status: 'PREPARED',
+    journalPath: path.resolve(tempDir, '..', 'arbitrary-victim.txt'),
+    initialJournalSize: 0,
+    initialJournalExisted: false
+  };
+  fs.writeFileSync(txnPath, JSON.stringify(maliciousWal, null, 2), 'utf8');
+
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_PATH_TRAVERSAL_DETECTED/
+  );
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R08-B02 - Corrupted WAL fails closed without deletion under Default-Deny', () => {
+  const tempDir = createTempDir('r08-b02-wal-corrupt-');
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true
+  };
+
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  fs.writeFileSync(txnPath, 'NOT_VALID_JSON{:::broken', 'utf8');
+
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_CORRUPTION_DETECTED/
+  );
+
+  // Assert fail-closed: WAL is NOT deleted
+  assert.equal(fs.existsSync(txnPath), true);
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R08-B04 - Registry history gap and tail deletion anti-rollback', () => {
+  const tempDir = createTempDir('r08-b04-anti-rollback-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  // 1. Initialize v1 and v2
+  const v1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: auth.keyId,
+    activeKeyFingerprint: auth.fp,
+    activePublicKeyPem: auth.pem,
+    keyType: 'ed25519',
+    pinnedSince: '2026-10-16T06:55:39.565Z',
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{ keyId: auth.keyId, keyFingerprint: auth.fp, publicKeyPem: auth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' }]
+  };
+  saveTrustRegistry(v1, opts);
+
+  const v2 = createAuthorizedRegistryUpdate(v1, {}, auth.keyId, auth.privateKey);
+  saveTrustRegistry(v2, opts);
+
+  const v3 = createAuthorizedRegistryUpdate(v2, {}, auth.keyId, auth.privateKey);
+  saveTrustRegistry(v3, opts);
+
+  const histDir = path.join(tempDir, 'history');
+  assert.equal(fs.existsSync(path.join(histDir, 'trust-registry.v1.json')), true);
+  assert.equal(fs.existsSync(path.join(histDir, 'trust-registry.v2.json')), true);
+  assert.equal(fs.existsSync(path.join(histDir, 'trust-registry.v3.json')), true);
+
+  // Attack 1: Intermediate gap - delete v2
+  fs.unlinkSync(path.join(histDir, 'trust-registry.v2.json'));
+  assert.throws(
+    () => loadTrustRegistry(opts),
+    /HISTORY_GAP_DETECTED/
+  );
+
+  // Restore v2
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v2.json'), JSON.stringify(v2, null, 2) + '\n', 'utf8');
+  assert.equal(loadTrustRegistry(opts).valid, true);
+
+  // Attack 2: Tail deletion - revert disk to v2 and delete history v3
+  fs.writeFileSync(getTrustRegistryPath(opts), JSON.stringify(v2, null, 2) + '\n', 'utf8');
+  fs.unlinkSync(path.join(histDir, 'trust-registry.v3.json'));
+
+  // Must detect rollback against checkpoint recorded registryVersion (3)
+  assert.throws(
+    () => loadTrustRegistry(opts),
+    /REGISTRY_ROLLBACK_DETECTED/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R08-B05 - Revoked keys rejected from authorizing registry updates', () => {
+  const auth = generateTestAuthority();
+  const delegateA = generateTestAuthority();
+
+  const v1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: auth.keyId,
+    activeKeyFingerprint: auth.fp,
+    activePublicKeyPem: auth.pem,
+    keyType: 'ed25519',
+    pinnedSince: '2026-10-16T06:55:39.565Z',
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [
+      { keyId: auth.keyId, keyFingerprint: auth.fp, publicKeyPem: auth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' },
+      { keyId: delegateA.keyId, keyFingerprint: delegateA.fp, publicKeyPem: delegateA.pem, status: 'ACTIVE', issuedAt: '2026-10-16T06:55:39.565Z' }
+    ]
+  };
+
+  // v2 revokes delegateA
+  const v2 = createAuthorizedRegistryUpdate(
+    v1,
+    {
+      revokedKeyIds: [delegateA.keyId],
+      keys: [
+        { keyId: auth.keyId, keyFingerprint: auth.fp, publicKeyPem: auth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' },
+        { keyId: delegateA.keyId, keyFingerprint: delegateA.fp, publicKeyPem: delegateA.pem, status: 'REVOKED', issuedAt: '2026-10-16T06:55:39.565Z' }
+      ]
+    },
+    auth.keyId,
+    auth.privateKey
+  );
+
+  // Attempting to create v3 using revoked delegateA key must throw
+  assert.throws(
+    () => createAuthorizedRegistryUpdate(v2, {}, delegateA.keyId, delegateA.privateKey),
+    /REVOKED_KEY_AUTHORIZATION_REJECTED/
+  );
+
+  // Attempting to validate a forged v3 signed by delegateA against priorRegistry v2 must fail
+  const forgedV3 = {
+    ...v2,
+    registryVersion: 3,
+    authorizationProof: {
+      authorizedBy: delegateA.keyId,
+      signature: crypto.sign(null, Buffer.from('test', 'utf8'), delegateA.privateKey).toString('hex')
+    }
+  };
+  const val = validateTrustRegistry(forgedV3, { priorRegistry: v2, trustedRootKeyId: auth.keyId, trustedRootPublicKeyPem: auth.pem });
+  assert.equal(val.valid, false);
+  assert.ok(val.error.includes('[REVOKED_KEY_AUTHORIZATION_REJECTED]'));
+});
+
+test('PLUGIN_DATA Governance: R08-B07 - Atomic stale lock reclamation cleans up dead lock without race', () => {
+  const tempDir = createTempDir('r08-b07-stale-lock-');
+  const targetFile = path.join(tempDir, 'resource.txt');
+  const lockFile = `${targetFile}.lock`;
+
+  // Create an artificially stale lock with dead PID (999999) and mtime 60s in the past
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999, timestamp: Date.now() - 60000, lockId: 'STALE-999' }), 'utf8');
+  const oldTime = (Date.now() - 60000) / 1000;
+  fs.utimesSync(lockFile, oldTime, oldTime);
+
+  let executed = false;
+  const res = withFileLock(targetFile, () => {
+    executed = true;
+    return 'ACQUIRED_AFTER_STALE_RECLAMATION';
+  }, { staleLockTimeoutMs: 1000 });
+
+  assert.equal(executed, true);
+  assert.equal(res, 'ACQUIRED_AFTER_STALE_RECLAMATION');
+  assert.equal(fs.existsSync(lockFile), false);
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});

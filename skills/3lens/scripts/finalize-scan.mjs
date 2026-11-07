@@ -2980,8 +2980,21 @@ export function finalizeScan({
 
     if (!compactGuardResult && env) {
       const expectedRepoRootFp = repoRoot ? crypto.createHash('sha256').update(path.resolve(repoRoot), 'utf8').digest('hex') : null;
-      const trustedToolDigest = compactOptions?.expectedToolManifestDigest || effectiveToolProvenance?.toolIntegrityDigest || null;
-      if (preCompactionState?.toolManifestDigest && trustedToolDigest && preCompactionState.toolManifestDigest !== trustedToolDigest) {
+      // R08-B03: Runtime tool provenance is authoritative under Default-Deny.
+      // Expected tool digest passed via compactOptions cannot override runtime provenance;
+      // any divergence between caller expectation and runtime provenance is a conflict failure.
+      const runtimeToolDigest = effectiveToolProvenance?.toolIntegrityDigest || null;
+      const expectedCallerDigest = compactOptions?.expectedToolManifestDigest || null;
+      if (runtimeToolDigest && expectedCallerDigest && runtimeToolDigest !== expectedCallerDigest) {
+        compactGuardResult = {
+          valid: false,
+          error: `[TOOL_DIGEST_AUTHORITY_CONFLICT] Caller expectedToolManifestDigest (${expectedCallerDigest}) conflicts with authoritative runtime tool provenance (${runtimeToolDigest})`,
+          status: 'UNCHECKABLE',
+          envelope: env
+        };
+      }
+      const trustedToolDigest = runtimeToolDigest || expectedCallerDigest || null;
+      if (!compactGuardResult && preCompactionState?.toolManifestDigest && trustedToolDigest && preCompactionState.toolManifestDigest !== trustedToolDigest) {
         compactGuardResult = {
           valid: false,
           error: `Pre-compaction state toolManifestDigest (${preCompactionState.toolManifestDigest}) does not match trusted runtime tool provenance (${trustedToolDigest})`,
@@ -3553,8 +3566,11 @@ export function finalizeScan({
     (contextDrift && contextDrift.hasDrift && ['THREAT_MODEL_REVIEW_REQUIRED', 'CONTEXT_DRIFT'].includes(contextDrift.status))
   );
 
-  // R6-P0-01 & R11-P0-01: Six-Pillar Assurance Gates (extended with M54-P2-F06 compactGate)
-  const compactGate = !compactGuardResult || compactGuardResult.valid === true;
+  // R6-P0-01 & R11-P0-01: Six-Pillar Assurance Gates (extended with M54-P2-F06 compactGate & R08-B06)
+  // In compacted sessions, continuity requires VERIFIED status under Default-Deny; UNAUTHENTICATED fails compactGate
+  const compactGate = !isCompactedSessionEffective
+    ? (!compactGuardResult || compactGuardResult.valid === true)
+    : Boolean(compactGuardResult && compactGuardResult.valid === true && compactGuardResult.status === 'VERIFIED');
   const coverageGate = (coverageStatus === 'COMPLETE') && compactGate;
   const matrixGate = Boolean(matrixValidation.valid && isMatrixComplete);
   const findingGate = (confirmedCount === 0 && deferredCount === 0 && acceptedRiskCount === 0);

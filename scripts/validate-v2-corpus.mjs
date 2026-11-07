@@ -112,6 +112,7 @@ export function validateV2Corpus(corpusPath = path.join(REPO_ROOT, 'evals/v2-cor
     'upstreamRepo',
     'commitSha',
     'targetFile',
+    'blobSha256',
     'targetSink',
     'expectedDisposition',
     'expectedSeverity',

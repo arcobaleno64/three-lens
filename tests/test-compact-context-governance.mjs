@@ -262,7 +262,8 @@ test('Compact Governance: F06 - finalizeScan accepts valid CASE envelope', () =>
     }
   });
 
-  assert.equal(resUnsigned.summary.gates.compactGate, true);
+  // R08-B06: In compacted session, UNAUTHENTICATED envelope fails compactGate under Default-Deny
+  assert.equal(resUnsigned.summary.gates.compactGate, false);
   assert.equal(resUnsigned.compactGuard.valid, true);
   assert.equal(resUnsigned.compactGuard.status, 'UNAUTHENTICATED');
 
@@ -472,4 +473,45 @@ test('Compact Governance: R07 F-06 - CASE signature payload binds signedBy and r
   const tamperedRes = validateCompactedStateEnvelope(tamperedSignedByEnv, {}, { verifierPublicKey });
   assert.equal(tamperedRes.valid, false);
   assert.ok(tamperedRes.error.includes('Cryptographic signature verification failed'));
+});
+
+test('Compact Governance: R08-B03 - finalizeScan rejects conflict between caller expectedToolManifestDigest and authoritative runtime provenance', () => {
+  const scanRunId = 'scan-run-r08-b03';
+  const executionNonce = 'NONCE-LEGAL-R08';
+  const runtimeDigest = '0e8304a3977f26417792906eb4e34edfbad60b4832ba4832311f986fd7e35f95';
+  const conflictingCallerDigest = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  const verifierPublicKey = publicKey.export({ type: 'spki', format: 'pem' });
+
+  const signedEnv = createCompactedStateEnvelope({
+    scanRunId,
+    executionNonce,
+    toolManifestDigest: runtimeDigest,
+    repoRootFingerprint: ''
+  }, {
+    signerPrivateKey: privateKey,
+    signerKeyId: 'KEY-SUPERVISOR-TEST'
+  });
+
+  const res = finalizeScan({
+    repoRoot: process.cwd(),
+    scanRunId,
+    nonce: executionNonce,
+    toolProvenance: { toolIntegrityDigest: runtimeDigest },
+    compactOptions: {
+      verifierPublicKey,
+      expectedToolManifestDigest: conflictingCallerDigest
+    },
+    compactedAuditEnvelope: signedEnv,
+    preCompactionState: {
+      scanRunId,
+      executionNonce,
+      toolManifestDigest: runtimeDigest
+    }
+  });
+
+  assert.equal(res.summary.gates.compactGate, false);
+  assert.equal(res.compactGuard.valid, false);
+  assert.equal(res.compactGuard.status, 'UNCHECKABLE');
+  assert.ok(res.compactGuard.error.includes('[TOOL_DIGEST_AUTHORITY_CONFLICT]'));
 });
