@@ -3914,7 +3914,9 @@ export function validateCrossFormatParity({
   }
 
   if (loadedSarif?.runs?.[0]?.results && typeof loadedMarkdown === 'string') {
-    const sarifCount = loadedSarif.runs[0].results.length;
+    const sarifCount = loadedSarif.runs[0].results.filter(
+      r => !r.properties?.disposition || r.properties.disposition === 'REPORTABLE'
+    ).length;
     const match = loadedMarkdown.match(/- \*\*Confirmed Vulnerabilities \(Reportable\)\*\*:\s*(\d+)/);
     if (match) {
       const mdCount = parseInt(match[1], 10);
