@@ -339,18 +339,29 @@ export function withFileLock(targetFile, fn, options = {}) {
         try {
           const stats = fs.statSync(lockFile);
           if (Date.now() - stats.mtimeMs > staleTimeoutMs) {
-            // R08-B07: Atomic stale lock reclamation to eliminate TOCTOU race
+            // R08-B07 / R09-B03: Authenticated two-phase stale lock reclamation
             const reclaimLockFile = `${lockFile}.reclaim`;
+            const reclaimLockId = crypto.randomBytes(8).toString('hex');
             let reclaimFd = null;
             try {
               reclaimFd = fs.openSync(reclaimLockFile, 'wx');
-              fs.writeFileSync(reclaimFd, JSON.stringify({ pid: process.pid, timestamp: Date.now() }), 'utf8');
+              fs.writeFileSync(reclaimFd, JSON.stringify({ pid: process.pid, timestamp: Date.now(), reclaimLockId }), 'utf8');
             } catch (recErr) {
               if (recErr.code === 'EEXIST') {
                 try {
                   const recStat = fs.statSync(reclaimLockFile);
                   if (Date.now() - recStat.mtimeMs > 3000) {
-                    try { fs.unlinkSync(reclaimLockFile); } catch {}
+                    try {
+                      const recRaw = fs.readFileSync(reclaimLockFile, 'utf8');
+                      const recParsed = JSON.parse(recRaw);
+                      // Only reclaim if holder PID is definitively dead
+                      if (recParsed.pid && !isPidAlive(recParsed.pid)) {
+                        const recheck = fs.readFileSync(reclaimLockFile, 'utf8');
+                        if (recheck === recRaw) {
+                          fs.unlinkSync(reclaimLockFile);
+                        }
+                      }
+                    } catch {}
                   }
                 } catch {}
               }
@@ -377,7 +388,15 @@ export function withFileLock(targetFile, fn, options = {}) {
                 }
               } finally {
                 try { fs.closeSync(reclaimFd); } catch {}
-                try { fs.unlinkSync(reclaimLockFile); } catch {}
+                try {
+                  if (fs.existsSync(reclaimLockFile)) {
+                    const content = fs.readFileSync(reclaimLockFile, 'utf8');
+                    const parsed = JSON.parse(content);
+                    if (parsed.reclaimLockId === reclaimLockId) {
+                      fs.unlinkSync(reclaimLockFile);
+                    }
+                  }
+                } catch {}
               }
               continue;
             }
@@ -465,83 +484,100 @@ export function recoverAbortedRevocationTransaction(options = {}) {
     throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Transaction WAL missing required fields (txnId, status)');
   }
 
-  if (txnData.status === 'PREPARED') {
-    const expectedJournalPath = getRevocationJournalPath(options);
-    const expectedCheckpointPath = getRevocationCheckpointPath(options);
-    const expectedRegPath = getTrustRegistryPath(options);
-    const histDir = path.join(dir, 'history');
+  // R09-B01: If a WAL file exists on disk, its status MUST be PREPARED to be recoverable.
+  // Any corrupted, unknown, or non-PREPARED status MUST fail closed under Default-Deny.
+  if (txnData.status !== 'PREPARED') {
+    throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Transaction WAL has invalid or unrecoverable status (${txnData.status}); refusing to proceed fail-closed`);
+  }
 
-    // R08-B01: Strict canonical path verification to prevent arbitrary file overwrite/deletion
-    if (txnData.journalPath && path.resolve(txnData.journalPath) !== path.resolve(expectedJournalPath)) {
-      throw new Error(`[TRANSACTION_WAL_PATH_TRAVERSAL_DETECTED] WAL journalPath (${txnData.journalPath}) does not match expected canonical path (${expectedJournalPath})`);
-    }
-    if (txnData.checkpointPath && path.resolve(txnData.checkpointPath) !== path.resolve(expectedCheckpointPath)) {
-      throw new Error(`[TRANSACTION_WAL_PATH_TRAVERSAL_DETECTED] WAL checkpointPath (${txnData.checkpointPath}) does not match expected canonical path (${expectedCheckpointPath})`);
-    }
-    if (txnData.regPath && path.resolve(txnData.regPath) !== path.resolve(expectedRegPath)) {
-      throw new Error(`[TRANSACTION_WAL_PATH_TRAVERSAL_DETECTED] WAL regPath (${txnData.regPath}) does not match expected canonical path (${expectedRegPath})`);
-    }
-    if (txnData.histPath) {
-      const resolvedHist = path.resolve(txnData.histPath);
-      if (
-        path.dirname(resolvedHist) !== path.resolve(histDir) ||
-        !/^trust-registry\.v\d+\.json$/.test(path.basename(resolvedHist))
-      ) {
-        throw new Error(`[TRANSACTION_WAL_PATH_TRAVERSAL_DETECTED] WAL histPath (${txnData.histPath}) escapes history directory or has invalid filename`);
-      }
-    }
+  const expectedJournalPath = getRevocationJournalPath(options);
+  const expectedCheckpointPath = getRevocationCheckpointPath(options);
+  const expectedRegPath = getTrustRegistryPath(options);
+  const histDir = path.join(dir, 'history');
 
-    try {
-      if (txnData.journalPath && typeof txnData.initialJournalSize === 'number') {
-        assertSafeStorageTarget(expectedJournalPath, options);
-        if (fs.existsSync(expectedJournalPath)) {
-          if (txnData.initialJournalSize === 0 && txnData.initialJournalExisted === false) {
-            fs.unlinkSync(expectedJournalPath);
-          } else {
-            fs.truncateSync(expectedJournalPath, txnData.initialJournalSize);
-          }
-        }
-      }
-      if (txnData.checkpointPath) {
-        assertSafeStorageTarget(expectedCheckpointPath, options);
-        if (txnData.initialCheckpointRawBase64) {
-          fs.writeFileSync(expectedCheckpointPath, Buffer.from(txnData.initialCheckpointRawBase64, 'base64'));
-        } else if (fs.existsSync(expectedCheckpointPath) && txnData.initialCheckpointExisted === false) {
-          fs.unlinkSync(expectedCheckpointPath);
-        }
-      }
-      if (txnData.regPath) {
-        assertSafeStorageTarget(expectedRegPath, options);
-        if (txnData.initialRegistryRawBase64) {
-          fs.writeFileSync(expectedRegPath, Buffer.from(txnData.initialRegistryRawBase64, 'base64'));
-        } else if (fs.existsSync(expectedRegPath) && txnData.initialRegistryExisted === false) {
-          fs.unlinkSync(expectedRegPath);
-        }
-      }
-      if (txnData.histPath) {
-        const canonicalHistPath = path.resolve(txnData.histPath);
-        assertSafeStorageTarget(canonicalHistPath, options);
-        if (txnData.initialHistRawBase64) {
-          fs.writeFileSync(canonicalHistPath, Buffer.from(txnData.initialHistRawBase64, 'base64'));
-        } else if (fs.existsSync(canonicalHistPath) && txnData.initialHistExisted === false) {
-          fs.unlinkSync(canonicalHistPath);
-        }
-      }
-      fs.unlinkSync(txnPath);
-      return { recovered: true, txnId: txnData.txnId };
-    } catch (recErr) {
-      if (recErr.message && recErr.message.includes('TRANSACTION_WAL_PATH_TRAVERSAL_DETECTED')) {
-        throw recErr;
-      }
-      txnData.status = 'CORRUPTED';
-      try {
-        fs.writeFileSync(txnPath, JSON.stringify(txnData, null, 2), 'utf8');
-      } catch (_) {}
-      throw new Error(`[TRANSACTION_CRASH_RECOVERY_FAILED] Failed to recover aborted transaction ${txnData.txnId}: ${recErr.message}`);
+  // R08-B01: Strict canonical path verification to prevent arbitrary file overwrite/deletion
+  if (txnData.journalPath && path.resolve(txnData.journalPath) !== path.resolve(expectedJournalPath)) {
+    throw new Error(`[TRANSACTION_WAL_PATH_TRAVERSAL_DETECTED] WAL journalPath (${txnData.journalPath}) does not match expected canonical path (${expectedJournalPath})`);
+  }
+  if (txnData.checkpointPath && path.resolve(txnData.checkpointPath) !== path.resolve(expectedCheckpointPath)) {
+    throw new Error(`[TRANSACTION_WAL_PATH_TRAVERSAL_DETECTED] WAL checkpointPath (${txnData.checkpointPath}) does not match expected canonical path (${expectedCheckpointPath})`);
+  }
+  if (txnData.regPath && path.resolve(txnData.regPath) !== path.resolve(expectedRegPath)) {
+    throw new Error(`[TRANSACTION_WAL_PATH_TRAVERSAL_DETECTED] WAL regPath (${txnData.regPath}) does not match expected canonical path (${expectedRegPath})`);
+  }
+  if (txnData.histPath) {
+    if (typeof txnData.histPath !== 'string') {
+      throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] WAL histPath must be string');
+    }
+    const resolvedHist = path.resolve(txnData.histPath);
+    if (
+      path.dirname(resolvedHist) !== path.resolve(histDir) ||
+      !/^trust-registry\.v\d+\.json$/.test(path.basename(resolvedHist))
+    ) {
+      throw new Error(`[TRANSACTION_WAL_PATH_TRAVERSAL_DETECTED] WAL histPath (${txnData.histPath}) escapes history directory or has invalid filename`);
     }
   }
 
-  return { recovered: false };
+  // R09-B01: Mandatory paths and sizes in PREPARED WAL
+  if (
+    !txnData.journalPath || typeof txnData.journalPath !== 'string' ||
+    !txnData.checkpointPath || typeof txnData.checkpointPath !== 'string' ||
+    !txnData.regPath || typeof txnData.regPath !== 'string' ||
+    typeof txnData.initialJournalSize !== 'number'
+  ) {
+    throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Transaction WAL PREPARED state missing required paths or sizes (journalPath, checkpointPath, regPath, initialJournalSize)');
+  }
+
+  try {
+    // R09-B02: Descriptor-bound truncate and safe atomic writes to eliminate TOCTOU race
+    if (fs.existsSync(expectedJournalPath)) {
+      if (txnData.initialJournalSize === 0 && txnData.initialJournalExisted === false) {
+        assertSafeStorageTarget(expectedJournalPath, options);
+        fs.unlinkSync(expectedJournalPath);
+      } else {
+        const journalFd = safeOpenStorageFile(expectedJournalPath, 'r+', 0o600, options);
+        try {
+          fs.ftruncateSync(journalFd, txnData.initialJournalSize);
+          fs.fsyncSync(journalFd);
+        } finally {
+          fs.closeSync(journalFd);
+        }
+      }
+    }
+    if (txnData.initialCheckpointRawBase64) {
+      safeWriteFileSync(expectedCheckpointPath, Buffer.from(txnData.initialCheckpointRawBase64, 'base64'), options);
+    } else if (fs.existsSync(expectedCheckpointPath) && txnData.initialCheckpointExisted === false) {
+      assertSafeStorageTarget(expectedCheckpointPath, options);
+      fs.unlinkSync(expectedCheckpointPath);
+    }
+    if (txnData.initialRegistryRawBase64) {
+      safeWriteFileSync(expectedRegPath, Buffer.from(txnData.initialRegistryRawBase64, 'base64'), options);
+    } else if (fs.existsSync(expectedRegPath) && txnData.initialRegistryExisted === false) {
+      assertSafeStorageTarget(expectedRegPath, options);
+      fs.unlinkSync(expectedRegPath);
+    }
+    if (txnData.histPath) {
+      const canonicalHistPath = path.resolve(txnData.histPath);
+      if (txnData.initialHistRawBase64) {
+        safeWriteFileSync(canonicalHistPath, Buffer.from(txnData.initialHistRawBase64, 'base64'), options);
+      } else if (fs.existsSync(canonicalHistPath) && txnData.initialHistExisted === false) {
+        assertSafeStorageTarget(canonicalHistPath, options);
+        fs.unlinkSync(canonicalHistPath);
+      }
+    }
+    assertSafeStorageTarget(txnPath, options);
+    fs.unlinkSync(txnPath);
+    return { recovered: true, txnId: txnData.txnId };
+  } catch (recErr) {
+    if (recErr.message && recErr.message.includes('TRANSACTION_WAL_PATH_TRAVERSAL_DETECTED')) {
+      throw recErr;
+    }
+    txnData.status = 'CORRUPTED';
+    try {
+      safeWriteFileSync(txnPath, JSON.stringify(txnData, null, 2), options);
+    } catch (_) {}
+    throw new Error(`[TRANSACTION_CRASH_RECOVERY_FAILED] Failed to recover aborted transaction ${txnData.txnId}: ${recErr.message}`);
+  }
 }
 
 /**

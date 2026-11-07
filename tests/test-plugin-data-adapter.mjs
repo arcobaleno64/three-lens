@@ -1674,3 +1674,63 @@ test('PLUGIN_DATA Governance: R08-B07 - Atomic stale lock reclamation cleans up 
   assert.equal(fs.existsSync(lockFile), false);
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
+
+test('PLUGIN_DATA Governance: R09-B01 - Non-PREPARED or corrupted WAL status fails closed on recovery', () => {
+  const tempDir = createTempDir('r09-b01-wal-status-');
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true
+  };
+
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+
+  // 1. Status 'CORRUPTED' must throw and refuse to proceed fail-closed
+  fs.writeFileSync(txnPath, JSON.stringify({ txnId: 'T1', status: 'CORRUPTED' }, null, 2), 'utf8');
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_CORRUPTION_DETECTED.*invalid or unrecoverable status \(CORRUPTED\)/
+  );
+
+  // 2. Status 'UNKNOWN' must throw fail-closed
+  fs.writeFileSync(txnPath, JSON.stringify({ txnId: 'T2', status: 'UNKNOWN' }, null, 2), 'utf8');
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_CORRUPTION_DETECTED.*invalid or unrecoverable status \(UNKNOWN\)/
+  );
+
+  // 3. Status 'PREPARED' with missing required paths must throw fail-closed
+  fs.writeFileSync(txnPath, JSON.stringify({ txnId: 'T3', status: 'PREPARED' }, null, 2), 'utf8');
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_CORRUPTION_DETECTED.*missing required paths or sizes/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R09-B03 - Stale reclaim lock with ALIVE PID is NOT unlinked', () => {
+  const tempDir = createTempDir('r09-b03-reclaim-alive-');
+  const targetFile = path.join(tempDir, 'resource.txt');
+  const lockFile = `${targetFile}.lock`;
+  const reclaimLockFile = `${lockFile}.reclaim`;
+
+  // Create an artificially stale lock with dead PID (999999)
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999, timestamp: Date.now() - 60000, lockId: 'DEAD-MAIN' }), 'utf8');
+  const oldTime = (Date.now() - 60000) / 1000;
+  fs.utimesSync(lockFile, oldTime, oldTime);
+
+  // Create a reclaim lock held by the CURRENT process (which is alive!)
+  fs.writeFileSync(reclaimLockFile, JSON.stringify({ pid: process.pid, timestamp: Date.now() - 5000, reclaimLockId: 'ALIVE-REC' }), 'utf8');
+  const reclaimOldTime = (Date.now() - 5000) / 1000;
+  fs.utimesSync(reclaimLockFile, reclaimOldTime, reclaimOldTime);
+
+  // Another process attempting to acquire should time out because reclaim lock is held by an ALIVE process
+  assert.throws(
+    () => withFileLock(targetFile, () => 'SHOULD_NOT_ACQUIRE', { lockTimeoutMs: 150, staleLockTimeoutMs: 1000 }),
+    /LOCK_TIMEOUT/
+  );
+
+  // Assert reclaim lock was NOT unlinked because PID is alive
+  assert.equal(fs.existsSync(reclaimLockFile), true);
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
