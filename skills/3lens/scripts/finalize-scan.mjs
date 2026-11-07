@@ -2980,10 +2980,20 @@ export function finalizeScan({
 
     if (!compactGuardResult && env) {
       const expectedRepoRootFp = repoRoot ? crypto.createHash('sha256').update(path.resolve(repoRoot), 'utf8').digest('hex') : null;
+      const trustedToolDigest = compactOptions?.expectedToolManifestDigest || effectiveToolProvenance?.toolIntegrityDigest || null;
+      if (preCompactionState?.toolManifestDigest && trustedToolDigest && preCompactionState.toolManifestDigest !== trustedToolDigest) {
+        compactGuardResult = {
+          valid: false,
+          error: `Pre-compaction state toolManifestDigest (${preCompactionState.toolManifestDigest}) does not match trusted runtime tool provenance (${trustedToolDigest})`,
+          status: 'UNCHECKABLE',
+          envelope: env
+        };
+      }
+
       const expectedContext = {
         scanRunId: executionRunId || manifestRunId || preCompactionState?.scanRunId || null,
         executionNonce: effectiveNonce || preCompactionState?.executionNonce || null,
-        toolManifestDigest: compactOptions?.expectedToolManifestDigest || preCompactionState?.toolManifestDigest || effectiveToolProvenance?.toolIntegrityDigest || null,
+        toolManifestDigest: trustedToolDigest || preCompactionState?.toolManifestDigest || null,
         repoRootFingerprint: compactOptions?.requireRepoRootFingerprint
           ? expectedRepoRootFp
           : (env?.repoRootFingerprint ? expectedRepoRootFp : (preCompactionState?.repoRootFingerprint || null))
@@ -3015,7 +3025,20 @@ export function finalizeScan({
           if (!safeCheck.safe) {
             compactGuardResult = { valid: false, error: safeCheck.error, status: 'UNCHECKABLE', envelope: env };
           } else {
-            compactGuardResult = { valid: true, error: null, status: 'VERIFIED', envelope: env };
+            // Round 07 F-06: Under Default-Deny, VERIFIED status requires verified cryptographic signature
+            const hasVerifiedSig = (validation.signatureValid === true) || (env?.signature && compactOptions?.verifierPublicKey);
+            if (hasVerifiedSig) {
+              compactGuardResult = { valid: true, error: null, status: 'VERIFIED', envelope: env };
+            } else if (compactOptions?.requireSignature) {
+              compactGuardResult = {
+                valid: false,
+                error: 'Compacted state envelope requires verified cryptographic signature under Default-Deny (F-06)',
+                status: 'UNCHECKABLE',
+                envelope: env
+              };
+            } else {
+              compactGuardResult = { valid: true, error: null, status: 'UNAUTHENTICATED', envelope: env };
+            }
           }
         } else if (env?.signature && compactOptions?.verifierPublicKey) {
           compactGuardResult = { valid: true, error: null, status: 'VERIFIED', envelope: env };
@@ -5261,25 +5284,45 @@ if (isDirectExecution) {
       }
 
       let compactedAuditEnvelope = null;
-      if (compactEnvelopePathArg && fs.existsSync(compactEnvelopePathArg)) {
+      if (compactEnvelopePathArg) {
+        if (!fs.existsSync(compactEnvelopePathArg)) {
+          console.error(`[COMPACT-GUARD] Specified --compact-envelope file does not exist: ${compactEnvelopePathArg}`);
+          process.exit(1);
+        }
         try {
           compactedAuditEnvelope = JSON.parse(fs.readFileSync(compactEnvelopePathArg, 'utf8'));
-        } catch {}
+        } catch (err) {
+          console.error(`[COMPACT-GUARD] Specified --compact-envelope failed to parse as JSON: ${err.message}`);
+          process.exit(1);
+        }
       } else if (fs.existsSync(path.resolve(repoRoot, 'scratch/compacted-audit-envelope.json'))) {
         try {
           compactedAuditEnvelope = JSON.parse(fs.readFileSync(path.resolve(repoRoot, 'scratch/compacted-audit-envelope.json'), 'utf8'));
-        } catch {}
+        } catch (err) {
+          console.error(`[COMPACT-GUARD] Scratch compacted-audit-envelope.json failed to parse as JSON: ${err.message}`);
+          process.exit(1);
+        }
       }
 
       let preCompactionState = null;
-      if (preCompactionStatePathArg && fs.existsSync(preCompactionStatePathArg)) {
+      if (preCompactionStatePathArg) {
+        if (!fs.existsSync(preCompactionStatePathArg)) {
+          console.error(`[COMPACT-GUARD] Specified --pre-compaction-state file does not exist: ${preCompactionStatePathArg}`);
+          process.exit(1);
+        }
         try {
           preCompactionState = JSON.parse(fs.readFileSync(preCompactionStatePathArg, 'utf8'));
-        } catch {}
+        } catch (err) {
+          console.error(`[COMPACT-GUARD] Specified --pre-compaction-state failed to parse as JSON: ${err.message}`);
+          process.exit(1);
+        }
       } else if (fs.existsSync(path.resolve(repoRoot, 'scratch/pre-compaction-state.json'))) {
         try {
           preCompactionState = JSON.parse(fs.readFileSync(path.resolve(repoRoot, 'scratch/pre-compaction-state.json'), 'utf8'));
-        } catch {}
+        } catch (err) {
+          console.error(`[COMPACT-GUARD] Scratch pre-compaction-state.json failed to parse as JSON: ${err.message}`);
+          process.exit(1);
+        }
       }
 
       let compactVerifierPublicKey = null;

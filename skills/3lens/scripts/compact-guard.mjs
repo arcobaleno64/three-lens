@@ -103,9 +103,10 @@ export function createCompactedStateEnvelope(state, options = {}) {
   };
 
   if (options.signerPrivateKey) {
-    const signPayload = Buffer.from(`${envelope.scanRunId}:${envelope.executionNonce}:${envelope.stateDigest}:${envelope.persistedStateDigest}`, 'utf8');
+    const signedBy = options.signerKeyId || 'SUPERVISOR_ROOT';
+    const signPayload = Buffer.from(`${envelope.scanRunId}:${envelope.executionNonce}:${envelope.stateDigest}:${envelope.persistedStateDigest}:${signedBy}`, 'utf8');
     envelope.signature = crypto.sign(null, signPayload, options.signerPrivateKey).toString('hex');
-    envelope.signedBy = options.signerKeyId || 'SUPERVISOR_ROOT';
+    envelope.signedBy = signedBy;
   }
 
   return envelope;
@@ -322,8 +323,9 @@ export function validateCompactedStateEnvelope(envelope, expectedContext = {}, o
         error: 'Signature present on envelope but options.verifierPublicKey was not provided for verification (F05 / R04-B04)'
       };
     }
+    const signedBy = envelope.signedBy || 'SUPERVISOR_ROOT';
     const signPayload = Buffer.from(
-      `${envelope.scanRunId}:${envelope.executionNonce}:${envelope.stateDigest}:${envelope.persistedStateDigest}`,
+      `${envelope.scanRunId}:${envelope.executionNonce}:${envelope.stateDigest}:${envelope.persistedStateDigest}:${signedBy}`,
       'utf8'
     );
     const isValidSig = crypto.verify(
@@ -337,7 +339,7 @@ export function validateCompactedStateEnvelope(envelope, expectedContext = {}, o
     }
   }
 
-  return { valid: true, error: null };
+  return { valid: true, error: null, signatureValid: !!envelope.signature };
 }
 
 /**

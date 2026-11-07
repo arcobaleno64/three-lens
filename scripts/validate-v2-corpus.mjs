@@ -22,6 +22,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
@@ -176,12 +177,26 @@ export function validateV2Corpus(corpusPath = path.join(REPO_ROOT, 'evals/v2-cor
         }
       }
 
+      if (c.blobSha256) {
+        const fileContent = fs.readFileSync(diskPath);
+        const actualSha = crypto.createHash('sha256').update(fileContent).digest('hex');
+        if (actualSha !== c.blobSha256) {
+          errors.push(`${prefix}: Target file SHA-256 '${actualSha}' does not match declared blobSha256 '${c.blobSha256}' (Round 07 F-05)`);
+        }
+      }
+
       if (c.commitSha) {
         try {
-          execFileSync('git', ['cat-file', '-e', `${c.commitSha}:${c.targetFile}`], {
+          const gitBlob = execFileSync('git', ['cat-file', '-p', `${c.commitSha}:${c.targetFile}`], {
             cwd: REPO_ROOT,
-            stdio: ['ignore', 'ignore', 'pipe']
+            stdio: ['ignore', 'pipe', 'pipe']
           });
+          if (c.blobSha256) {
+            const gitSha = crypto.createHash('sha256').update(gitBlob).digest('hex');
+            if (gitSha !== c.blobSha256) {
+              errors.push(`${prefix}: Target file in git commit '${c.commitSha}' has SHA-256 '${gitSha}', which diverges from declared blobSha256 '${c.blobSha256}' (Round 07 F-05)`);
+            }
+          }
         } catch {
           errors.push(`${prefix}: Target file '${c.targetFile}' does not exist in git commit object '${c.commitSha}' (R04-B06)`);
         }

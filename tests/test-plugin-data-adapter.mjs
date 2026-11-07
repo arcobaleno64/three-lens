@@ -18,6 +18,10 @@ import {
   withFileLock,
   createAuthorizedRegistryUpdate,
   safeOpenStorageFile,
+  GOVERNANCE_LOCK_TARGET,
+  REVOCATION_TXN_FILE,
+  withGovernanceLock,
+  recoverAbortedRevocationTransaction,
   REVOCATION_TYPES,
   EMBEDDED_ROOT_REGISTRY,
   DEFAULT_SUPERVISOR_KEY_ID,
@@ -891,10 +895,10 @@ test('PLUGIN_DATA Governance: R04-B05 - loadRevocationJournal acquires lock even
   const journalPath = getRevocationJournalPath(opts);
   assert.equal(fs.existsSync(journalPath), false);
 
-  // Simulate an active writer currently holding the lock while creating journal
-  const lockDir = path.dirname(journalPath);
+  // Simulate an active writer currently holding the unified governance lock while creating journal
+  const lockDir = tempDir;
   if (!fs.existsSync(lockDir)) fs.mkdirSync(lockDir, { recursive: true });
-  const lockPath = `${journalPath}.lock`;
+  const lockPath = path.join(lockDir, `${GOVERNANCE_LOCK_TARGET}.lock`);
 
   const lockContent = JSON.stringify({
     pid: process.pid,
@@ -1302,5 +1306,186 @@ test('PLUGIN_DATA Governance: R06 Signer Authority - appendRevocationEntry rejec
     /KEY_MISMATCH_REJECTED/
   );
 
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R07 F-01 - History directory deletion or missing genesis history fails closed', () => {
+  const tempDir = createTempDir('r07-f01-hist-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp
+  };
+
+  const v1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: auth.keyId,
+    activeKeyFingerprint: auth.fp,
+    activePublicKeyPem: auth.pem,
+    keyType: 'ed25519',
+    pinnedSince: '2026-10-16T06:55:39.565Z',
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{ keyId: auth.keyId, keyFingerprint: auth.fp, publicKeyPem: auth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' }]
+  };
+
+  saveTrustRegistry(v1, opts);
+  const loaded = loadTrustRegistry(opts);
+  assert.equal(loaded.valid, true);
+
+  // 1. Delete history/ directory completely -> must fail closed with HISTORY_DELETION_DETECTED
+  const histDir = path.join(tempDir, 'history');
+  fs.rmSync(histDir, { recursive: true, force: true });
+  assert.throws(
+    () => loadTrustRegistry(opts),
+    /HISTORY_DELETION_DETECTED/
+  );
+
+  // 2. Re-create history/ without trust-registry.v1.json -> must fail closed with GENESIS_HISTORY_MISSING_FAIL_CLOSED
+  fs.mkdirSync(histDir, { recursive: true });
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v2.json'), JSON.stringify(v1), 'utf8');
+  assert.throws(
+    () => loadTrustRegistry(opts),
+    /GENESIS_HISTORY_MISSING_FAIL_CLOSED/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R07 F-03 - Simulated failure in appendRevocationEntry triggers full rollback and clears WAL', () => {
+  const tempDir = createTempDir('r07-f03-rollback-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  // Initial valid append
+  const first = appendRevocationEntry(
+    { revocationType: REVOCATION_TYPES.NONCE_REVOCATION, targetId: 'NONCE-INITIAL' },
+    opts
+  );
+  assert.equal(first.entryIndex, 0);
+
+  const journalPath = getRevocationJournalPath(opts);
+  const initialJournalContent = fs.readFileSync(journalPath, 'utf8');
+  const initialCheckpoint = fs.readFileSync(getRevocationCheckpointPath(opts), 'utf8');
+  const initialRegistry = fs.readFileSync(getTrustRegistryPath(opts), 'utf8');
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+
+  // Fail during REGISTRY_WRITE stage
+  assert.throws(
+    () => appendRevocationEntry(
+      { revocationType: REVOCATION_TYPES.NONCE_REVOCATION, targetId: 'NONCE-SHOULD-ROLLBACK' },
+      { ...opts, _simulateFailureStage: 'REGISTRY_WRITE' }
+    ),
+    /SIMULATED_FAILURE_REGISTRY_WRITE/
+  );
+
+  // Verify journal was truncated back to original
+  assert.equal(fs.readFileSync(journalPath, 'utf8'), initialJournalContent);
+  // Verify checkpoint was restored
+  assert.equal(fs.readFileSync(getRevocationCheckpointPath(opts), 'utf8'), initialCheckpoint);
+  // Verify registry was restored
+  assert.equal(fs.readFileSync(getTrustRegistryPath(opts), 'utf8'), initialRegistry);
+  // Verify WAL transaction marker is cleared
+  assert.equal(fs.existsSync(txnPath), false);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R07 F-03 - WAL Crash Recovery restores disk state on uncommitted transaction', () => {
+  const tempDir = createTempDir('r07-f03-wal-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  // Initial append
+  appendRevocationEntry(
+    { revocationType: REVOCATION_TYPES.NONCE_REVOCATION, targetId: 'NONCE-STABLE-1' },
+    opts
+  );
+
+  const journalPath = getRevocationJournalPath(opts);
+  const checkpointPath = getRevocationCheckpointPath(opts);
+  const regPath = getTrustRegistryPath(opts);
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+
+  const stableJournalBytes = fs.readFileSync(journalPath);
+  const stableCheckpointBytes = fs.readFileSync(checkpointPath);
+  const stableRegBytes = fs.readFileSync(regPath);
+
+  // Simulate an interrupted transaction by writing WAL with status 'PREPARED' and partial mutations
+  const txnData = {
+    txnId: 'SIMULATED-CRASH-TXN-1234',
+    status: 'PREPARED',
+    createdAt: new Date().toISOString(),
+    journalPath,
+    initialJournalSize: stableJournalBytes.length,
+    initialJournalExisted: true,
+    checkpointPath,
+    initialCheckpointRawBase64: stableCheckpointBytes.toString('base64'),
+    initialCheckpointExisted: true,
+    regPath,
+    initialRegistryRawBase64: stableRegBytes.toString('base64'),
+    initialRegistryExisted: true,
+    histPath: null,
+    initialHistRawBase64: null,
+    initialHistExisted: false
+  };
+  fs.writeFileSync(txnPath, JSON.stringify(txnData, null, 2), 'utf8');
+
+  // Corrupt journal by appending partial garbage
+  fs.appendFileSync(journalPath, '{"brokenLine": true}\n');
+
+  // Load journal -> should auto-trigger recovery, truncate journal, delete WAL, and succeed
+  const recovered = loadRevocationJournal(opts);
+  assert.equal(recovered.valid, true);
+  assert.equal(recovered.count, 1);
+  assert.equal(fs.existsSync(txnPath), false);
+  assert.equal(fs.readFileSync(journalPath).length, stableJournalBytes.length);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R07 F-04 - withGovernanceLock enforces unified exclusion across governance operations', () => {
+  const tempDir = createTempDir('r07-f04-gov-lock-');
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    lockTimeoutMs: 100
+  };
+
+  let lockAcquiredInside = false;
+  withGovernanceLock(opts, () => {
+    lockAcquiredInside = true;
+    const lockFile = path.join(tempDir, `${GOVERNANCE_LOCK_TARGET}.lock`);
+    assert.equal(fs.existsSync(lockFile), true);
+
+    // Concurrent call must timeout
+    assert.throws(
+      () => withGovernanceLock(opts, () => {}),
+      /LOCK_TIMEOUT|Timeout acquiring lock/
+    );
+  });
+
+  assert.equal(lockAcquiredInside, true);
   fs.rmSync(tempDir, { recursive: true, force: true });
 });

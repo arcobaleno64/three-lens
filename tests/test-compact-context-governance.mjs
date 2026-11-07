@@ -238,18 +238,23 @@ test('Compact Governance: F06 - finalizeScan accepts valid CASE envelope', () =>
   const scanRunId = 'scan-run-valid-999';
   const executionNonce = 'NONCE-LEGAL-777';
   const toolManifestDigest = '0e8304a3977f26417792906eb4e34edfbad60b4832ba4832311f986fd7e35f95';
-  const validEnvelope = createCompactedStateEnvelope({
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  const verifierPublicKey = publicKey.export({ type: 'spki', format: 'pem' });
+
+  // 1. Unsigned envelope -> UNAUTHENTICATED
+  const unsignedEnvelope = createCompactedStateEnvelope({
     scanRunId,
     executionNonce,
     toolManifestDigest,
     repoRootFingerprint: ''
   });
 
-  const res = finalizeScan({
+  const resUnsigned = finalizeScan({
     repoRoot: process.cwd(),
     scanRunId,
     nonce: executionNonce,
-    compactedAuditEnvelope: validEnvelope,
+    toolProvenance: { toolIntegrityDigest: toolManifestDigest },
+    compactedAuditEnvelope: unsignedEnvelope,
     preCompactionState: {
       scanRunId,
       executionNonce,
@@ -257,9 +262,38 @@ test('Compact Governance: F06 - finalizeScan accepts valid CASE envelope', () =>
     }
   });
 
-  assert.equal(res.summary.gates.compactGate, true);
-  assert.equal(res.compactGuard.valid, true);
-  assert.equal(res.compactGuard.status, 'VERIFIED');
+  assert.equal(resUnsigned.summary.gates.compactGate, true);
+  assert.equal(resUnsigned.compactGuard.valid, true);
+  assert.equal(resUnsigned.compactGuard.status, 'UNAUTHENTICATED');
+
+  // 2. Cryptographically signed envelope -> VERIFIED
+  const signedEnvelope = createCompactedStateEnvelope({
+    scanRunId,
+    executionNonce,
+    toolManifestDigest,
+    repoRootFingerprint: ''
+  }, {
+    signerPrivateKey: privateKey,
+    signerKeyId: 'KEY-SUPERVISOR-TEST'
+  });
+
+  const resSigned = finalizeScan({
+    repoRoot: process.cwd(),
+    scanRunId,
+    nonce: executionNonce,
+    toolProvenance: { toolIntegrityDigest: toolManifestDigest },
+    compactOptions: { verifierPublicKey },
+    compactedAuditEnvelope: signedEnvelope,
+    preCompactionState: {
+      scanRunId,
+      executionNonce,
+      toolManifestDigest
+    }
+  });
+
+  assert.equal(resSigned.summary.gates.compactGate, true);
+  assert.equal(resSigned.compactGuard.valid, true);
+  assert.equal(resSigned.compactGuard.status, 'VERIFIED');
 });
 
 test('Compact Governance: F05 - requireSignature fails closed when verifierPublicKey is omitted', () => {
@@ -309,6 +343,7 @@ test('Compact Governance: F06 - finalizeScan detects preCompactionState tamperin
     repoRoot: process.cwd(),
     scanRunId: originalState.scanRunId,
     nonce: originalState.executionNonce,
+    toolProvenance: { toolIntegrityDigest: originalState.toolManifestDigest },
     preCompactionState: originalState,
     compactedAuditEnvelope: tamperedEnv
   });
@@ -381,4 +416,60 @@ test('Compact Governance: R05-B05 - finalizeScan strictly fails closed to UNCHEC
   assert.equal(res.compactGuard.valid, false);
   assert.equal(res.compactGuard.status, 'UNCHECKABLE');
   assert.ok(res.compactGuard.error.includes('authoritative integrity basis') || res.compactGuard.error.includes('R05-B05'));
+});
+
+test('Compact Governance: R07 F-02 - finalizeScan rejects preCompactionState attempting to forge toolManifestDigest', () => {
+  const scanRunId = 'scan-run-f02';
+  const executionNonce = 'NONCE-F02';
+  const trustedDigest = '4181b74228073574f7368da52bacc3db859c4de81d9d257f59c8da9133960db9';
+  const forgedDigest = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef';
+
+  const envelope = createCompactedStateEnvelope({
+    scanRunId,
+    executionNonce,
+    toolManifestDigest: forgedDigest,
+    repoRootFingerprint: ''
+  });
+
+  const res = finalizeScan({
+    repoRoot: process.cwd(),
+    scanRunId,
+    nonce: executionNonce,
+    toolProvenance: { toolIntegrityDigest: trustedDigest },
+    compactedAuditEnvelope: envelope,
+    preCompactionState: {
+      scanRunId,
+      executionNonce,
+      toolManifestDigest: forgedDigest
+    }
+  });
+
+  assert.equal(res.summary.gates.compactGate, false);
+  assert.equal(res.compactGuard.valid, false);
+  assert.equal(res.compactGuard.status, 'UNCHECKABLE');
+  assert.ok(res.compactGuard.error.includes('does not match trusted runtime tool provenance'));
+});
+
+test('Compact Governance: R07 F-06 - CASE signature payload binds signedBy and rejects tampered signedBy', () => {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  const verifierPublicKey = publicKey.export({ type: 'spki', format: 'pem' });
+
+  const signedEnv = createCompactedStateEnvelope(VALID_SAMPLE_STATE, {
+    signerPrivateKey: privateKey,
+    signerKeyId: 'KEY-ORIGINAL-SIGNER'
+  });
+
+  // 1. Valid signature passes
+  const validRes = validateCompactedStateEnvelope(signedEnv, {}, { verifierPublicKey });
+  assert.equal(validRes.valid, true);
+  assert.equal(validRes.signatureValid, true);
+
+  // 2. Tampering with signedBy breaks signature verification
+  const tamperedSignedByEnv = {
+    ...signedEnv,
+    signedBy: 'KEY-FORGED-SIGNER'
+  };
+  const tamperedRes = validateCompactedStateEnvelope(tamperedSignedByEnv, {}, { verifierPublicKey });
+  assert.equal(tamperedRes.valid, false);
+  assert.ok(tamperedRes.error.includes('Cryptographic signature verification failed'));
 });
