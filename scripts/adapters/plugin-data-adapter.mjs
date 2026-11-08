@@ -39,6 +39,10 @@ export const ADAPTER_VERSION = '1.1.0';
 // Guarantees capability cannot escape via object cloning, closures, or Symbol forgery.
 const _governanceLockStorage = new AsyncLocalStorage();
 
+// R16-B02: Unexported module-private Symbol token for privileged internal witness storage access.
+// Guarantees external callers cannot forge internal write privileges via plain options properties.
+const INTERNAL_WITNESS_WRITE_TOKEN = Symbol('INTERNAL_WITNESS_WRITE_TOKEN');
+
 function canonicalizeDirPath(dir) {
   try {
     return fs.realpathSync(dir);
@@ -146,10 +150,13 @@ export function toRealNormalizedPath(p) {
  * @param {object} [options={}] - Options containing repoRoot or workspacePaths
  */
 export function assertSafeStorageTarget(targetPath, options = {}) {
-  // R15-B04: Strictly confine monotonic witness files against caller tampering via public storage APIs
+  // R15-B04 & R16-B02: Strictly confine monotonic witness files against caller tampering via public storage APIs.
+  // Privileged internal writes mandate the unexported module-private Symbol token; plain string flags are rejected.
   const baseName = path.basename(targetPath);
-  if ((baseName === '.monotonic-witness.json' || baseName.endsWith('.witness.json')) && options.__internalWitnessWrite !== true) {
-    throw new Error(`[STORAGE_CONFINEMENT_VIOLATION] Direct access to monotonic witness file (${targetPath}) is strictly forbidden via storage API`);
+  if (baseName === '.monotonic-witness.json' || baseName.endsWith('.witness.json')) {
+    if (!options || options[INTERNAL_WITNESS_WRITE_TOKEN] !== true) {
+      throw new Error(`[STORAGE_CONFINEMENT_VIOLATION] Direct access to monotonic witness file (${targetPath}) is strictly forbidden via storage API`);
+    }
   }
 
   const forbiddenRoots = [
@@ -833,9 +840,32 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
       }
       throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Failed to verify committed state for COMMITTED WAL: ${parseErr.message}`);
     }
-    // R15-B02: Update persistent monotonic witness BEFORE unlinking COMMITTED WAL marker
-    const curRegDigest = computeRegistryDigest(curReg);
-    updateMonotonicWitness(dir, curReg.registryVersion, txnData.committedHwmHeadIndex, txnData.committedHwmHeadDigest, curRegDigest, options);
+      // R16-B03: Comprehensive non-mutating validation of curReg and historical continuity before witness update
+      let effectivePriorReg = null;
+      if (curReg.registryVersion > 1) {
+        const priorHistPath = path.join(dir, 'history', `trust-registry.v${curReg.registryVersion - 1}.json`);
+        if (fs.existsSync(priorHistPath)) {
+          try {
+            effectivePriorReg = JSON.parse(fs.readFileSync(priorHistPath, 'utf8'));
+          } catch (_) {}
+        }
+      }
+      const regValidation = validateTrustRegistry(curReg, {
+        ...options,
+        priorRegistry: effectivePriorReg,
+        allowEmbeddedFallback: true,
+        failClosed: true
+      });
+      if (!regValidation.valid) {
+        throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL post-image registry failed validation: ${regValidation.error}`);
+      }
+
+      // Check curReg against witness freshness and historical continuity
+      const curRegDigest = computeRegistryDigest(curReg);
+      assertMonotonicWitnessFreshness(dir, curReg.registryVersion, txnData.committedHwmHeadIndex, txnData.committedHwmHeadDigest, curRegDigest, options);
+
+      // R15-B02 & R16-B03: Update persistent monotonic witness AFTER complete authorization & continuity validation
+      updateMonotonicWitness(dir, curReg.registryVersion, txnData.committedHwmHeadIndex, txnData.committedHwmHeadDigest, curRegDigest, options);
 
     assertSafeStorageTarget(txnPath, options);
     try {
@@ -1204,18 +1234,49 @@ export function computeRegistryAuthorizationPayload(registry) {
 }
 
 /**
+ * Computes canonical identity commitment payload for trust registry.
+ * Resolves R15-B03 & R16-B04: Binds schemaVersion, registryVersion, authority,
+ * activeKey, keys array, status, pinnedSince, rotationPolicy, keyType,
+ * validFrom, validUntil, complete authorizationProof (signerKeyId, signedAt, signature, priorRegistryVersion),
+ * and outer signature into a canonical domain-separated payload.
+ *
+ * @param {object} registry
+ * @returns {string} Domain-separated canonical string
+ */
+export function computeRegistryIdentityPayload(registry) {
+  if (!registry || typeof registry !== 'object') return '';
+  const authPayload = computeRegistryAuthorizationPayload(registry);
+  const normalizedProof = (registry.authorizationProof && typeof registry.authorizationProof === 'object')
+    ? {
+        signerKeyId: typeof registry.authorizationProof.signerKeyId === 'string' ? registry.authorizationProof.signerKeyId : '',
+        signedAt: typeof registry.authorizationProof.signedAt === 'string' ? registry.authorizationProof.signedAt : '',
+        signature: typeof registry.authorizationProof.signature === 'string' ? registry.authorizationProof.signature : '',
+        priorRegistryVersion: typeof registry.authorizationProof.priorRegistryVersion === 'number' ? registry.authorizationProof.priorRegistryVersion : 0
+      }
+    : null;
+  const identityObj = {
+    authPayload,
+    signature: typeof registry.signature === 'string' ? registry.signature : '',
+    pinnedSince: typeof registry.pinnedSince === 'string' ? registry.pinnedSince : '',
+    rotationPolicy: typeof registry.rotationPolicy === 'string' ? registry.rotationPolicy : '',
+    keyType: typeof registry.keyType === 'string' ? registry.keyType : '',
+    validFrom: typeof registry.validFrom === 'string' ? registry.validFrom : '',
+    validUntil: typeof registry.validUntil === 'string' ? registry.validUntil : '',
+    authorizationProof: normalizedProof
+  };
+  return 'TRUST_REGISTRY_COMMITMENT_V1:' + canonicalJsonStringify(identityObj);
+}
+
+/**
  * Computes canonical content digest for trust registry authority commitment.
- * Resolves R15-B03: Binds schemaVersion, registryVersion, authority, activeKey,
- * keys array, status, and authorization signature into a deterministic SHA-256 digest.
+ * Resolves R15-B03 & R16-B04: Deterministic SHA-256 digest over complete canonical identity commitment.
  *
  * @param {object} registry
  * @returns {string} SHA-256 hex digest
  */
 export function computeRegistryDigest(registry) {
   if (!registry || typeof registry !== 'object') return '';
-  const authPayload = computeRegistryAuthorizationPayload(registry);
-  const signature = typeof registry.signature === 'string' ? registry.signature : '';
-  return sha256Digest(authPayload + '|' + signature);
+  return sha256Digest(computeRegistryIdentityPayload(registry));
 }
 
 /**
@@ -1878,6 +1939,26 @@ function doLoadTrustRegistry(options = {}) {
             if (v > maxHistVersion) maxHistVersion = v;
             try {
               const histObj = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
+              // R16-B01: Verify historical registry against monotonic witness commitment
+              const curWitness = getMonotonicWitness(dir, options);
+              if (curWitness.registryDigests && curWitness.registryDigests[String(v)]) {
+                const histDigest = computeRegistryDigest(histObj);
+                if (histDigest !== curWitness.registryDigests[String(v)]) {
+                  const errorMsg = `[REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Historical registry ${hf} digest (${histDigest}) diverges from witnessed historical commitment (${curWitness.registryDigests[String(v)]})`;
+                  if (options.failClosed !== false) {
+                    throw new Error(errorMsg);
+                  }
+                  return {
+                    source: 'PLUGIN_DATA',
+                    registry: null,
+                    valid: false,
+                    error: errorMsg,
+                    cryptographicValidity: false,
+                    monotonicValidity: false,
+                    ancestryContinuity: false
+                  };
+                }
+              }
               if (v === parsed.registryVersion) {
                 sameVersionHistRegistry = histObj;
               }
@@ -1886,7 +1967,11 @@ function doLoadTrustRegistry(options = {}) {
                   highestHistHwmIndex = histObj.revocationHighWaterMark.headIndex;
                 }
               }
-            } catch (_) {}
+            } catch (histErr) {
+              if (histErr.message && (histErr.message.includes('REGISTRY_HISTORY_DIVERGENCE_DETECTED') || histErr.message.includes('MONOTONIC_WITNESS_DIVERGENCE_DETECTED'))) {
+                throw histErr;
+              }
+            }
           }
         }
 
@@ -2367,7 +2452,7 @@ export function getMonotonicWitness(dir, options = {}) {
       } catch (err) {
         throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} is corrupted or cannot be parsed: ${err.message}`);
       }
-      // R15-B04: Strict Schema Validation under Default-Deny
+      // R15-B04 & R16-B05: Strict Schema Validation & Semantic Integrity under Default-Deny
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
         throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} contains invalid JSON payload (must be object)`);
       }
@@ -2377,20 +2462,53 @@ export function getMonotonicWitness(dir, options = {}) {
       if (typeof raw.dir !== 'string' || !raw.dir.trim()) {
         throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing mandatory 'dir' string`);
       }
+      // R16-B05: Directory path semantic parity check against target storage dir
+      const normalizedWitnessDir = path.resolve(raw.dir);
+      const expectedDir = path.resolve(dir);
+      if (normalizedWitnessDir !== expectedDir) {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness directory '${normalizedWitnessDir}' diverges from expected storage directory '${expectedDir}'`);
+      }
       if (typeof raw.maxSeenRegistryVersion !== 'number' || !Number.isInteger(raw.maxSeenRegistryVersion) || raw.maxSeenRegistryVersion < 1) {
         throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'maxSeenRegistryVersion'`);
+      }
+      // R16-B05: maxSeenRegistryDigest must be 64-hex SHA-256
+      if (typeof raw.maxSeenRegistryDigest !== 'string' || !/^[a-f0-9]{64}$/.test(raw.maxSeenRegistryDigest)) {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'maxSeenRegistryDigest' (must be 64-hex SHA-256)`);
       }
       if (typeof raw.maxSeenHwmHeadIndex !== 'number' || !Number.isInteger(raw.maxSeenHwmHeadIndex) || raw.maxSeenHwmHeadIndex < -1) {
         throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'maxSeenHwmHeadIndex'`);
       }
-      if (typeof raw.maxSeenHwmHeadDigest !== 'string') {
-        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'maxSeenHwmHeadDigest'`);
-      }
-      if (typeof raw.maxSeenRegistryDigest !== 'string') {
-        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'maxSeenRegistryDigest'`);
+      // R16-B05: HWM index vs headDigest semantic consistency
+      if (raw.maxSeenHwmHeadIndex >= 0) {
+        if (typeof raw.maxSeenHwmHeadDigest !== 'string' || !/^[a-f0-9]{64}$/.test(raw.maxSeenHwmHeadDigest)) {
+          throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'maxSeenHwmHeadDigest' for index ${raw.maxSeenHwmHeadIndex}`);
+        }
+      } else {
+        if (raw.maxSeenHwmHeadDigest !== '') {
+          throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} has non-empty 'maxSeenHwmHeadDigest' for index -1`);
+        }
       }
       if (typeof raw.updatedAt !== 'string' || !raw.updatedAt.trim()) {
         throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'updatedAt'`);
+      }
+
+      // R16-B05: Strict dictionary structure & semantic validation for registryDigests
+      if (!raw.registryDigests || typeof raw.registryDigests !== 'object' || Array.isArray(raw.registryDigests)) {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'registryDigests' dictionary`);
+      }
+      for (const [v, d] of Object.entries(raw.registryDigests)) {
+        const vNum = parseInt(v, 10);
+        if (!Number.isInteger(vNum) || vNum < 1 || String(vNum) !== v) {
+          throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} contains invalid version key '${v}' in registryDigests`);
+        }
+        if (typeof d !== 'string' || !/^[a-f0-9]{64}$/.test(d)) {
+          throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} contains invalid digest format for version ${v} in registryDigests`);
+        }
+      }
+      // Ensure maxSeenRegistryVersion exists in registryDigests and matches maxSeenRegistryDigest
+      const maxVerKey = String(raw.maxSeenRegistryVersion);
+      if (raw.registryDigests[maxVerKey] !== raw.maxSeenRegistryDigest) {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} registryDigests[${maxVerKey}] does not match maxSeenRegistryDigest`);
       }
 
       // R15-B03: Check registry digest divergence at same version
@@ -2585,6 +2703,37 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
     }
   }
 
+  // R16-B01: Automatically seal all existing history registries on disk into witness.registryDigests
+  const histDir = path.join(dir, 'history');
+  if (fs.existsSync(histDir)) {
+    try {
+      const histFiles = fs.readdirSync(histDir);
+      for (const hf of histFiles) {
+        const m = hf.match(/^trust-registry\.v(\d+)\.json$/);
+        if (m) {
+          const v = m[1];
+          if (!witness.registryDigests[v]) {
+            try {
+              const histObj = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
+              witness.registryDigests[v] = computeRegistryDigest(histObj);
+              changed = true;
+            } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  // Ensure current maxSeenRegistryVersion is always present in witness.registryDigests
+  if (witness.maxSeenRegistryDigest && /^[a-f0-9]{64}$/.test(witness.maxSeenRegistryDigest)) {
+    if (!witness.registryDigests) witness.registryDigests = {};
+    const maxVerKey = String(witness.maxSeenRegistryVersion);
+    if (!witness.registryDigests[maxVerKey]) {
+      witness.registryDigests[maxVerKey] = witness.maxSeenRegistryDigest;
+      changed = true;
+    }
+  }
+
   const { localWitnessFile, systemWitnessFile } = getWitnessStoragePaths(dir);
   const writeWitness = (filePath) => {
     try {
@@ -2600,8 +2749,8 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
         maxSeenHwmHeadDigest: witness.maxSeenHwmHeadDigest || '',
         updatedAt: new Date().toISOString()
       }, null, 2) + '\n';
-      // R15-B04: Privileged internal write flag to satisfy safe storage confinement
-      safeWriteFileSync(filePath, payload, { ...options, __internalWitnessWrite: true });
+      // R15-B04 & R16-B02: Privileged internal write token to satisfy safe storage confinement
+      safeWriteFileSync(filePath, payload, { ...options, [INTERNAL_WITNESS_WRITE_TOKEN]: true });
     } catch (writeErr) {
       throw new Error(`[STORAGE_DURABILITY_FAILURE] Failed to persist monotonic witness at ${filePath}: ${writeErr.message}`);
     }
@@ -2638,26 +2787,83 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
     );
   }
 
-  // R15-B03: Check registryDigest divergence at same version
-  if (typeof candidateRegistryVersion === 'number' && candidateRegistryDigest) {
-    if (
-      candidateRegistryVersion === witness.maxSeenRegistryVersion &&
-      witness.maxSeenRegistryDigest &&
-      candidateRegistryDigest !== witness.maxSeenRegistryDigest
-    ) {
-      throw new Error(
-        `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate registry digest (${candidateRegistryDigest}) diverges from monotonic witness registryDigest (${witness.maxSeenRegistryDigest}) at registryVersion ${candidateRegistryVersion}`
-      );
+  // R15-B03 & R16-B01: Check registryDigest divergence for candidate and traverse historical ancestor commitments
+  if (typeof candidateRegistryVersion === 'number') {
+    // 1. Check candidate version if a witnessed digest exists
+    const candKey = String(candidateRegistryVersion);
+    if (witness.registryDigests && witness.registryDigests[candKey] && candidateRegistryDigest) {
+      if (candidateRegistryDigest !== witness.registryDigests[candKey]) {
+        throw new Error(
+          `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate registry digest (${candidateRegistryDigest}) diverges from witnessed digest (${witness.registryDigests[candKey]}) for registryVersion ${candidateRegistryVersion}`
+        );
+      }
+    } else if (candidateRegistryVersion === witness.maxSeenRegistryVersion && witness.maxSeenRegistryDigest && candidateRegistryDigest) {
+      if (candidateRegistryDigest !== witness.maxSeenRegistryDigest) {
+        throw new Error(
+          `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate registry digest (${candidateRegistryDigest}) diverges from monotonic witness registryDigest (${witness.maxSeenRegistryDigest}) at registryVersion ${candidateRegistryVersion}`
+        );
+      }
     }
-    const verKey = String(candidateRegistryVersion);
-    if (
-      witness.registryDigests &&
-      witness.registryDigests[verKey] &&
-      candidateRegistryDigest !== witness.registryDigests[verKey]
-    ) {
-      throw new Error(
-        `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate registry digest (${candidateRegistryDigest}) diverges from witnessed digest (${witness.registryDigests[verKey]}) for registryVersion ${candidateRegistryVersion}`
-      );
+
+    // 2. R16-B01: Traverse and verify ALL witnessed historical versions against on-disk history
+    if (witness.registryDigests && typeof witness.registryDigests === 'object') {
+      const histDir = path.join(dir, 'history');
+      for (const [vStr, expectedDigest] of Object.entries(witness.registryDigests)) {
+        const v = parseInt(vStr, 10);
+        // If candidate itself is this version, verify candidateRegistryDigest
+        if (v === candidateRegistryVersion && candidateRegistryDigest) {
+          if (candidateRegistryDigest !== expectedDigest) {
+            throw new Error(
+              `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate registry digest (${candidateRegistryDigest}) diverges from witnessed digest (${expectedDigest}) for registryVersion ${v}`
+            );
+          }
+        }
+        // If version is strictly prior to candidate, verify on-disk historical artifact
+        if (v < candidateRegistryVersion) {
+          const histPath = path.join(histDir, `trust-registry.v${v}.json`);
+          if (fs.existsSync(histPath)) {
+            try {
+              const histObj = JSON.parse(fs.readFileSync(histPath, 'utf8'));
+              const actualHistDigest = computeRegistryDigest(histObj);
+              if (actualHistDigest !== expectedDigest) {
+                throw new Error(
+                  `[REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Historical registry trust-registry.v${v}.json digest (${actualHistDigest}) diverges from monotonic witness historical commitment (${expectedDigest})`
+                );
+              }
+            } catch (readErr) {
+              if (readErr.message.includes('REGISTRY_HISTORY_DIVERGENCE_DETECTED') || readErr.message.includes('REGISTRY_DIVERGENCE_DETECTED')) throw readErr;
+              throw new Error(
+                `[REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Failed to verify historical registry at ${histPath}: ${readErr.message}`
+              );
+            }
+          } else {
+            // Check if prior version is currently residing in trust-registry.json (e.g. during saveTrustRegistry)
+            const currentRegPath = path.join(dir, 'trust-registry.json');
+            let foundInCurrent = false;
+            if (fs.existsSync(currentRegPath)) {
+              try {
+                const curObj = JSON.parse(fs.readFileSync(currentRegPath, 'utf8'));
+                if (curObj.registryVersion === v) {
+                  const actualDigest = computeRegistryDigest(curObj);
+                  if (actualDigest !== expectedDigest) {
+                    throw new Error(
+                      `[REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] On-disk trust registry version ${v} digest (${actualDigest}) diverges from monotonic witness historical commitment (${expectedDigest})`
+                    );
+                  }
+                  foundInCurrent = true;
+                }
+              } catch (curErr) {
+                if (curErr.message.includes('REGISTRY_HISTORY_DIVERGENCE_DETECTED')) throw curErr;
+              }
+            }
+            if (!foundInCurrent && candidateRegistryVersion > v) {
+              throw new Error(
+                `[HISTORY_GAP_DETECTED] [REGISTRY_HISTORY_DIVERGENCE_DETECTED] Required historical registry for version ${v} committed in monotonic witness is missing from ${histPath}`
+              );
+            }
+          }
+        }
+      }
     }
   }
 
