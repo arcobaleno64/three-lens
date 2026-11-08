@@ -4234,13 +4234,16 @@ test('PLUGIN_DATA Governance: R17-B03 - Registry Identity Digest commits to all 
     signature: 'original-outer-signature',
     authorizationProof: {
       authorizedBy: auth.keyId,
+      signerKeyId: auth.keyId,
       signature: 'original-proof-signature',
       timestamp: '2026-01-01T00:00:00.000Z',
+      signedAt: '2026-01-01T00:00:00.000Z',
       priorRegistryVersion: 0
     },
     revocationHighWaterMark: {
-      index: 0,
+      headIndex: 0,
       headDigest: 'c'.repeat(64),
+      updatedAt: '2026-01-01T00:00:00.000Z',
       signature: 'original-hwm-signature',
       authorizedBy: auth.keyId
     }
@@ -4253,15 +4256,46 @@ test('PLUGIN_DATA Governance: R17-B03 - Registry Identity Digest commits to all 
   mutatedAuthorizedBy.authorizationProof.authorizedBy = 'another-supervisor-key';
   assert.notStrictEqual(computeRegistryDigest(mutatedAuthorizedBy), baseDigest);
 
+  // Mutating signerKeyId must change digest
+  const mutatedSignerKeyId = JSON.parse(JSON.stringify(v1));
+  mutatedSignerKeyId.authorizationProof.signerKeyId = 'another-signer-key-id';
+  assert.notStrictEqual(computeRegistryDigest(mutatedSignerKeyId), baseDigest);
+
   // Mutating timestamp must change digest
   const mutatedTimestamp = JSON.parse(JSON.stringify(v1));
   mutatedTimestamp.authorizationProof.timestamp = '2026-11-08T12:00:00.000Z';
   assert.notStrictEqual(computeRegistryDigest(mutatedTimestamp), baseDigest);
 
+  // Mutating signedAt must change digest
+  const mutatedSignedAt = JSON.parse(JSON.stringify(v1));
+  mutatedSignedAt.authorizationProof.signedAt = '2026-11-08T12:00:00.000Z';
+  assert.notStrictEqual(computeRegistryDigest(mutatedSignedAt), baseDigest);
+
   // Mutating outer signature must change digest
   const mutatedSig = JSON.parse(JSON.stringify(v1));
   mutatedSig.signature = 'tampered-outer-signature';
   assert.notStrictEqual(computeRegistryDigest(mutatedSig), baseDigest);
+
+  // Mutating HWM fields (headIndex, headDigest, updatedAt, authorizedBy, signature) must each change digest
+  const mutatedHwmIndex = JSON.parse(JSON.stringify(v1));
+  mutatedHwmIndex.revocationHighWaterMark.headIndex = 1;
+  assert.notStrictEqual(computeRegistryDigest(mutatedHwmIndex), baseDigest);
+
+  const mutatedHwmDigest = JSON.parse(JSON.stringify(v1));
+  mutatedHwmDigest.revocationHighWaterMark.headDigest = 'd'.repeat(64);
+  assert.notStrictEqual(computeRegistryDigest(mutatedHwmDigest), baseDigest);
+
+  const mutatedHwmUpdatedAt = JSON.parse(JSON.stringify(v1));
+  mutatedHwmUpdatedAt.revocationHighWaterMark.updatedAt = '2026-11-08T12:00:00.000Z';
+  assert.notStrictEqual(computeRegistryDigest(mutatedHwmUpdatedAt), baseDigest);
+
+  const mutatedHwmAuthBy = JSON.parse(JSON.stringify(v1));
+  mutatedHwmAuthBy.revocationHighWaterMark.authorizedBy = 'another-hwm-signer';
+  assert.notStrictEqual(computeRegistryDigest(mutatedHwmAuthBy), baseDigest);
+
+  const mutatedHwmSig = JSON.parse(JSON.stringify(v1));
+  mutatedHwmSig.revocationHighWaterMark.signature = 'tampered-hwm-signature';
+  assert.notStrictEqual(computeRegistryDigest(mutatedHwmSig), baseDigest);
 });
 
 test('PLUGIN_DATA Governance: R17-E01 - Sparse witness with missing intermediate historical version is rejected fail-closed', () => {
@@ -4487,6 +4521,402 @@ test('PLUGIN_DATA Governance: R17-B04 - WAL signer rotated out or retired in cur
   assert.throws(
     () => recoverAbortedRevocationTransaction(opts),
     /RETIRED_KEY_AUTHORIZATION_REJECTED|TRANSACTION_WAL_SIGNER_UNTRUSTED/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R18-B01 - WAL signed by completely removed genesis root key is rejected fail-closed', () => {
+  const tempDir = createTempDir('r18-b01-removed-genesis-signer-');
+  const authA = generateTestAuthority();
+  const authB = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: authA.keyId,
+    trustedRootPublicKeyPem: authA.pem,
+    trustedRootFingerprint: authA.fp
+  };
+
+  // 1. Setup Genesis v1 with authA
+  const reg1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: authA.keyId,
+    activeKeyFingerprint: authA.fp,
+    activePublicKeyPem: authA.pem,
+    keys: [{
+      keyId: authA.keyId,
+      keyFingerprint: authA.fp,
+      publicKeyPem: authA.pem,
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: '2026-01-01T00:00:00.000Z'
+    }],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(reg1, opts);
+
+  // 2. Rotate to v2 with authB as active key, completely omitting authA from keys[]
+  const reg2 = createAuthorizedRegistryUpdate(
+    reg1,
+    {
+      activeKeyId: authB.keyId,
+      activeKeyFingerprint: authB.fp,
+      activePublicKeyPem: authB.pem,
+      keys: [
+        {
+          keyId: authB.keyId,
+          keyFingerprint: authB.fp,
+          publicKeyPem: authB.pem,
+          status: 'ACTIVE',
+          issuedAt: new Date().toISOString()
+        }
+      ]
+    },
+    authA.keyId,
+    authA.privateKey
+  );
+  saveTrustRegistry(reg2, opts);
+
+  // 3. Create a WAL signed by removed genesis root key authA
+  const walPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const walPayload = {
+    schemaVersion: '1.0.0',
+    txnId: 'tx-test-removed-genesis-signer',
+    pid: process.pid,
+    status: 'COMMITTED',
+    timestamp: new Date().toISOString(),
+    committedAt: new Date().toISOString(),
+    signedBy: authA.keyId,
+    journalPath: getRevocationJournalPath(opts),
+    checkpointPath: getRevocationCheckpointPath(opts),
+    regPath: getTrustRegistryPath(opts),
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: true,
+    initialRegistryVersion: 2,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: '',
+    committedHwmHeadIndex: -1,
+    committedHwmHeadDigest: '',
+    expectedTargetHwmHeadIndex: -1,
+    expectedTargetHwmHeadDigest: '',
+    expectedTargetRegistryVersion: 2
+  };
+  const walSignPayload = Buffer.from(computeTransactionWalSignPayload(walPayload), 'utf8');
+  walPayload.signature = crypto.sign(null, walSignPayload, authA.privateKey).toString('hex');
+  fs.writeFileSync(walPath, JSON.stringify(walPayload, null, 2) + '\n', 'utf8');
+
+  // Must fail closed with TRANSACTION_WAL_SIGNER_UNTRUSTED without falling back to trustedRootPublicKeyPem
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_SIGNER_UNTRUSTED|RETIRED_KEY_AUTHORIZATION_REJECTED/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R18-B02 - Same-version Registry digest advances when HWM headIndex strictly increments and rejects same-index divergence', () => {
+  const tempDir = createTempDir('r18-b02-hwm-digest-evolution-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp
+  };
+
+  // 1. Setup Genesis v1
+  const reg1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'test-auth',
+    activeKeyId: auth.keyId,
+    activeKeyFingerprint: auth.fp,
+    activePublicKeyPem: auth.pem,
+    keys: [{
+      keyId: auth.keyId,
+      keyFingerprint: auth.fp,
+      publicKeyPem: auth.pem,
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: '2026-01-01T00:00:00.000Z'
+    }],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(reg1, opts);
+  const w0 = getMonotonicWitness(tempDir, opts);
+  assert.strictEqual(w0.maxSeenRegistryVersion, 1);
+  assert.strictEqual(w0.maxSeenHwmHeadIndex, -1);
+
+  // 2. Append revocation entry 0 -> updates HWM in Registry v1 (headIndex: 0)
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'revoked-1',
+    reason: 'test 1'
+  }, { ...opts, signerKeyId: auth.keyId, signerPrivateKey: auth.privateKey });
+
+  const w1 = getMonotonicWitness(tempDir, opts);
+  assert.strictEqual(w1.maxSeenRegistryVersion, 1);
+  assert.strictEqual(w1.maxSeenHwmHeadIndex, 0);
+  // Registry digest at v1 legitimately evolved because HWM headIndex incremented from -1 to 0
+  assert.notStrictEqual(w1.maxSeenRegistryDigest, w0.maxSeenRegistryDigest);
+  assert.strictEqual(w1.registryDigests['1'], w1.maxSeenRegistryDigest);
+
+  // Verify loadTrustRegistry succeeds after HWM evolution
+  const loadedAfterHwm = loadTrustRegistry(opts);
+  assert.strictEqual(loadedAfterHwm.valid, true);
+
+  // 3. Mutate HWM updatedAt at the SAME headIndex (0) and re-sign HWM -> must be rejected as REGISTRY_DIVERGENCE_DETECTED
+  const regPath = getTrustRegistryPath(opts);
+  const histV1Path = path.join(tempDir, 'history', 'trust-registry.v1.json');
+  const curDiskReg = JSON.parse(fs.readFileSync(regPath, 'utf8'));
+  curDiskReg.revocationHighWaterMark.updatedAt = '2029-01-01T00:00:00.000Z';
+  const hwmSignPayload = Buffer.from(JSON.stringify({
+    domain: 'THREE_LENS_REVOCATION_HWM_V1',
+    registryVersion: curDiskReg.registryVersion,
+    headIndex: curDiskReg.revocationHighWaterMark.headIndex,
+    headDigest: curDiskReg.revocationHighWaterMark.headDigest,
+    updatedAt: curDiskReg.revocationHighWaterMark.updatedAt,
+    authorizedBy: auth.keyId
+  }), 'utf8');
+  curDiskReg.revocationHighWaterMark.signature = crypto.sign(null, hwmSignPayload, auth.privateKey).toString('hex');
+  const mutatedRaw = JSON.stringify(curDiskReg, null, 2) + '\n';
+  fs.writeFileSync(regPath, mutatedRaw, 'utf8');
+  fs.writeFileSync(histV1Path, mutatedRaw, 'utf8');
+
+  assert.throws(
+    () => loadTrustRegistry(opts),
+    /REGISTRY_DIVERGENCE_DETECTED/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R18-B03 - getMonotonicWitness returns frozen deep clone and externalMonotonicWitness cannot poison shared memory state', () => {
+  const tempDir = createTempDir('r18-b03-witness-immutability-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp
+  };
+
+  const reg1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'test-auth',
+    activeKeyId: auth.keyId,
+    activeKeyFingerprint: auth.fp,
+    activePublicKeyPem: auth.pem,
+    keys: [{
+      keyId: auth.keyId,
+      keyFingerprint: auth.fp,
+      publicKeyPem: auth.pem,
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: '2026-01-01T00:00:00.000Z'
+    }],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(reg1, opts);
+
+  // 1. Verify returned witness and registryDigests map are frozen
+  const w1 = getMonotonicWitness(tempDir, opts);
+  assert.strictEqual(Object.isFrozen(w1), true);
+  assert.strictEqual(Object.isFrozen(w1.registryDigests), true);
+  assert.throws(() => {
+    w1.maxSeenRegistryVersion = 999999;
+  }, TypeError);
+  assert.throws(() => {
+    w1.registryDigests['1'] = '0'.repeat(64);
+  }, TypeError);
+
+  // 2. Call getMonotonicWitness with untrusted high externalMonotonicWitness
+  const extWitness = getMonotonicWitness(tempDir, {
+    ...opts,
+    externalMonotonicWitness: {
+      minRegistryVersion: 1000000,
+      minHwmHeadIndex: 500000
+    }
+  });
+  assert.strictEqual(extWitness.maxSeenRegistryVersion, 1000000);
+  assert.strictEqual(extWitness.maxSeenHwmHeadIndex, 500000);
+
+  // 3. Subsequent normal getMonotonicWitness and loadTrustRegistry MUST NOT be poisoned by externalMonotonicWitness
+  const w2 = getMonotonicWitness(tempDir, opts);
+  assert.strictEqual(w2.maxSeenRegistryVersion, 1);
+  assert.strictEqual(w2.maxSeenHwmHeadIndex, -1);
+
+  const loaded = loadTrustRegistry(opts);
+  assert.strictEqual(loaded.valid, true);
+  assert.strictEqual(loaded.registry.registryVersion, 1);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R18-B04 - WAL recovery accepts historical journal entry from retired/removed key within its active HWM window and rejects post-retirement entries', () => {
+  const tempDir = createTempDir('r18-b04-wal-journal-window-');
+  const authA = generateTestAuthority();
+  const authB = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: authA.keyId,
+    trustedRootPublicKeyPem: authA.pem,
+    trustedRootFingerprint: authA.fp
+  };
+
+  // 1. Setup Genesis v1 with authA
+  const reg1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: authA.keyId,
+    activeKeyFingerprint: authA.fp,
+    activePublicKeyPem: authA.pem,
+    keys: [{
+      keyId: authA.keyId,
+      keyFingerprint: authA.fp,
+      publicKeyPem: authA.pem,
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: '2026-01-01T00:00:00.000Z'
+    }],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(reg1, opts);
+
+  // 2. Append revocation entry 0 signed by authA while v1 is active
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'compromised-v1-key',
+    reason: 'revoked under v1 by authA'
+  }, { ...opts, signerKeyId: authA.keyId, signerPrivateKey: authA.privateKey });
+
+  // 3. Rotate to v2 with authB active and authA RETIRED (carrying over HWM headIndex 0)
+  const v1WithHwm = loadTrustRegistry(opts).registry;
+  const reg2 = createAuthorizedRegistryUpdate(
+    v1WithHwm,
+    {
+      activeKeyId: authB.keyId,
+      activeKeyFingerprint: authB.fp,
+      activePublicKeyPem: authB.pem,
+      keys: [
+        {
+          keyId: authA.keyId,
+          keyFingerprint: authA.fp,
+          publicKeyPem: authA.pem,
+          status: 'RETIRED',
+          issuedAt: '2026-01-01T00:00:00.000Z'
+        },
+        {
+          keyId: authB.keyId,
+          keyFingerprint: authB.fp,
+          publicKeyPem: authB.pem,
+          status: 'ACTIVE',
+          issuedAt: new Date().toISOString()
+        }
+      ]
+    },
+    authA.keyId,
+    authA.privateKey
+  );
+  saveTrustRegistry(reg2, opts);
+
+  // 4. Append revocation entry 1 signed by active authB in v2
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'compromised-v2-key',
+    reason: 'revoked under v2 by authB'
+  }, { ...opts, signerKeyId: authB.keyId, signerPrivateKey: authB.privateKey });
+
+  // 5. Simulate a COMMITTED WAL signed by authB at entry 1 -> recovery must succeed (verifying entry 0 by retired authA and entry 1 by active authB)
+  const journalPath = getRevocationJournalPath(opts);
+  const cpPath = getRevocationCheckpointPath(opts);
+  const regPath = getTrustRegistryPath(opts);
+  const cp = JSON.parse(fs.readFileSync(cpPath, 'utf8'));
+  const walPath = path.join(tempDir, REVOCATION_TXN_FILE);
+
+  const walPayload = {
+    schemaVersion: '1.0.0',
+    txnId: 'tx-test-valid-historical-chain',
+    pid: process.pid,
+    status: 'COMMITTED',
+    timestamp: new Date().toISOString(),
+    committedAt: new Date().toISOString(),
+    signedBy: authB.keyId,
+    journalPath,
+    checkpointPath: cpPath,
+    regPath,
+    initialJournalSize: 0,
+    initialJournalExisted: true,
+    initialJournalSha256: '0'.repeat(64),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: true,
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: true,
+    initialRegistryVersion: 2,
+    initialHwmHeadIndex: 0,
+    initialHwmHeadDigest: '0'.repeat(64),
+    committedHwmHeadIndex: cp.headIndex,
+    committedHwmHeadDigest: cp.headDigest,
+    expectedTargetHwmHeadIndex: cp.headIndex,
+    expectedTargetHwmHeadDigest: cp.headDigest,
+    expectedTargetRegistryVersion: 2
+  };
+  const walSignPayload = Buffer.from(computeTransactionWalSignPayload(walPayload), 'utf8');
+  walPayload.signature = crypto.sign(null, walSignPayload, authB.privateKey).toString('hex');
+  fs.writeFileSync(walPath, JSON.stringify(walPayload, null, 2) + '\n', 'utf8');
+
+  const recResult = recoverAbortedRevocationTransaction(opts);
+  assert.strictEqual(recResult.committed, true);
+  assert.strictEqual(fs.existsSync(walPath), false);
+
+  // 6. Also verify that if entry 1 was forged/signed by retired authA (outside its active window of index <= 0), recovery fails closed
+  const lines = fs.readFileSync(journalPath, 'utf8').trim().split(/\r?\n/);
+  const forgedEntry1 = JSON.parse(lines[1]);
+  forgedEntry1.signerKeyId = authA.keyId;
+  forgedEntry1.signerKeyFingerprint = authA.fp;
+  const { entryDigest: _ed, signature: _sig, ...unsignedEntry1 } = forgedEntry1;
+  forgedEntry1.entryDigest = sha256Digest(canonicalJsonStringify(unsignedEntry1));
+  forgedEntry1.signature = crypto.sign(null, Buffer.from(forgedEntry1.entryDigest, 'utf8'), authA.privateKey).toString('hex');
+  lines[1] = JSON.stringify(forgedEntry1);
+  fs.writeFileSync(journalPath, lines.join('\n') + '\n', 'utf8');
+
+  // Update checkpoint and registry HWM to match forgedEntry1.entryDigest signed by authB so only journal entry 1's signer is retired authA
+  cp.headDigest = forgedEntry1.entryDigest;
+  const { signature: _cpSig, ...cpToSign } = cp;
+  cp.signature = crypto.sign(null, Buffer.from(canonicalJsonStringify(cpToSign), 'utf8'), authB.privateKey).toString('hex');
+  fs.writeFileSync(cpPath, JSON.stringify(cp, null, 2) + '\n', 'utf8');
+
+  const curReg2 = JSON.parse(fs.readFileSync(regPath, 'utf8'));
+  curReg2.revocationHighWaterMark.headDigest = forgedEntry1.entryDigest;
+  const hwmSignPayload2 = Buffer.from(JSON.stringify({
+    domain: 'THREE_LENS_REVOCATION_HWM_V1',
+    registryVersion: curReg2.registryVersion,
+    headIndex: curReg2.revocationHighWaterMark.headIndex,
+    headDigest: curReg2.revocationHighWaterMark.headDigest,
+    updatedAt: curReg2.revocationHighWaterMark.updatedAt,
+    authorizedBy: authB.keyId
+  }), 'utf8');
+  curReg2.revocationHighWaterMark.signature = crypto.sign(null, hwmSignPayload2, authB.privateKey).toString('hex');
+  fs.writeFileSync(regPath, JSON.stringify(curReg2, null, 2) + '\n', 'utf8');
+
+  walPayload.committedHwmHeadDigest = forgedEntry1.entryDigest;
+  walPayload.expectedTargetHwmHeadDigest = forgedEntry1.entryDigest;
+  const walSignPayload2 = Buffer.from(computeTransactionWalSignPayload(walPayload), 'utf8');
+  walPayload.signature = crypto.sign(null, walSignPayload2, authB.privateKey).toString('hex');
+  fs.writeFileSync(walPath, JSON.stringify(walPayload, null, 2) + '\n', 'utf8');
+
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /RETIRED_KEY_AUTHORIZATION_REJECTED|TRANSACTION_WAL_CORRUPTION_DETECTED/
   );
 
   fs.rmSync(tempDir, { recursive: true, force: true });

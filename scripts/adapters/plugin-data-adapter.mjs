@@ -637,13 +637,95 @@ export function recoverAbortedRevocationTransaction(options = {}) {
 }
 
 /**
- * R17-B03: Replays and cryptographically verifies all journal entries from index 0 to targetHeadIndex.
- * Validates unbroken entry indices, continuous hash chaining (prevEntryDigest), and valid cryptographic signatures.
+ * R18-B04: Shared historical key lifecycle & active-window resolver for revocation journal verification.
+ * Resolves each key's public key and maximum valid journal entry index from the validated current registry
+ * and unbroken historical registry chain (history/trust-registry.v*.json).
+ * Genesis fallback is permitted strictly when neither an on-disk registry nor historical progression exists.
+ */
+function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
+  const trustedKeys = new Map();
+  const maxActiveIndexPerKey = new Map();
+
+  if (currentRegistry && Array.isArray(currentRegistry.keys)) {
+    for (const k of currentRegistry.keys) {
+      if (k && k.keyId && k.publicKeyPem) {
+        if (k.status === 'ACTIVE_PINNED_ROOT' || k.status === 'ACTIVE') {
+          trustedKeys.set(k.keyId, k.publicKeyPem);
+          maxActiveIndexPerKey.set(k.keyId, Infinity);
+        } else if (k.status === 'RETIRED' || k.status === 'REVOKED') {
+          trustedKeys.set(k.keyId, k.publicKeyPem);
+          maxActiveIndexPerKey.set(k.keyId, -1);
+        }
+      }
+    }
+  }
+
+  let hasHistoryFiles = false;
+  const histDir = path.join(dir, 'history');
+  if (fs.existsSync(histDir)) {
+    const histFiles = fs.readdirSync(histDir).filter(f => /^trust-registry\.v(\d+)\.json$/.test(f));
+    histFiles.sort((a, b) => {
+      const vA = parseInt(a.match(/^trust-registry\.v(\d+)\.json$/)[1], 10);
+      const vB = parseInt(b.match(/^trust-registry\.v(\d+)\.json$/)[1], 10);
+      return vA - vB;
+    });
+    for (const hf of histFiles) {
+      hasHistoryFiles = true;
+      let hReg = null;
+      try {
+        hReg = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
+      } catch (err) {
+        if (options.failClosed !== false) {
+          throw new Error(`[HISTORY_CORRUPTION_DETECTED] [REGISTRY_HISTORY_DIVERGENCE_DETECTED] Corrupted historical registry ${hf} in ${histDir}: ${err.message}`);
+        }
+        continue;
+      }
+      const hHwmIdx = typeof hReg?.revocationHighWaterMark?.headIndex === 'number'
+        ? hReg.revocationHighWaterMark.headIndex
+        : -1;
+      for (const hk of hReg?.keys || []) {
+        if (hk && hk.keyId && hk.publicKeyPem) {
+          if (!trustedKeys.has(hk.keyId)) {
+            trustedKeys.set(hk.keyId, hk.publicKeyPem);
+            maxActiveIndexPerKey.set(hk.keyId, -1);
+          }
+          if (hk.status === 'ACTIVE' || hk.status === 'ACTIVE_PINNED_ROOT') {
+            const cur = maxActiveIndexPerKey.get(hk.keyId);
+            if (cur !== Infinity) {
+              maxActiveIndexPerKey.set(hk.keyId, Math.max(cur ?? -1, hHwmIdx));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // R18-B01 & R18-B04: Genesis root fallback is permitted ONLY in pure Genesis Bootstrap
+  // (no current on-disk registry and no historical registry progression).
+  if (!currentRegistry && !hasHistoryFiles) {
+    const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
+    const rootPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
+    if (!trustedKeys.has(rootId)) {
+      trustedKeys.set(rootId, rootPem);
+      maxActiveIndexPerKey.set(rootId, Infinity);
+    }
+  }
+
+  return { trustedKeys, maxActiveIndexPerKey };
+}
+
+/**
+ * R17-B03 & R18-B04: Replays and cryptographically verifies all journal entries from index 0 to targetHeadIndex.
+ * Validates unbroken entry indices, continuous hash chaining (prevEntryDigest), historical key lifecycle windows,
+ * and valid cryptographic signatures.
  */
 function verifyFullJournalChain(journalLines, targetHeadIndex, targetHeadDigest, curReg, options = {}) {
   if (!Array.isArray(journalLines) || journalLines.length < targetHeadIndex + 1) {
     throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry count is insufficient for target index');
   }
+  const dir = resolvePluginDataDir(options);
+  const { trustedKeys, maxActiveIndexPerKey } = resolveJournalTrustedKeyWindows(dir, curReg, options);
+
   let expectedPrevDigest = '0'.repeat(64);
   for (let i = 0; i <= targetHeadIndex; i++) {
     let entry = null;
@@ -663,21 +745,15 @@ function verifyFullJournalChain(journalLines, targetHeadIndex, targetHeadDigest,
       throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry at index ${i} missing signature or signedBy`);
     }
 
-    let entrySignerPem = null;
-    if (curReg && Array.isArray(curReg.keys)) {
-      const kRec = curReg.keys.find(k => k.keyId === entry.signedBy);
-      if (kRec && (kRec.status === 'ACTIVE' || kRec.status === 'ACTIVE_PINNED_ROOT')) {
-        entrySignerPem = kRec.publicKeyPem;
-      } else if (kRec) {
-        throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry at index ${i} signed by inactive/retired key '${entry.signedBy}'`);
-      }
-    }
-    if (!entrySignerPem && (options.trustedRootKeyId === entry.signedBy || DEFAULT_SUPERVISOR_KEY_ID === entry.signedBy)) {
-      entrySignerPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
-    }
+    const entrySignerPem = trustedKeys.get(entry.signedBy);
     if (!entrySignerPem) {
-      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry at index ${i} signer '${entry.signedBy}' is unauthenticated`);
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] [UNKNOWN_SIGNER_REJECTED] Journal entry at index ${i} signer '${entry.signedBy}' is unauthenticated`);
     }
+    const maxIdxForSigner = maxActiveIndexPerKey.get(entry.signedBy);
+    if (typeof maxIdxForSigner === 'number' && maxIdxForSigner !== Infinity && i > maxIdxForSigner) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] [RETIRED_KEY_AUTHORIZATION_REJECTED] Journal entry at index ${i} signed by retired or removed key '${entry.signedBy}' (max active index ${maxIdxForSigner})`);
+    }
+
     const entrySignPayload = Buffer.from(computeRevocationEntrySignPayload(entry), 'utf8');
     const isSigValid = crypto.verify(null, entrySignPayload, entrySignerPem, Buffer.from(entry.signature, 'hex'));
     if (!isSigValid) {
@@ -763,52 +839,96 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
     throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Transaction WAL missing required paths, sizes, or cryptographic metadata');
   }
 
-  // R10-B01, R11-B01, R12-B06 & R14-B03: Check if signer was retired or revoked in current on-disk registry
+  // R10-B01, R11-B01, R11-B03, R12-B01, R12-B06, R13-B01, R14-B03, R17-B04 & R18-B01:
+  // When an on-disk registry exists, validate it first and select WAL signer exclusively from its active keys.
+  // Removed, retired, or revoked keys are unconditionally rejected without any fallback to genesis/default root.
+  let signerPublicKeyPem = null;
   if (fs.existsSync(expectedRegPath)) {
+    let curRegRaw = null;
     try {
-      const curRegRaw = JSON.parse(fs.readFileSync(expectedRegPath, 'utf8'));
-      if (curRegRaw && Array.isArray(curRegRaw.keys)) {
-        const curKey = curRegRaw.keys.find(k => k.keyId === txnData.signedBy);
-        if (curKey) {
-          if (curKey.status === 'RETIRED') {
-            throw new Error(`[RETIRED_KEY_AUTHORIZATION_REJECTED] Signer '${txnData.signedBy}' in WAL is retired in current trust registry`);
-          }
-          if (curKey.status === 'REVOKED') {
-            throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer '${txnData.signedBy}' in WAL is revoked in current trust registry`);
-          }
-        }
+      curRegRaw = JSON.parse(fs.readFileSync(expectedRegPath, 'utf8'));
+    } catch (readErr) {
+      throw new Error(`[TRANSACTION_WAL_ROLLBACK_CHECK_FAILED] [TRANSACTION_WAL_CORRUPTION_DETECTED] Existing trust registry exists at ${expectedRegPath} but cannot be parsed: ${readErr.message}`);
+    }
+
+    if (curRegRaw && Array.isArray(curRegRaw.revokedKeyIds) && curRegRaw.revokedKeyIds.includes(txnData.signedBy)) {
+      throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer '${txnData.signedBy}' in WAL is revoked in current trust registry`);
+    }
+
+    if (curRegRaw && Array.isArray(curRegRaw.keys)) {
+      const curKey = curRegRaw.keys.find(k => k.keyId === txnData.signedBy);
+      if (!curKey) {
+        throw new Error(`[RETIRED_KEY_AUTHORIZATION_REJECTED] [TRANSACTION_WAL_SIGNER_UNTRUSTED] Signer '${txnData.signedBy}' in WAL is not present in current on-disk trust registry keys`);
       }
-    } catch (e) {
-      if (e.message && (e.message.includes('RETIRED_KEY_AUTHORIZATION_REJECTED') || e.message.includes('REVOKED_KEY_AUTHORIZATION_REJECTED'))) {
-        throw e;
+      if (curKey.status === 'RETIRED') {
+        throw new Error(`[RETIRED_KEY_AUTHORIZATION_REJECTED] Signer '${txnData.signedBy}' in WAL is retired in current trust registry`);
+      }
+      if (curKey.status === 'REVOKED') {
+        throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer '${txnData.signedBy}' in WAL is revoked in current trust registry`);
+      }
+      if (curKey.status !== 'ACTIVE' && curKey.status !== 'ACTIVE_PINNED_ROOT') {
+        throw new Error(`[TRANSACTION_WAL_SIGNER_UNTRUSTED] Signer '${txnData.signedBy}' in WAL does not have ACTIVE or ACTIVE_PINNED_ROOT status in current trust registry`);
       }
     }
-  }
 
-  let signerPublicKeyPem = null;
-  if (options.trustedRootKeyId === txnData.signedBy && options.trustedRootPublicKeyPem) {
-    signerPublicKeyPem = options.trustedRootPublicKeyPem;
-  } else if (DEFAULT_SUPERVISOR_KEY_ID === txnData.signedBy) {
-    signerPublicKeyPem = DEFAULT_SUPERVISOR_PUBLIC_PEM;
+    let effectivePriorReg = null;
+    if (curRegRaw && typeof curRegRaw.registryVersion === 'number' && curRegRaw.registryVersion > 1) {
+      const priorHistPath = path.join(histDir, `trust-registry.v${curRegRaw.registryVersion - 1}.json`);
+      if (fs.existsSync(priorHistPath)) {
+        try {
+          effectivePriorReg = JSON.parse(fs.readFileSync(priorHistPath, 'utf8'));
+        } catch (_) {}
+      }
+    }
+
+    const onDiskRegValidation = validateTrustRegistry(curRegRaw, {
+      ...options,
+      skipLock: true,
+      priorRegistry: effectivePriorReg,
+      allowEmbeddedFallback: true,
+      failClosed: true
+    });
+    if (!onDiskRegValidation.valid) {
+      if (!curRegRaw || !Array.isArray(curRegRaw.keys)) {
+        throw new Error(`[TRANSACTION_WAL_ROLLBACK_CHECK_FAILED] Existing trust registry on disk is invalid or schema-corrupt (${onDiskRegValidation.error}); refusing rollback under Default-Deny`);
+      }
+      if (txnData.status === 'COMMITTED') {
+        throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] [TRANSACTION_WAL_SIGNER_UNTRUSTED] COMMITTED WAL on-disk trust registry failed cryptographic validation: ${onDiskRegValidation.error}`);
+      }
+      throw new Error(`[TRANSACTION_WAL_SIGNER_UNTRUSTED] [TRANSACTION_WAL_ROLLBACK_CHECK_FAILED] Existing trust registry on disk failed validation (${onDiskRegValidation.error}); refusing WAL signer '${txnData.signedBy}'`);
+    }
+
+    const verifiedKey = curRegRaw.keys.find(
+      k => k.keyId === txnData.signedBy && (k.status === 'ACTIVE' || k.status === 'ACTIVE_PINNED_ROOT')
+    );
+    if (!verifiedKey || !verifiedKey.publicKeyPem) {
+      throw new Error(`[TRANSACTION_WAL_SIGNER_UNTRUSTED] Signer '${txnData.signedBy}' in WAL is not an active key in validated on-disk trust registry`);
+    }
+    signerPublicKeyPem = verifiedKey.publicKeyPem;
   } else {
-    const embKey = EMBEDDED_ROOT_REGISTRY.keys.find(k => k.keyId === txnData.signedBy);
-    if (embKey) {
-      signerPublicKeyPem = embKey.publicKeyPem;
-    } else if (fs.existsSync(expectedRegPath)) {
-      try {
-        // R12-B06: Authenticate candidate registry via full trust chain back to genesis
-        const loadedReg = doLoadTrustRegistry({
-          ...options,
-          skipLock: true,
-          failClosed: true
-        });
-        if (loadedReg && loadedReg.valid && loadedReg.registry && Array.isArray(loadedReg.registry.keys)) {
-          const regKey = loadedReg.registry.keys.find(k => k.keyId === txnData.signedBy);
-          if (regKey && (regKey.status === 'ACTIVE' || regKey.status === 'ACTIVE_PINNED_ROOT')) {
-            signerPublicKeyPem = regKey.publicKeyPem;
-          }
-        }
-      } catch (_) {}
+    // R18-B01: Pure Genesis Bootstrap verification:
+    // Genesis root key is permitted ONLY when there is no existing registry, no history files, and no witness progression.
+    const curWitness = getMonotonicWitness(dir, options);
+    const hasHistory = fs.existsSync(histDir) && fs.readdirSync(histDir).some(f => /^trust-registry\.v\d+\.json$/.test(f));
+    if (
+      curWitness.maxSeenRegistryVersion > 1 ||
+      curWitness.maxSeenHwmHeadIndex >= 0 ||
+      hasHistory ||
+      txnData.initialRegistryVersion > 1 ||
+      txnData.initialRegistryExisted === true
+    ) {
+      throw new Error(`[TRANSACTION_WAL_ROLLBACK_CHECK_FAILED] [TRANSACTION_WAL_SIGNER_UNTRUSTED] On-disk trust registry is missing despite historical state progression; refusing Genesis fallback for WAL signer '${txnData.signedBy}'`);
+    }
+
+    if (options.trustedRootKeyId === txnData.signedBy && options.trustedRootPublicKeyPem) {
+      signerPublicKeyPem = options.trustedRootPublicKeyPem;
+    } else if (DEFAULT_SUPERVISOR_KEY_ID === txnData.signedBy) {
+      signerPublicKeyPem = DEFAULT_SUPERVISOR_PUBLIC_PEM;
+    } else {
+      const embKey = EMBEDDED_ROOT_REGISTRY.keys.find(k => k.keyId === txnData.signedBy);
+      if (embKey) {
+        signerPublicKeyPem = embKey.publicKeyPem;
+      }
     }
   }
 
@@ -1305,15 +1425,25 @@ export function computeRegistryIdentityPayload(registry) {
     : null;
   const normalizedProof = proof
     ? {
-        authorizedBy: typeof proof.authorizedBy === 'string'
-          ? proof.authorizedBy
-          : (typeof proof.signerKeyId === 'string' ? proof.signerKeyId : ''),
+        authorizedBy: typeof proof.authorizedBy === 'string' ? proof.authorizedBy : '',
+        signerKeyId: typeof proof.signerKeyId === 'string' ? proof.signerKeyId : '',
         signature: typeof proof.signature === 'string' ? proof.signature : '',
-        timestamp: typeof proof.timestamp === 'string'
-          ? proof.timestamp
-          : (typeof proof.signedAt === 'string' ? proof.signedAt : ''),
+        timestamp: typeof proof.timestamp === 'string' ? proof.timestamp : '',
+        signedAt: typeof proof.signedAt === 'string' ? proof.signedAt : '',
         algorithm: typeof proof.algorithm === 'string' ? proof.algorithm : 'ed25519',
         priorRegistryVersion: typeof proof.priorRegistryVersion === 'number' ? proof.priorRegistryVersion : 0
+      }
+    : null;
+  const hwm = (registry.revocationHighWaterMark && typeof registry.revocationHighWaterMark === 'object')
+    ? registry.revocationHighWaterMark
+    : null;
+  const normalizedHwm = hwm
+    ? {
+        headIndex: typeof hwm.headIndex === 'number' ? hwm.headIndex : -1,
+        headDigest: typeof hwm.headDigest === 'string' ? hwm.headDigest : '',
+        updatedAt: typeof hwm.updatedAt === 'string' ? hwm.updatedAt : '',
+        authorizedBy: typeof hwm.authorizedBy === 'string' ? hwm.authorizedBy : '',
+        signature: typeof hwm.signature === 'string' ? hwm.signature : ''
       }
     : null;
   const identityObj = {
@@ -1324,7 +1454,8 @@ export function computeRegistryIdentityPayload(registry) {
     keyType: typeof registry.keyType === 'string' ? registry.keyType : '',
     validFrom: typeof registry.validFrom === 'string' ? registry.validFrom : '',
     validUntil: typeof registry.validUntil === 'string' ? registry.validUntil : '',
-    authorizationProof: normalizedProof
+    authorizationProof: normalizedProof,
+    revocationHighWaterMark: normalizedHwm
   };
   return 'TRUST_REGISTRY_COMMITMENT_V1:' + canonicalJsonStringify(identityObj);
 }
@@ -1525,9 +1656,17 @@ export function validateTrustRegistry(registry, options = {}) {
       };
     }
 
-    const hwmSignerKey = registry.keys.find(
+    let hwmSignerKey = registry.keys.find(
       k => k.keyId === hwm.authorizedBy && ['ACTIVE_PINNED_ROOT', 'ACTIVE', 'RETIRED', 'REVOKED'].includes(k.status)
     );
+    if (!hwmSignerKey && priorReg && Array.isArray(priorReg.keys)) {
+      const priorKey = priorReg.keys.find(
+        k => k.keyId === hwm.authorizedBy && ['ACTIVE_PINNED_ROOT', 'ACTIVE'].includes(k.status)
+      );
+      if (priorKey) {
+        hwmSignerKey = { ...priorKey, status: 'RETIRED' };
+      }
+    }
     if (!hwmSignerKey) {
       return {
         valid: false,
@@ -2001,11 +2140,20 @@ function doLoadTrustRegistry(options = {}) {
             if (v > maxHistVersion) maxHistVersion = v;
             try {
               const histObj = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
-              // R16-B01: Verify historical registry against monotonic witness commitment
+              // R16-B01 & R18-B02: Verify historical registry against monotonic witness commitment.
+              // Digest advancement at the active version is permitted strictly when HWM headIndex advances.
               const curWitness = getMonotonicWitness(dir, options);
               if (curWitness.registryDigests && curWitness.registryDigests[String(v)]) {
                 const histDigest = computeRegistryDigest(histObj);
-                if (histDigest !== curWitness.registryDigests[String(v)]) {
+                const histHwmIdx = typeof histObj?.revocationHighWaterMark?.headIndex === 'number'
+                  ? histObj.revocationHighWaterMark.headIndex
+                  : -1;
+                const isActiveHwmAdvancing = (
+                  v === curWitness.maxSeenRegistryVersion &&
+                  v === parsed.registryVersion &&
+                  histHwmIdx > curWitness.maxSeenHwmHeadIndex
+                );
+                if (histDigest !== curWitness.registryDigests[String(v)] && !isActiveHwmAdvancing) {
                   const errorMsg = `[REGISTRY_ROLLBACK_DETECTED] [REGISTRY_DIVERGENCE_DETECTED] [REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_ROLLBACK_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Historical registry ${hf} digest (${histDigest}) diverges from witnessed historical commitment (${curWitness.registryDigests[String(v)]})`;
                   if (options.failClosed !== false) {
                     throw new Error(errorMsg);
@@ -2593,26 +2741,43 @@ export function getMonotonicWitness(dir, options = {}) {
         }
       }
 
-      // R15-B03: Check registry digest divergence at same version
+      // R15-B03 & R18-B02: Check registry digest divergence at same version.
+      // Same-version digest advancement is permitted strictly when HWM headIndex advances.
       if (raw.maxSeenRegistryVersion > maxRegVer) {
         maxRegVer = raw.maxSeenRegistryVersion;
         maxRegDigest = raw.maxSeenRegistryDigest || '';
       } else if (raw.maxSeenRegistryVersion === maxRegVer) {
-        if (raw.maxSeenRegistryDigest && maxRegDigest && raw.maxSeenRegistryDigest !== maxRegDigest) {
-          throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Persistent witness registry divergence at version ${maxRegVer} in ${filePath}`);
-        }
-        if (!maxRegDigest && raw.maxSeenRegistryDigest) {
-          maxRegDigest = raw.maxSeenRegistryDigest;
+        if (raw.maxSeenHwmHeadIndex > maxHwmIdx) {
+          maxRegDigest = raw.maxSeenRegistryDigest || maxRegDigest;
+        } else if (raw.maxSeenHwmHeadIndex === maxHwmIdx) {
+          if (raw.maxSeenRegistryDigest && maxRegDigest && raw.maxSeenRegistryDigest !== maxRegDigest) {
+            throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Persistent witness registry divergence at version ${maxRegVer} in ${filePath}`);
+          }
+          if (!maxRegDigest && raw.maxSeenRegistryDigest) {
+            maxRegDigest = raw.maxSeenRegistryDigest;
+          }
         }
       }
 
       if (raw.registryDigests && typeof raw.registryDigests === 'object') {
         for (const [v, d] of Object.entries(raw.registryDigests)) {
           if (typeof d === 'string') {
-            if (registryDigestsMap[v] && registryDigestsMap[v] !== d) {
-              throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Persistent witness historical registry divergence at version ${v} in ${filePath}`);
+            const vNum = parseInt(v, 10);
+            if (vNum === maxRegVer && raw.maxSeenRegistryVersion === maxRegVer) {
+              if (raw.maxSeenHwmHeadIndex > maxHwmIdx) {
+                registryDigestsMap[v] = d;
+              } else if (raw.maxSeenHwmHeadIndex === maxHwmIdx) {
+                if (registryDigestsMap[v] && registryDigestsMap[v] !== d) {
+                  throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Persistent witness historical registry divergence at version ${v} in ${filePath}`);
+                }
+                registryDigestsMap[v] = d;
+              }
+            } else {
+              if (registryDigestsMap[v] && registryDigestsMap[v] !== d) {
+                throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Persistent witness historical registry divergence at version ${v} in ${filePath}`);
+              }
+              registryDigestsMap[v] = d;
             }
-            registryDigestsMap[v] = d;
           }
         }
       }
@@ -2635,49 +2800,66 @@ export function getMonotonicWitness(dir, options = {}) {
   readWitnessFile(localWitnessFile);
   readWitnessFile(systemWitnessFile);
 
-  // Read external witness from options
+  // R18-B03: Update internal authoritative memory witness exclusively from persistent anchors.
+  // Never allow unauthenticated caller options (externalMonotonicWitness) or returned object mutation
+  // to poison the shared in-process _DIR_MONOTONIC_WITNESS state.
+  memWitness.maxSeenRegistryVersion = maxRegVer;
+  memWitness.maxSeenRegistryDigest = maxRegDigest;
+  memWitness.registryDigests = { ...registryDigestsMap };
+  memWitness.maxSeenHwmHeadIndex = maxHwmIdx;
+  memWitness.maxSeenHwmHeadDigest = maxHwmDigest;
+
+  let effRegVer = maxRegVer;
+  let effRegDigest = maxRegDigest;
+  const effRegistryDigestsMap = { ...registryDigestsMap };
+  let effHwmIdx = maxHwmIdx;
+  let effHwmDigest = maxHwmDigest;
+
+  // Read per-call external witness floor from options without mutating shared memWitness
   const externalWitness = options.externalMonotonicWitness;
   if (externalWitness && typeof externalWitness === 'object') {
     if (typeof externalWitness.minRegistryVersion === 'number') {
-      if (externalWitness.minRegistryVersion > maxRegVer) {
-        maxRegVer = externalWitness.minRegistryVersion;
+      if (externalWitness.minRegistryVersion > effRegVer) {
+        effRegVer = externalWitness.minRegistryVersion;
         if (typeof externalWitness.minRegistryDigest === 'string') {
-          maxRegDigest = externalWitness.minRegistryDigest;
+          effRegDigest = externalWitness.minRegistryDigest;
         }
-      } else if (externalWitness.minRegistryVersion === maxRegVer) {
-        if (externalWitness.minRegistryDigest && maxRegDigest && externalWitness.minRegistryDigest !== maxRegDigest) {
-          throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] External witness registry digest diverges at version ${maxRegVer}`);
+      } else if (externalWitness.minRegistryVersion === effRegVer) {
+        if (externalWitness.minRegistryDigest && effRegDigest && externalWitness.minRegistryDigest !== effRegDigest) {
+          throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] External witness registry digest diverges at version ${effRegVer}`);
         }
       }
     }
     if (externalWitness.registryDigests && typeof externalWitness.registryDigests === 'object') {
       for (const [v, d] of Object.entries(externalWitness.registryDigests)) {
         if (typeof d === 'string') {
-          if (registryDigestsMap[v] && registryDigestsMap[v] !== d) {
+          if (effRegistryDigestsMap[v] && effRegistryDigestsMap[v] !== d) {
             throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] External witness historical registry digest diverges at version ${v}`);
           }
-          registryDigestsMap[v] = d;
+          effRegistryDigestsMap[v] = d;
         }
       }
     }
     if (typeof externalWitness.minHwmHeadIndex === 'number') {
-      if (externalWitness.minHwmHeadIndex > maxHwmIdx) {
-        maxHwmIdx = externalWitness.minHwmHeadIndex;
-        if (externalWitness.minHwmHeadDigest) maxHwmDigest = externalWitness.minHwmHeadDigest;
-      } else if (externalWitness.minHwmHeadIndex === maxHwmIdx && maxHwmIdx >= 0 && externalWitness.minHwmHeadDigest && maxHwmDigest) {
-        if (externalWitness.minHwmHeadDigest !== maxHwmDigest) {
-          throw new Error(`[MONOTONIC_WITNESS_DIVERGENCE_DETECTED] External witness digest diverges at index ${maxHwmIdx}`);
+      if (externalWitness.minHwmHeadIndex > effHwmIdx) {
+        effHwmIdx = externalWitness.minHwmHeadIndex;
+        if (externalWitness.minHwmHeadDigest) effHwmDigest = externalWitness.minHwmHeadDigest;
+      } else if (externalWitness.minHwmHeadIndex === effHwmIdx && effHwmIdx >= 0 && externalWitness.minHwmHeadDigest && effHwmDigest) {
+        if (externalWitness.minHwmHeadDigest !== effHwmDigest) {
+          throw new Error(`[MONOTONIC_WITNESS_DIVERGENCE_DETECTED] External witness digest diverges at index ${effHwmIdx}`);
         }
       }
     }
   }
 
-  memWitness.maxSeenRegistryVersion = maxRegVer;
-  memWitness.maxSeenRegistryDigest = maxRegDigest;
-  memWitness.registryDigests = registryDigestsMap;
-  memWitness.maxSeenHwmHeadIndex = maxHwmIdx;
-  memWitness.maxSeenHwmHeadDigest = maxHwmDigest;
-  return memWitness;
+  // R18-B03: Return a deeply cloned, frozen read-only snapshot so external callers cannot mutate internal state
+  return Object.freeze({
+    maxSeenRegistryVersion: effRegVer,
+    maxSeenRegistryDigest: effRegDigest,
+    registryDigests: Object.freeze({ ...effRegistryDigestsMap }),
+    maxSeenHwmHeadIndex: effHwmIdx,
+    maxSeenHwmHeadDigest: effHwmDigest
+  });
 }
 
 function normalizeWitnessCallArgs(arg4, arg5, arg6) {
@@ -2736,10 +2918,26 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
     throw new Error('[STORAGE_CONFINEMENT_VIOLATION] [UNAUTHORIZED_WITNESS_UPDATE] Calling updateMonotonicWitness requires internal witness write token');
   }
 
-  const witness = getMonotonicWitness(dir, options);
+  const norm = canonicalizeDirPath(dir);
+  const current = getMonotonicWitness(dir, { ...options, externalMonotonicWitness: undefined });
+  const witness = {
+    maxSeenRegistryVersion: current.maxSeenRegistryVersion,
+    maxSeenRegistryDigest: current.maxSeenRegistryDigest || '',
+    registryDigests: { ...(current.registryDigests || {}) },
+    maxSeenHwmHeadIndex: current.maxSeenHwmHeadIndex,
+    maxSeenHwmHeadDigest: current.maxSeenHwmHeadDigest || ''
+  };
   let changed = false;
 
-  // R15-B03: Check and update registry version and content commitment
+  const isHwmAdvancingAtActiveVersion = (
+    typeof registryVersion === 'number' &&
+    registryVersion === witness.maxSeenRegistryVersion &&
+    typeof hwmHeadIndex === 'number' &&
+    hwmHeadIndex > witness.maxSeenHwmHeadIndex
+  );
+
+  // R15-B03 & R18-B02: Check and update registry version and content commitment.
+  // At the active registryVersion, a digest update is permitted strictly when HWM headIndex advances.
   if (typeof registryVersion === 'number') {
     if (registryVersion > witness.maxSeenRegistryVersion) {
       witness.maxSeenRegistryVersion = registryVersion;
@@ -2747,9 +2945,14 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
       changed = true;
     } else if (registryVersion === witness.maxSeenRegistryVersion) {
       if (registryDigest && witness.maxSeenRegistryDigest && witness.maxSeenRegistryDigest !== registryDigest) {
-        throw new Error(
-          `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Monotonic witness registry divergence at version ${registryVersion}: existing digest ${witness.maxSeenRegistryDigest} !== candidate digest ${registryDigest}`
-        );
+        if (isHwmAdvancingAtActiveVersion) {
+          witness.maxSeenRegistryDigest = registryDigest;
+          changed = true;
+        } else {
+          throw new Error(
+            `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Monotonic witness registry divergence at version ${registryVersion}: existing digest ${witness.maxSeenRegistryDigest} !== candidate digest ${registryDigest}`
+          );
+        }
       }
       if (!witness.maxSeenRegistryDigest && registryDigest) {
         witness.maxSeenRegistryDigest = registryDigest;
@@ -2760,9 +2963,14 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
       if (!witness.registryDigests) witness.registryDigests = {};
       const verKey = String(registryVersion);
       if (witness.registryDigests[verKey] && witness.registryDigests[verKey] !== registryDigest) {
-        throw new Error(
-          `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Monotonic witness historical registry divergence at version ${registryVersion}: existing digest ${witness.registryDigests[verKey]} !== candidate digest ${registryDigest}`
-        );
+        if (isHwmAdvancingAtActiveVersion) {
+          witness.registryDigests[verKey] = registryDigest;
+          changed = true;
+        } else {
+          throw new Error(
+            `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Monotonic witness historical registry divergence at version ${registryVersion}: existing digest ${witness.registryDigests[verKey]} !== candidate digest ${registryDigest}`
+          );
+        }
       }
       if (!witness.registryDigests[verKey]) {
         witness.registryDigests[verKey] = registryDigest;
@@ -2821,6 +3029,15 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
     }
   }
 
+  // Update internal authoritative memory witness map
+  _DIR_MONOTONIC_WITNESS.set(norm, {
+    maxSeenRegistryVersion: witness.maxSeenRegistryVersion,
+    maxSeenRegistryDigest: witness.maxSeenRegistryDigest || '',
+    registryDigests: { ...(witness.registryDigests || {}) },
+    maxSeenHwmHeadIndex: witness.maxSeenHwmHeadIndex,
+    maxSeenHwmHeadDigest: witness.maxSeenHwmHeadDigest || ''
+  });
+
   const { localWitnessFile, systemWitnessFile } = getWitnessStoragePaths(dir);
   const writeWitness = (filePath) => {
     try {
@@ -2874,18 +3091,25 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
     );
   }
 
-  // R15-B03 & R16-B01: Check registryDigest divergence for candidate and traverse historical ancestor commitments
+  // R15-B03, R16-B01 & R18-B02: Check registryDigest divergence for candidate and traverse historical ancestor commitments.
+  // At the active registryVersion, a digest update is permitted strictly when HWM headIndex strictly advances.
   if (typeof candidateRegistryVersion === 'number') {
+    const isHwmAdvancingAtActiveVersion = (
+      candidateRegistryVersion === witness.maxSeenRegistryVersion &&
+      typeof candidateHwmHeadIndex === 'number' &&
+      candidateHwmHeadIndex > witness.maxSeenHwmHeadIndex
+    );
+
     // 1. Check candidate version if a witnessed digest exists
     const candKey = String(candidateRegistryVersion);
     if (witness.registryDigests && witness.registryDigests[candKey] && candidateRegistryDigest) {
-      if (candidateRegistryDigest !== witness.registryDigests[candKey]) {
+      if (candidateRegistryDigest !== witness.registryDigests[candKey] && !isHwmAdvancingAtActiveVersion) {
         throw new Error(
           `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate registry digest (${candidateRegistryDigest}) diverges from witnessed digest (${witness.registryDigests[candKey]}) for registryVersion ${candidateRegistryVersion}`
         );
       }
     } else if (candidateRegistryVersion === witness.maxSeenRegistryVersion && witness.maxSeenRegistryDigest && candidateRegistryDigest) {
-      if (candidateRegistryDigest !== witness.maxSeenRegistryDigest) {
+      if (candidateRegistryDigest !== witness.maxSeenRegistryDigest && !isHwmAdvancingAtActiveVersion) {
         throw new Error(
           `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate registry digest (${candidateRegistryDigest}) diverges from monotonic witness registryDigest (${witness.maxSeenRegistryDigest}) at registryVersion ${candidateRegistryVersion}`
         );
@@ -2897,22 +3121,26 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
       const histDir = path.join(dir, 'history');
       for (const [vStr, expectedDigest] of Object.entries(witness.registryDigests)) {
         const v = parseInt(vStr, 10);
+        const isThisVersionAdvancingHwm = (v === candidateRegistryVersion && isHwmAdvancingAtActiveVersion);
         // If candidate itself is this version, verify candidateRegistryDigest
         if (v === candidateRegistryVersion && candidateRegistryDigest) {
-          if (candidateRegistryDigest !== expectedDigest) {
+          if (candidateRegistryDigest !== expectedDigest && !isThisVersionAdvancingHwm) {
             throw new Error(
               `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate registry digest (${candidateRegistryDigest}) diverges from witnessed digest (${expectedDigest}) for registryVersion ${v}`
             );
           }
         }
         // R17-B02: If on-disk historical artifact exists for this version (even if v === candidateRegistryVersion),
-        // verify its content digest matches the monotonic witness commitment and fail closed if corrupted
+        // verify its content digest matches the monotonic witness commitment (or candidateRegistryDigest if advancing HWM) and fail closed if corrupted
         const histPath = path.join(histDir, `trust-registry.v${v}.json`);
         if (fs.existsSync(histPath)) {
           try {
             const histObj = JSON.parse(fs.readFileSync(histPath, 'utf8'));
             const actualHistDigest = computeRegistryDigest(histObj);
-            if (actualHistDigest !== expectedDigest) {
+            const targetHistDigest = (isThisVersionAdvancingHwm && candidateRegistryDigest)
+              ? candidateRegistryDigest
+              : expectedDigest;
+            if (actualHistDigest !== targetHistDigest && actualHistDigest !== expectedDigest) {
               throw new Error(
                 `[REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Historical registry trust-registry.v${v}.json digest (${actualHistDigest}) diverges from monotonic witness historical commitment (${expectedDigest})`
               );
@@ -3348,62 +3576,12 @@ function doLoadRevocationJournal(options = {}) {
       return { valid: false, entries: [], error: msg, count: lines.length, path: journalPath };
     }
 
-    const trustedKeys = new Map();
-    const maxActiveIndexPerKey = new Map();
-
-    if (trustRegistryLoad.valid && trustRegistryLoad.registry) {
-      for (const k of trustRegistryLoad.registry.keys || []) {
-        if (['ACTIVE_PINNED_ROOT', 'ACTIVE'].includes(k.status)) {
-          trustedKeys.set(k.keyId, k.publicKeyPem);
-          maxActiveIndexPerKey.set(k.keyId, Infinity);
-        } else if (['RETIRED', 'REVOKED'].includes(k.status)) {
-          trustedKeys.set(k.keyId, k.publicKeyPem);
-          maxActiveIndexPerKey.set(k.keyId, -1);
-        }
-      }
-    }
-
-    // Historical key lifecycle resolution: load historical public keys and track active windows from history/
-    const histDir = path.join(path.dirname(journalPath), 'history');
-    if (fs.existsSync(histDir)) {
-      try {
-        const histFiles = fs.readdirSync(histDir).filter(f => /^trust-registry\.v(\d+)\.json$/.test(f));
-        histFiles.sort((a, b) => {
-          const vA = parseInt(a.match(/^trust-registry\.v(\d+)\.json$/)[1], 10);
-          const vB = parseInt(b.match(/^trust-registry\.v(\d+)\.json$/)[1], 10);
-          return vA - vB;
-        });
-        for (const hf of histFiles) {
-          try {
-            const hReg = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
-            const hHwmIdx = typeof hReg.revocationHighWaterMark?.headIndex === 'number'
-              ? hReg.revocationHighWaterMark.headIndex
-              : -1;
-            for (const hk of hReg.keys || []) {
-              if (hk.keyId && hk.publicKeyPem) {
-                if (!trustedKeys.has(hk.keyId)) {
-                  trustedKeys.set(hk.keyId, hk.publicKeyPem);
-                }
-                if (hk.status === 'ACTIVE' || hk.status === 'ACTIVE_PINNED_ROOT') {
-                  const cur = maxActiveIndexPerKey.get(hk.keyId);
-                  if (cur !== Infinity) {
-                    maxActiveIndexPerKey.set(hk.keyId, Math.max(cur ?? -1, hHwmIdx));
-                  }
-                }
-              }
-            }
-          } catch (_) {}
-        }
-      } catch (_) {}
-    }
-
-    // Include genesis root anchor if not already configured with an explicit status
-    const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
-    const rootPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
-    if (!trustedKeys.has(rootId)) {
-      trustedKeys.set(rootId, rootPem);
-      maxActiveIndexPerKey.set(rootId, Infinity);
-    }
+    // R18-B04: Unified historical key lifecycle resolution shared with WAL recovery
+    const { trustedKeys, maxActiveIndexPerKey } = resolveJournalTrustedKeyWindows(
+      dir,
+      trustRegistryLoad.valid ? trustRegistryLoad.registry : null,
+      options
+    );
 
     const entries = [];
     let expectedPrevDigest = '0'.repeat(64);
