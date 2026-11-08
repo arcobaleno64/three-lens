@@ -28,7 +28,10 @@ import {
   DEFAULT_SUPERVISOR_KEY_ID,
   DEFAULT_SUPERVISOR_PUBLIC_PEM,
   DEFAULT_SUPERVISOR_FINGERPRINT,
-  canonicalJsonStringify
+  canonicalJsonStringify,
+  isGovernanceLockHeld,
+  resetMonotonicWitnessForTest,
+  sha256Digest
 } from '../scripts/adapters/plugin-data-adapter.mjs';
 
 function createTempDir(prefix = 'test-plugin-data-') {
@@ -664,8 +667,8 @@ test('PLUGIN_DATA Governance: R03-B02 - loadRevocationJournal accepts historical
         { keyId: operatorAuth.keyId, keyFingerprint: operatorAuth.fp, publicKeyPem: operatorAuth.pem, status: 'RETIRED', issuedAt: '2026-10-16T06:55:39.565Z' }
       ]
     },
-    rootAuth.keyId,
-    rootAuth.privateKey
+    operatorAuth.keyId,
+    operatorAuth.privateKey
   );
   saveTrustRegistry(v3Reg, opts);
 
@@ -2614,5 +2617,427 @@ test('PLUGIN_DATA Governance: R12-B06 - Rotated supervisor key in validated hist
   const recRes = recoverAbortedRevocationTransaction(opts);
   assert.equal(recRes.recovered, true);
 
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R13-B01 - Incomplete registry schema { registryVersion: 1 } strictly fails closed and prevents WAL rollback', () => {
+  const tempDir = createTempDir('r13-b01-incomplete-reg-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp
+  };
+
+  // Write a journal with 1 entry
+  const journalPath = getRevocationJournalPath(opts);
+  const entry = {
+    entryIndex: 0,
+    timestamp: new Date().toISOString(),
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'TEST-REVOKED-TARGET',
+    reason: 'COMPROMISED_KEY',
+    prevEntryDigest: '0'.repeat(64),
+    signedBy: auth.keyId,
+    signature: '0'.repeat(128)
+  };
+  fs.writeFileSync(journalPath, JSON.stringify(entry) + '\n', 'utf8');
+
+  // Incomplete registry schema: only { registryVersion: 1 }
+  const regPath = getTrustRegistryPath(opts);
+  fs.writeFileSync(regPath, JSON.stringify({ registryVersion: 1 }, null, 2), 'utf8');
+
+  // PREPARED WAL attempting to truncate journal
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const wal = {
+    txnId: 'WAL-R13-B01',
+    status: 'PREPARED',
+    createdAt: new Date().toISOString(),
+    signedBy: auth.keyId,
+    journalPath,
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    checkpointPath: getRevocationCheckpointPath(opts),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    regPath,
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: false,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: ''
+  };
+  const payload = Buffer.from(computeTransactionWalSignPayload(wal), 'utf8');
+  wal.signature = crypto.sign(null, payload, auth.privateKey).toString('hex');
+  fs.writeFileSync(txnPath, JSON.stringify(wal, null, 2), 'utf8');
+
+  // Must fail closed before truncating journal or unlinking WAL
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_ROLLBACK_CHECK_FAILED/
+  );
+
+  // Assert journal is NOT truncated and WAL is NOT unlinked
+  assert.equal(fs.existsSync(journalPath), true);
+  assert.equal(fs.readFileSync(journalPath, 'utf8').trim().length > 0, true);
+  assert.equal(fs.existsSync(txnPath), true);
+
+  resetMonotonicWitnessForTest(tempDir, { allowInWorkspace: true });
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R13-B02 & R13-B03 - Persistent monotonic witness survives process restart and journal fail-closed', () => {
+  const tempDir = createTempDir('r13-b02-persistent-witness-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp
+  };
+
+  // 1. Append a revocation entry to move witness to headIndex 0
+  appendRevocationEntry(
+    {
+      revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+      targetId: 'VICTIM-KEY-01',
+      reason: 'TEST_REVOCATION'
+    },
+    {
+      ...opts,
+      signerKeyId: auth.keyId,
+      signerPrivateKey: auth.privateKey
+    }
+  );
+
+  // Verify persistent witness file exists in local directory
+  const localWitness = path.join(tempDir, '.monotonic-witness.json');
+  assert.equal(fs.existsSync(localWitness), true);
+
+  // 2. Clear memory witness cache to simulate cold-start / process restart
+  resetMonotonicWitnessForTest(null, { allowInWorkspace: true });
+
+  // 3. Whole-directory state rollback simulation:
+  // Overwrite registry with an old version 1 without HWM, update history to match, and remove local witness
+  const regPath = getTrustRegistryPath(opts);
+  const v1NoHwm = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: auth.keyId,
+    activeKeyFingerprint: auth.fp,
+    activePublicKeyPem: auth.pem,
+    keyType: 'ed25519',
+    pinnedSince: '2026-10-16T06:55:39.565Z',
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{ keyId: auth.keyId, keyFingerprint: auth.fp, publicKeyPem: auth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' }]
+  };
+  fs.writeFileSync(regPath, JSON.stringify(v1NoHwm, null, 2), 'utf8');
+  const histPath = path.join(tempDir, 'history', 'trust-registry.v1.json');
+  if (fs.existsSync(histPath)) {
+    fs.writeFileSync(histPath, JSON.stringify(v1NoHwm, null, 2), 'utf8');
+  }
+  try { fs.unlinkSync(localWitness); } catch (_) {}
+  const journalPath = getRevocationJournalPath(opts);
+  const checkpointPath = getRevocationCheckpointPath(opts);
+  try { fs.unlinkSync(journalPath); } catch (_) {}
+  try { fs.unlinkSync(checkpointPath); } catch (_) {}
+
+  // loadTrustRegistry must detect rollback against persistent system witness
+  assert.throws(
+    () => loadTrustRegistry({ ...opts, failClosed: true }),
+    /MONOTONIC_WITNESS_ROLLBACK_DETECTED/
+  );
+
+  // 4. R13-B03: doLoadRevocationJournal fail-closed when registry is invalid or freshness fails
+  assert.throws(
+    () => loadRevocationJournal({ ...opts, failClosed: true }),
+    /MONOTONIC_WITNESS_ROLLBACK_DETECTED|TRUST_REGISTRY_INVALID/
+  );
+
+  resetMonotonicWitnessForTest(tempDir, { allowInWorkspace: true });
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R13-B04 - AsyncLocalStorage confinement prevents capability leakage via lockedOpts cloning or closure', () => {
+  const tempDir = createTempDir('r13-b04-als-confinement-');
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    lockTimeoutMs: 100
+  };
+
+  let escapedOpts = null;
+  withGovernanceLock(opts, (lockedOpts) => {
+    assert.equal(isGovernanceLockHeld(tempDir), true);
+    escapedOpts = { ...lockedOpts };
+  });
+
+  // After withGovernanceLock terminates, lock is released and ALS context is destroyed
+  assert.equal(isGovernanceLockHeld(tempDir), false);
+
+  // Calling loadTrustRegistry with escapedOpts outside ALS acquires lock normally without error
+  const regRes = loadTrustRegistry(escapedOpts);
+  assert.equal(regRes.valid, true);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R13-B05 - COMMITTED WAL strictly verifies physical journal tail entry', () => {
+  const tempDir = createTempDir('r13-b05-committed-tail-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp
+  };
+
+  const journalPath = getRevocationJournalPath(opts);
+  const checkpointPath = getRevocationCheckpointPath(opts);
+  const regPath = getTrustRegistryPath(opts);
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+
+  const entry0 = {
+    entryIndex: 0,
+    timestamp: new Date().toISOString(),
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'TARGET-01',
+    reason: 'TEST',
+    prevEntryDigest: '0'.repeat(64),
+    signedBy: auth.keyId,
+    signature: '0'.repeat(128)
+  };
+  const entry0Digest = sha256Digest(canonicalJsonStringify(entry0));
+
+  // Registry and checkpoint at headIndex 0
+  const hwm = {
+    headIndex: 0,
+    headDigest: entry0Digest,
+    updatedAt: new Date().toISOString(),
+    authorizedBy: auth.keyId
+  };
+  const hwmSig = crypto.sign(null, Buffer.from(canonicalJsonStringify(hwm), 'utf8'), auth.privateKey).toString('hex');
+  const reg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: auth.keyId,
+    activeKeyFingerprint: auth.fp,
+    activePublicKeyPem: auth.pem,
+    keyType: 'ed25519',
+    pinnedSince: new Date().toISOString(),
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{ keyId: auth.keyId, keyFingerprint: auth.fp, publicKeyPem: auth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: new Date().toISOString() }],
+    revocationHighWaterMark: {
+      ...hwm,
+      signature: hwmSig
+    }
+  };
+  fs.writeFileSync(regPath, JSON.stringify(reg, null, 2), 'utf8');
+
+  const cp = {
+    headIndex: 0,
+    headDigest: entry0Digest,
+    updatedAt: new Date().toISOString(),
+    registryVersion: 1
+  };
+  fs.writeFileSync(checkpointPath, JSON.stringify(cp, null, 2), 'utf8');
+
+  // Create COMMITTED WAL
+  const committedWal = {
+    txnId: 'TXN-COMMITTED-R13-B05',
+    status: 'COMMITTED',
+    committedAt: new Date().toISOString(),
+    signedBy: auth.keyId,
+    journalPath,
+    checkpointPath,
+    regPath,
+    initialJournalSize: 0,
+    initialRegistryVersion: 1,
+    committedHwmHeadIndex: 0,
+    committedHwmHeadDigest: entry0Digest
+  };
+  const walSigPayload = Buffer.from(computeTransactionWalSignPayload(committedWal), 'utf8');
+  committedWal.signature = crypto.sign(null, walSigPayload, auth.privateKey).toString('hex');
+
+  // Case 1: Journal is missing -> fails closed
+  fs.writeFileSync(txnPath, JSON.stringify(committedWal, null, 2), 'utf8');
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_CORRUPTION_DETECTED/
+  );
+
+  // Case 2: Journal is empty (0 lines) -> fails closed
+  fs.writeFileSync(journalPath, '', 'utf8');
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_CORRUPTION_DETECTED/
+  );
+
+  // Case 3: Journal has mismatched tail entry -> fails closed
+  const tamperedEntry = { ...entry0, targetId: 'TAMPERED' };
+  fs.writeFileSync(journalPath, JSON.stringify(tamperedEntry) + '\n', 'utf8');
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_CORRUPTION_DETECTED/
+  );
+
+  // Case 4: Journal has exact matching tail entry -> succeeds, safely unlinks WAL
+  fs.writeFileSync(journalPath, JSON.stringify(entry0) + '\n', 'utf8');
+  const res = recoverAbortedRevocationTransaction(opts);
+  assert.equal(res.committed, true);
+  assert.equal(fs.existsSync(txnPath), false);
+
+  resetMonotonicWitnessForTest(tempDir, { allowInWorkspace: true });
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R13-B06 & R13-B08 - Multi-generation key rotation chain and retired key rejection', () => {
+  const tempDir = createTempDir('r13-b06-b08-rotation-');
+  const auth1 = generateTestAuthority();
+  const auth2 = generateTestAuthority();
+  const auth3 = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth1.keyId,
+    trustedRootPublicKeyPem: auth1.pem,
+    trustedRootFingerprint: auth1.fp
+  };
+
+  // 1. Genesis v1 with auth1
+  const v1Reg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: auth1.keyId,
+    activeKeyFingerprint: auth1.fp,
+    activePublicKeyPem: auth1.pem,
+    keyType: 'ed25519',
+    pinnedSince: new Date().toISOString(),
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{
+      keyId: auth1.keyId,
+      publicKeyPem: auth1.pem,
+      keyFingerprint: auth1.fp,
+      keyType: 'ed25519',
+      role: 'SUPERVISOR_ROOT',
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: new Date().toISOString()
+    }]
+  };
+  saveTrustRegistry(v1Reg, opts);
+
+  // 2. v2: rotate to auth2 (ACTIVE), auth1 becomes RETIRED, signed by auth1
+  const v2Reg = createAuthorizedRegistryUpdate(
+    v1Reg,
+    {
+      activeKeyId: auth2.keyId,
+      activeKeyFingerprint: auth2.fp,
+      activePublicKeyPem: auth2.pem,
+      keys: [
+        {
+          keyId: auth1.keyId,
+          publicKeyPem: auth1.pem,
+          keyFingerprint: auth1.fp,
+          keyType: 'ed25519',
+          role: 'SUPERVISOR_ROOT',
+          status: 'RETIRED',
+          issuedAt: new Date().toISOString()
+        },
+        {
+          keyId: auth2.keyId,
+          publicKeyPem: auth2.pem,
+          keyFingerprint: auth2.fp,
+          keyType: 'ed25519',
+          role: 'SUPERVISOR_ROOT',
+          status: 'ACTIVE',
+          issuedAt: new Date().toISOString()
+        }
+      ]
+    },
+    auth1.keyId,
+    auth1.privateKey
+  );
+  saveTrustRegistry(v2Reg, { ...opts, priorRegistry: v1Reg });
+
+  // 3. R13-B08: RETIRED key auth1 CANNOT authorize new registry update!
+  assert.throws(
+    () => createAuthorizedRegistryUpdate(
+      v2Reg,
+      { activeKeyId: auth3.keyId, activeKeyFingerprint: auth3.fp, activePublicKeyPem: auth3.pem },
+      auth1.keyId,
+      auth1.privateKey
+    ),
+    /RETIRED_KEY_AUTHORIZATION_REJECTED/
+  );
+
+  // 4. v3: rotate to auth3 (ACTIVE), auth2 becomes RETIRED, signed by auth2 (ACTIVE in v2)
+  const v3Reg = createAuthorizedRegistryUpdate(
+    v2Reg,
+    {
+      activeKeyId: auth3.keyId,
+      activeKeyFingerprint: auth3.fp,
+      activePublicKeyPem: auth3.pem,
+      keys: [
+        {
+          keyId: auth1.keyId,
+          publicKeyPem: auth1.pem,
+          keyFingerprint: auth1.fp,
+          keyType: 'ed25519',
+          role: 'SUPERVISOR_ROOT',
+          status: 'RETIRED',
+          issuedAt: new Date().toISOString()
+        },
+        {
+          keyId: auth2.keyId,
+          publicKeyPem: auth2.pem,
+          keyFingerprint: auth2.fp,
+          keyType: 'ed25519',
+          role: 'SUPERVISOR_ROOT',
+          status: 'RETIRED',
+          issuedAt: new Date().toISOString()
+        },
+        {
+          keyId: auth3.keyId,
+          publicKeyPem: auth3.pem,
+          keyFingerprint: auth3.fp,
+          keyType: 'ed25519',
+          role: 'SUPERVISOR_ROOT',
+          status: 'ACTIVE',
+          issuedAt: new Date().toISOString()
+        }
+      ]
+    },
+    auth2.keyId,
+    auth2.privateKey
+  );
+
+  // R13-B06: Validating v3 with priorRegistry v2 succeeds via unbroken historical chain (v1 in history/)
+  const v3Validation = validateTrustRegistry(v3Reg, {
+    ...opts,
+    priorRegistry: v2Reg
+  });
+  assert.equal(v3Validation.valid, true);
+
+  // Save v3
+  saveTrustRegistry(v3Reg, { ...opts, priorRegistry: v2Reg });
+
+  // Load trust registry loads v3 cleanly
+  const loaded = loadTrustRegistry(opts);
+  assert.equal(loaded.valid, true);
+  assert.equal(loaded.registry.registryVersion, 3);
+  assert.equal(loaded.registry.activeKeyId, auth3.keyId);
+
+  resetMonotonicWitnessForTest(tempDir, { allowInWorkspace: true });
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
