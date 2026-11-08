@@ -22,6 +22,7 @@ import {
   REVOCATION_TXN_FILE,
   withGovernanceLock,
   recoverAbortedRevocationTransaction,
+  computeTransactionWalSignPayload,
   REVOCATION_TYPES,
   EMBEDDED_ROOT_REGISTRY,
   DEFAULT_SUPERVISOR_KEY_ID,
@@ -1432,23 +1433,40 @@ test('PLUGIN_DATA Governance: R07 F-03 - WAL Crash Recovery restores disk state 
   const stableCheckpointBytes = fs.readFileSync(checkpointPath);
   const stableRegBytes = fs.readFileSync(regPath);
 
-  // Simulate an interrupted transaction by writing WAL with status 'PREPARED' and partial mutations
-  const txnData = {
+  // Simulate an interrupted transaction by writing signed WAL with status 'PREPARED' and partial mutations
+  const initialRegObj = JSON.parse(stableRegBytes.toString('utf8'));
+  const unsignedTxn = {
     txnId: 'SIMULATED-CRASH-TXN-1234',
     status: 'PREPARED',
     createdAt: new Date().toISOString(),
+    signedBy: auth.keyId,
     journalPath,
     initialJournalSize: stableJournalBytes.length,
     initialJournalExisted: true,
+    initialJournalSha256: crypto.createHash('sha256').update(stableJournalBytes).digest('hex'),
     checkpointPath,
-    initialCheckpointRawBase64: stableCheckpointBytes.toString('base64'),
+    initialCheckpointSha256: crypto.createHash('sha256').update(stableCheckpointBytes).digest('hex'),
     initialCheckpointExisted: true,
     regPath,
-    initialRegistryRawBase64: stableRegBytes.toString('base64'),
+    initialRegistrySha256: crypto.createHash('sha256').update(stableRegBytes).digest('hex'),
     initialRegistryExisted: true,
+    initialRegistryVersion: initialRegObj.registryVersion || 1,
+    initialHwmHeadIndex: initialRegObj.revocationHighWaterMark?.headIndex ?? -1,
+    initialHwmHeadDigest: initialRegObj.revocationHighWaterMark?.headDigest ?? '',
     histPath: null,
-    initialHistRawBase64: null,
+    initialHistSha256: '0'.repeat(64),
     initialHistExisted: false
+  };
+
+  const signPayload = Buffer.from(computeTransactionWalSignPayload(unsignedTxn), 'utf8');
+  const signature = crypto.sign(null, signPayload, auth.privateKey).toString('hex');
+
+  const txnData = {
+    ...unsignedTxn,
+    signature,
+    initialCheckpointRawBase64: stableCheckpointBytes.toString('base64'),
+    initialRegistryRawBase64: stableRegBytes.toString('base64'),
+    initialHistRawBase64: null
   };
   fs.writeFileSync(txnPath, JSON.stringify(txnData, null, 2), 'utf8');
 
@@ -1732,5 +1750,232 @@ test('PLUGIN_DATA Governance: R09-B03 - Stale reclaim lock with ALIVE PID is NOT
 
   // Assert reclaim lock was NOT unlinked because PID is alive
   assert.equal(fs.existsSync(reclaimLockFile), true);
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R10-B01 - Counterfeit PREPARED WAL without valid signature fails closed', () => {
+  const tempDir = createTempDir('r10-b01-counterfeit-wal-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  const journalPath = getRevocationJournalPath(opts);
+  const checkpointPath = getRevocationCheckpointPath(opts);
+  const regPath = getTrustRegistryPath(opts);
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+
+  // 1. Missing signature fails closed
+  const missingSigWal = {
+    txnId: 'TXN-FORGED-1',
+    status: 'PREPARED',
+    createdAt: new Date().toISOString(),
+    signedBy: auth.keyId,
+    journalPath,
+    initialJournalSize: 0,
+    checkpointPath,
+    regPath,
+    initialRegistryVersion: 1
+  };
+  fs.writeFileSync(txnPath, JSON.stringify(missingSigWal, null, 2), 'utf8');
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_CORRUPTION_DETECTED/
+  );
+
+  // 2. Tampered signature fails closed
+  const tamperedSigWal = {
+    ...missingSigWal,
+    signature: 'deadbeef'.repeat(16)
+  };
+  fs.writeFileSync(txnPath, JSON.stringify(tamperedSigWal, null, 2), 'utf8');
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_SIGNATURE_INVALID/
+  );
+
+  // 3. Untrusted signer fails closed
+  const untrustedSignerWal = {
+    ...missingSigWal,
+    signedBy: 'ROGUE-SIGNER-KEY',
+    signature: 'deadbeef'.repeat(16)
+  };
+  fs.writeFileSync(txnPath, JSON.stringify(untrustedSignerWal, null, 2), 'utf8');
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_SIGNER_UNTRUSTED/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R10-B01 - Replayed old snapshot in WAL fails closed against higher on-disk version or HWM', () => {
+  const tempDir = createTempDir('r10-b01-anti-rollback-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  // Perform two revocations so that on-disk HWM reaches headIndex: 1
+  appendRevocationEntry({ revocationType: REVOCATION_TYPES.NONCE_REVOCATION, targetId: 'NONCE-1' }, opts);
+  appendRevocationEntry({ revocationType: REVOCATION_TYPES.NONCE_REVOCATION, targetId: 'NONCE-2' }, opts);
+
+  const journalPath = getRevocationJournalPath(opts);
+  const checkpointPath = getRevocationCheckpointPath(opts);
+  const regPath = getTrustRegistryPath(opts);
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+
+  // Now an attacker signs a WAL claiming an initial state of Genesis with NO revocations (initialHwmHeadIndex: -1)
+  const oldWalFields = {
+    txnId: 'TXN-REPLAY-ATTACK',
+    status: 'PREPARED',
+    createdAt: new Date().toISOString(),
+    signedBy: auth.keyId,
+    journalPath,
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    checkpointPath,
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    regPath,
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: false,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: -1, // Old state before revocations!
+    initialHwmHeadDigest: '',
+    histPath: null,
+    initialHistSha256: '0'.repeat(64),
+    initialHistExisted: false
+  };
+
+  const signPayload = Buffer.from(computeTransactionWalSignPayload(oldWalFields), 'utf8');
+  const signature = crypto.sign(null, signPayload, auth.privateKey).toString('hex');
+  const replayedWal = { ...oldWalFields, signature };
+
+  fs.writeFileSync(txnPath, JSON.stringify(replayedWal, null, 2), 'utf8');
+
+  // Attempting recovery MUST fail closed because on-disk state already has committed HWM index 1!
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_ROLLBACK_ATTEMPT_DETECTED/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R10-B03 - withFileLock Default-Deny on invalid PID and atomic descriptor inode release', () => {
+  const tempDir = createTempDir('r10-b03-pid-validation-');
+  const targetFile = path.join(tempDir, 'resource.txt');
+  const lockFile = `${targetFile}.lock`;
+  const reclaimLockFile = `${lockFile}.reclaim`;
+
+  // 1. Stale lock with string PID ("12345") or malformed JSON MUST NOT be reclaimed under Default-Deny
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: "12345", timestamp: Date.now() - 60000, lockId: 'STRING-PID' }), 'utf8');
+  const oldTime = (Date.now() - 60000) / 1000;
+  fs.utimesSync(lockFile, oldTime, oldTime);
+
+  // An acquisition attempt must timeout because string PID is not presumed dead!
+  assert.throws(
+    () => withFileLock(targetFile, () => 'SHOULD_NOT_ACQUIRE', { lockTimeoutMs: 150, staleLockTimeoutMs: 1000 }),
+    /LOCK_TIMEOUT/
+  );
+  assert.equal(fs.existsSync(lockFile), true);
+
+  // 2. Stale reclaim lock with invalid string PID is NOT unlinked
+  fs.writeFileSync(reclaimLockFile, JSON.stringify({ pid: "999999", timestamp: Date.now() - 5000, reclaimLockId: 'STRING-REC' }), 'utf8');
+  const reclaimOldTime = (Date.now() - 5000) / 1000;
+  fs.utimesSync(reclaimLockFile, reclaimOldTime, reclaimOldTime);
+
+  assert.throws(
+    () => withFileLock(targetFile, () => 'SHOULD_NOT_ACQUIRE', { lockTimeoutMs: 150, staleLockTimeoutMs: 1000 }),
+    /LOCK_TIMEOUT/
+  );
+  assert.equal(fs.existsSync(reclaimLockFile), true);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R10-B04 - WAL marked COMMITTED does not roll back on subsequent recovery', () => {
+  const tempDir = createTempDir('r10-b04-committed-wal-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  // Append entry successfully
+  const res = appendRevocationEntry(
+    { revocationType: REVOCATION_TYPES.NONCE_REVOCATION, targetId: 'NONCE-COMMITTED' },
+    opts
+  );
+  assert.equal(res.success, true);
+
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  // Simulate situation where transaction committed but WAL file remained with status 'COMMITTED'
+  fs.writeFileSync(txnPath, JSON.stringify({
+    txnId: 'COMMITTED-TXN-1234',
+    status: 'COMMITTED',
+    committedAt: new Date().toISOString()
+  }, null, 2), 'utf8');
+
+  // Recovery should clean up COMMITTED WAL without rolling back committed revocation
+  const recRes = recoverAbortedRevocationTransaction(opts);
+  assert.equal(recRes.recovered, false);
+  assert.equal(recRes.committed, true);
+  assert.equal(fs.existsSync(txnPath), false);
+
+  // Verify revocation is still intact
+  const revCheck = isRevoked('NONCE-COMMITTED', opts);
+  assert.equal(revCheck.revoked, true);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R10-B05 - isRevoked executes atomically under unified governance lock', () => {
+  const tempDir = createTempDir('r10-b05-isrevoked-atomic-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  appendRevocationEntry(
+    { revocationType: REVOCATION_TYPES.NONCE_REVOCATION, targetId: 'NONCE-ATOMIC-TEST' },
+    opts
+  );
+
+  // Directly call isRevoked without skipLock -> should acquire governance lock, evaluate, and succeed
+  const res1 = isRevoked('NONCE-ATOMIC-TEST', opts);
+  assert.equal(res1.revoked, true);
+
+  // Call isRevoked from INSIDE withGovernanceLock with skipLock: true -> should succeed without reentrant deadlock
+  const res2 = withGovernanceLock(opts, () => {
+    return isRevoked('NONCE-ATOMIC-TEST', { ...opts, skipLock: true });
+  });
+  assert.equal(res2.revoked, true);
+
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
