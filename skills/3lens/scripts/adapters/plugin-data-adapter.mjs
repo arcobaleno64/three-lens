@@ -34,7 +34,8 @@ import crypto from 'node:crypto';
 export const ADAPTER_NAME = 'PLUGIN_DATA_DUAL_ANCHOR_ADAPTER';
 export const ADAPTER_VERSION = '1.1.0';
 
-export const INTERNAL_GOVERNANCE_TOKEN = Symbol.for('three_lens.governance.internal_lock_token');
+// R12-B04: Module-private, unforgeable governance token (not exported, not in global Symbol registry)
+const INTERNAL_GOVERNANCE_TOKEN = Symbol('three_lens.governance.internal_lock_token');
 
 export const REVOCATION_TYPES = Object.freeze({
   KEY_REVOCATION: 'KEY_REVOCATION',
@@ -270,7 +271,7 @@ export function safeWriteFileSync(targetPath, content, options = {}) {
   }
   assertSafeStorageTarget(tmpPath, options);
   fs.renameSync(tmpPath, targetPath);
-  // R11-B05: fsync parent directory on POSIX systems to persist directory entry mutation
+  // R11-B05 & R12-B07: fsync parent directory on POSIX systems to persist directory entry mutation
   try {
     const dirFd = fs.openSync(dir, 'r');
     try {
@@ -278,8 +279,12 @@ export function safeWriteFileSync(targetPath, content, options = {}) {
     } finally {
       fs.closeSync(dirFd);
     }
-  } catch (_) {
-    // Windows or filesystems that do not support directory fsync ignore gracefully
+  } catch (dirErr) {
+    // Windows throws EISDIR/EPERM/EINVAL when attempting to open or fsync a directory descriptor.
+    // On POSIX, fsync on a directory is supported; if it fails with physical I/O failure (EIO), fail-closed!
+    if (process.platform !== 'win32' && dirErr.code === 'EIO') {
+      throw new Error(`[STORAGE_DURABILITY_FAILURE] Failed to fsync directory ${dir}: ${dirErr.message}`);
+    }
   }
 }
 
@@ -536,7 +541,9 @@ export function withGovernanceLock(options, fn) {
   const lockTarget = path.join(dir, GOVERNANCE_LOCK_TARGET);
   return withFileLock(lockTarget, () => {
     const prevToken = opts[INTERNAL_GOVERNANCE_TOKEN];
+    const prevSkipLock = opts.skipLock;
     opts[INTERNAL_GOVERNANCE_TOKEN] = true;
+    opts.skipLock = true;
     try {
       return callback({
         ...opts,
@@ -549,6 +556,11 @@ export function withGovernanceLock(options, fn) {
       } else {
         opts[INTERNAL_GOVERNANCE_TOKEN] = prevToken;
       }
+      if (prevSkipLock === undefined) {
+        delete opts.skipLock;
+      } else {
+        opts.skipLock = prevSkipLock;
+      }
     }
   }, opts);
 }
@@ -556,11 +568,20 @@ export function withGovernanceLock(options, fn) {
 /**
  * Recovers an uncommitted or interrupted revocation transaction from WAL snapshot.
  * Resolves Round 07 F-03: Crash recovery / power loss recovery across multi-file writes.
+ * Resolves Round 12 B-04: Enforces execution under unified governance lock.
  *
  * @param {object} [options={}]
  * @returns {{ recovered: boolean, txnId?: string }}
  */
 export function recoverAbortedRevocationTransaction(options = {}) {
+  const canSkipLock = options.skipLock === true && options[INTERNAL_GOVERNANCE_TOKEN] === true;
+  if (canSkipLock) {
+    return _recoverAbortedRevocationTransactionInner(options);
+  }
+  return withGovernanceLock(options, (lockedOpts) => _recoverAbortedRevocationTransactionInner(lockedOpts));
+}
+
+function _recoverAbortedRevocationTransactionInner(options = {}) {
   const dir = resolvePluginDataDir(options);
   const txnPath = path.join(dir, REVOCATION_TXN_FILE);
   if (!fs.existsSync(txnPath)) {
@@ -627,7 +648,7 @@ export function recoverAbortedRevocationTransaction(options = {}) {
     throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Transaction WAL missing required paths, sizes, or cryptographic metadata');
   }
 
-  // R10-B01 & R11-B01: Authenticate signer public key against trusted root or validated registry
+  // R10-B01 & R11-B01 & R12-B06: Authenticate signer public key against trusted root or validated registry
   let signerPublicKeyPem = null;
   if (options.trustedRootKeyId === txnData.signedBy && options.trustedRootPublicKeyPem) {
     signerPublicKeyPem = options.trustedRootPublicKeyPem;
@@ -639,18 +660,15 @@ export function recoverAbortedRevocationTransaction(options = {}) {
       signerPublicKeyPem = embKey.publicKeyPem;
     } else if (fs.existsSync(expectedRegPath)) {
       try {
-        const rawReg = fs.readFileSync(expectedRegPath, 'utf8');
-        const candidateReg = JSON.parse(rawReg);
-        // R11-B01: STRICTLY validate candidateReg against genesis root authority
-        // before trusting any key declared within it!
-        const validated = validateTrustRegistry(candidateReg, {
+        // R12-B06: Authenticate candidate registry via full trust chain back to genesis
+        const loadedReg = doLoadTrustRegistry({
           ...options,
           skipLock: true,
           [INTERNAL_GOVERNANCE_TOKEN]: true,
-          allowEmbeddedFallback: true
+          failClosed: true
         });
-        if (validated && validated.valid === true && Array.isArray(candidateReg.keys)) {
-          const regKey = candidateReg.keys.find(k => k.keyId === txnData.signedBy);
+        if (loadedReg && loadedReg.valid && loadedReg.registry && Array.isArray(loadedReg.registry.keys)) {
+          const regKey = loadedReg.registry.keys.find(k => k.keyId === txnData.signedBy);
           if (regKey && (regKey.status === 'ACTIVE' || regKey.status === 'ACTIVE_PINNED_ROOT')) {
             signerPublicKeyPem = regKey.publicKeyPem;
           }
@@ -677,20 +695,36 @@ export function recoverAbortedRevocationTransaction(options = {}) {
     throw new Error(`[TRANSACTION_WAL_SIGNATURE_INVALID] Cryptographic signature verification failed for WAL ${txnData.txnId}: ${sigErr.message}`);
   }
 
-  // R11-B02: Verified COMMITTED WAL handling backed by authentic on-disk state
+  // R11-B02 & R12-B03: Verified COMMITTED WAL handling backed by authentic on-disk post-image state
   if (txnData.status === 'COMMITTED') {
     if (!fs.existsSync(expectedRegPath) || !fs.existsSync(expectedCheckpointPath)) {
       throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL exists but on-disk registry or checkpoint is missing');
+    }
+    if (
+      typeof txnData.committedHwmHeadIndex !== 'number' ||
+      typeof txnData.committedHwmHeadDigest !== 'string' ||
+      txnData.committedHwmHeadDigest.length !== 64
+    ) {
+      throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL missing mandatory committedHwmHeadIndex or committedHwmHeadDigest');
     }
     try {
       const curReg = JSON.parse(fs.readFileSync(expectedRegPath, 'utf8'));
       const curCp = JSON.parse(fs.readFileSync(expectedCheckpointPath, 'utf8'));
       if (
-        typeof txnData.committedHwmHeadIndex === 'number' &&
-        (curReg.revocationHighWaterMark?.headIndex !== txnData.committedHwmHeadIndex ||
-         curCp.headIndex !== txnData.committedHwmHeadIndex)
+        !curReg || typeof curReg !== 'object' ||
+        !curCp || typeof curCp !== 'object' ||
+        curReg.revocationHighWaterMark?.headIndex !== txnData.committedHwmHeadIndex ||
+        curReg.revocationHighWaterMark?.headDigest !== txnData.committedHwmHeadDigest ||
+        curCp.headIndex !== txnData.committedHwmHeadIndex ||
+        curCp.headDigest !== txnData.committedHwmHeadDigest
       ) {
-        throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL headIndex does not match on-disk registry/checkpoint headIndex');
+        throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL headIndex/headDigest does not match on-disk registry/checkpoint post-image');
+      }
+      if (
+        typeof txnData.expectedTargetRegistryVersion === 'number' &&
+        curReg.registryVersion < txnData.expectedTargetRegistryVersion
+      ) {
+        throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL registryVersion does not match on-disk registry');
       }
     } catch (parseErr) {
       if (parseErr.message && parseErr.message.includes('TRANSACTION_WAL_CORRUPTION_DETECTED')) {
@@ -698,10 +732,12 @@ export function recoverAbortedRevocationTransaction(options = {}) {
       }
       throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Failed to verify committed state for COMMITTED WAL: ${parseErr.message}`);
     }
+    assertSafeStorageTarget(txnPath, options);
     try {
-      assertSafeStorageTarget(txnPath, options);
       fs.unlinkSync(txnPath);
-    } catch (_) {}
+    } catch (unlinkErr) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Failed to unlink COMMITTED WAL: ${unlinkErr.message}`);
+    }
     return { recovered: false, committed: true, txnId: txnData.txnId };
   }
 
@@ -725,54 +761,82 @@ export function recoverAbortedRevocationTransaction(options = {}) {
     }
   }
 
-  // R10-B01, R11-B03, R11-B04: Monotonicity, Anti-Rollback & Legitimate Completion Checks
+  // R10-B01, R11-B03, R11-B04, R12-B01, R12-B05: Monotonicity, Anti-Rollback & Legitimate Completion Checks
   if (fs.existsSync(expectedRegPath)) {
     let currentReg = null;
     try {
       currentReg = JSON.parse(fs.readFileSync(expectedRegPath, 'utf8'));
     } catch (readErr) {
       // R11-B03: Fail-Closed under Default-Deny if existing registry cannot be parsed.
-      // Never ignore corrupted registry to prevent rollback attacks!
       throw new Error(`[TRANSACTION_WAL_ROLLBACK_CHECK_FAILED] Existing trust registry exists but cannot be verified for anti-rollback: ${readErr.message}`);
     }
 
-    const curRegVer = currentReg.registryVersion;
-    const curHwmIdx = currentReg.revocationHighWaterMark?.headIndex;
-    const curHwmDigest = currentReg.revocationHighWaterMark?.headDigest;
+    // R12-B01: Schema validation of on-disk registry under Default-Deny.
+    // If registry is {} or missing required schema fields, it MUST fail closed to prevent rollback.
+    if (
+      !currentReg ||
+      typeof currentReg !== 'object' ||
+      typeof currentReg.registryVersion !== 'number' ||
+      currentReg.registryVersion < 1
+    ) {
+      throw new Error('[TRANSACTION_WAL_ROLLBACK_CHECK_FAILED] Existing trust registry on disk is schema-corrupt or missing registryVersion; refusing rollback under Default-Deny');
+    }
 
-    // R11-B04: Check if transaction actually completed all on-disk mutations before crash
-    const isTransactionCompletedOnDisk = (
+    const curRegVer = currentReg.registryVersion;
+    const curHwm = currentReg.revocationHighWaterMark;
+    const curHwmIdx = curHwm ? curHwm.headIndex : -1;
+    const curHwmDigest = curHwm ? curHwm.headDigest : '';
+
+    if (curHwm && typeof curHwm.headIndex !== 'number') {
+      throw new Error('[TRANSACTION_WAL_ROLLBACK_CHECK_FAILED] Existing trust registry on disk has invalid revocationHighWaterMark; refusing rollback');
+    }
+
+    // R11-B04 & R12-B05: Check if transaction actually completed all on-disk mutations before crash
+    const isTargetExpected = (
       typeof txnData.expectedTargetHwmHeadIndex === 'number' &&
-      curHwmIdx === txnData.expectedTargetHwmHeadIndex &&
-      curHwmDigest === txnData.expectedTargetHwmHeadDigest
+      typeof txnData.expectedTargetHwmHeadDigest === 'string' &&
+      txnData.expectedTargetHwmHeadDigest.length === 64
     );
 
-    if (isTransactionCompletedOnDisk) {
-      // Verify checkpoint also reflects the completed transaction
-      if (fs.existsSync(expectedCheckpointPath)) {
+    if (isTargetExpected) {
+      const regMatches = (
+        curHwmIdx === txnData.expectedTargetHwmHeadIndex &&
+        curHwmDigest === txnData.expectedTargetHwmHeadDigest &&
+        (typeof txnData.expectedTargetRegistryVersion !== 'number' || curRegVer >= txnData.expectedTargetRegistryVersion)
+      );
+
+      if (regMatches && fs.existsSync(expectedCheckpointPath)) {
         try {
           const curCp = JSON.parse(fs.readFileSync(expectedCheckpointPath, 'utf8'));
-          if (curCp.headIndex === txnData.expectedTargetHwmHeadIndex && curCp.headDigest === txnData.expectedTargetHwmHeadDigest) {
+          const cpMatches = (
+            curCp &&
+            curCp.headIndex === txnData.expectedTargetHwmHeadIndex &&
+            curCp.headDigest === txnData.expectedTargetHwmHeadDigest
+          );
+          const journalMatches = (
+            fs.existsSync(expectedJournalPath) &&
+            fs.statSync(expectedJournalPath).size > txnData.initialJournalSize
+          );
+
+          if (cpMatches && journalMatches) {
             // The transaction was fully committed to disk before crash! Safely clean up marker.
-            try {
-              assertSafeStorageTarget(txnPath, options);
-              fs.unlinkSync(txnPath);
-            } catch (_) {}
+            assertSafeStorageTarget(txnPath, options);
+            fs.unlinkSync(txnPath);
             return { recovered: false, committed: true, txnId: txnData.txnId };
           }
         } catch (_) {}
       }
     }
 
-    // Monotonicity anti-rollback checks
-    if (typeof curRegVer === 'number' && curRegVer > txnData.initialRegistryVersion) {
+    // Monotonicity anti-rollback checks under Default-Deny
+    if (curRegVer > txnData.initialRegistryVersion) {
       throw new Error(`[TRANSACTION_WAL_ROLLBACK_ATTEMPT_DETECTED] WAL attempted to roll back registryVersion (${txnData.initialRegistryVersion}) below current on-disk version (${curRegVer})`);
     }
-    if (typeof curHwmIdx === 'number' && curHwmIdx > txnData.initialHwmHeadIndex) {
+    if (curHwmIdx > txnData.initialHwmHeadIndex) {
       throw new Error(`[TRANSACTION_WAL_ROLLBACK_ATTEMPT_DETECTED] WAL attempted to roll back revocationHighWaterMark headIndex (${txnData.initialHwmHeadIndex}) below committed on-disk HWM (${curHwmIdx})`);
     }
     // R11-B03: Check history divergence at same headIndex
-    if (typeof curHwmIdx === 'number' && curHwmIdx === txnData.initialHwmHeadIndex && txnData.initialHwmHeadDigest) {
+    if (curHwmIdx === txnData.initialHwmHeadIndex && txnData.initialHwmHeadDigest) {
       if (curHwmDigest !== txnData.initialHwmHeadDigest) {
         throw new Error(`[TRANSACTION_WAL_HISTORY_DIVERGENCE_DETECTED] WAL initialHwmHeadDigest does not match committed on-disk HWM headDigest at same index (${curHwmDigest} !== ${txnData.initialHwmHeadDigest})`);
       }
@@ -1832,6 +1896,13 @@ function doLoadTrustRegistry(options = {}) {
         };
       }
 
+      // R12-B02: Enforce monotonic witness freshness
+      const currentHwmIdx = typeof parsed.revocationHighWaterMark?.headIndex === 'number'
+        ? parsed.revocationHighWaterMark.headIndex
+        : -1;
+      assertMonotonicWitnessFreshness(dir, parsed.registryVersion, currentHwmIdx, options);
+      updateMonotonicWitness(dir, parsed.registryVersion, currentHwmIdx);
+
       return {
         source: 'PLUGIN_DATA',
         registry: parsed,
@@ -1953,6 +2024,65 @@ function doLoadTrustRegistry(options = {}) {
 }
 
 /**
+ * R12-B02: Directory-Bound Monotonic Freshness Witness Anchor.
+ * Defends against whole-directory state rollback where an attacker restores
+ * a past valid snapshot of PLUGIN_DATA (Registry, Checkpoint, Journal, History).
+ */
+const _DIR_MONOTONIC_WITNESS = new Map();
+
+export function getMonotonicWitness(dir) {
+  const norm = path.resolve(dir);
+  if (!_DIR_MONOTONIC_WITNESS.has(norm)) {
+    _DIR_MONOTONIC_WITNESS.set(norm, { maxSeenRegistryVersion: 1, maxSeenHwmHeadIndex: -1 });
+  }
+  return _DIR_MONOTONIC_WITNESS.get(norm);
+}
+
+export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex) {
+  const witness = getMonotonicWitness(dir);
+  if (typeof registryVersion === 'number' && registryVersion > witness.maxSeenRegistryVersion) {
+    witness.maxSeenRegistryVersion = registryVersion;
+  }
+  if (typeof hwmHeadIndex === 'number' && hwmHeadIndex > witness.maxSeenHwmHeadIndex) {
+    witness.maxSeenHwmHeadIndex = hwmHeadIndex;
+  }
+}
+
+export function resetMonotonicWitness(dir) {
+  if (dir) {
+    _DIR_MONOTONIC_WITNESS.delete(path.resolve(dir));
+  } else {
+    _DIR_MONOTONIC_WITNESS.clear();
+  }
+}
+
+export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, candidateHwmHeadIndex, options = {}) {
+  const externalWitness = options.externalMonotonicWitness || {};
+  const witness = getMonotonicWitness(dir);
+  const minRegVer = Math.max(
+    typeof options.minRegistryVersion === 'number' ? options.minRegistryVersion : 1,
+    typeof externalWitness.minRegistryVersion === 'number' ? externalWitness.minRegistryVersion : 1,
+    witness.maxSeenRegistryVersion
+  );
+  const minHwmIdx = Math.max(
+    typeof options.minHwmHeadIndex === 'number' ? options.minHwmHeadIndex : -1,
+    typeof externalWitness.minHwmHeadIndex === 'number' ? externalWitness.minHwmHeadIndex : -1,
+    witness.maxSeenHwmHeadIndex
+  );
+
+  if (typeof candidateRegistryVersion === 'number' && candidateRegistryVersion < minRegVer) {
+    throw new Error(
+      `[REGISTRY_ROLLBACK_DETECTED] [MONOTONIC_WITNESS_ROLLBACK_DETECTED] Loaded registryVersion (${candidateRegistryVersion}) is behind authenticated monotonic witness (${minRegVer})`
+    );
+  }
+  if (typeof candidateHwmHeadIndex === 'number' && candidateHwmHeadIndex < minHwmIdx) {
+    throw new Error(
+      `[REGISTRY_ROLLBACK_DETECTED] [HIGH_WATER_MARK_ROLLBACK_DETECTED] [MONOTONIC_WITNESS_ROLLBACK_DETECTED] Loaded HWM headIndex (${candidateHwmHeadIndex}) is behind authenticated monotonic witness (${minHwmIdx})`
+    );
+  }
+}
+
+/**
  * Loads trust registry under governance lock with automatic WAL crash recovery.
  * Resolves R08-B02: Executes exclusively under joint governance lock.
  *
@@ -1988,6 +2118,10 @@ export function saveTrustRegistry(registry, options = {}) {
   const doSave = (opts) => {
     recoverAbortedRevocationTransaction(opts);
     assertSafeStorageTarget(regPath, opts);
+    const saveHwmIdx = typeof registry.revocationHighWaterMark?.headIndex === 'number'
+      ? registry.revocationHighWaterMark.headIndex
+      : -1;
+    assertMonotonicWitnessFreshness(dir, registry.registryVersion, saveHwmIdx, opts);
     let priorRegistry = null;
     // Check against existing on-disk registry if present
     if (fs.existsSync(regPath)) {
@@ -2158,6 +2292,9 @@ export function saveTrustRegistry(registry, options = {}) {
     }
     safeWriteFileSync(checkpointPath, JSON.stringify(cpData, null, 2) + '\n', opts);
 
+    // R12-B02: Update monotonic witness on successful save
+    updateMonotonicWitness(dir, registry.registryVersion, registry.revocationHighWaterMark?.headIndex);
+
     return {
       success: true,
       path: normalizePath(regPath),
@@ -2182,6 +2319,7 @@ export function saveTrustRegistry(registry, options = {}) {
 function doLoadRevocationJournal(options = {}) {
   const journalPath = getRevocationJournalPath(options);
   const checkpointPath = getRevocationCheckpointPath(options);
+  const dir = path.dirname(journalPath);
 
   // Checkpoint audit (F01: Detect deletion / rollback)
   let checkpoint = null;
@@ -2383,6 +2521,11 @@ function doLoadRevocationJournal(options = {}) {
         return { valid: false, entries: [], error: msg, count: entries.length, path: journalPath };
       }
     }
+
+    // R12-B02: Enforce monotonic witness freshness
+    const activeHeadIndex = checkpoint ? checkpoint.headIndex : (registryHwm ? registryHwm.headIndex : -1);
+    assertMonotonicWitnessFreshness(dir, undefined, activeHeadIndex, options);
+    updateMonotonicWitness(dir, undefined, activeHeadIndex);
 
     return { valid: true, entries, error: null, count: entries.length, path: journalPath };
   } catch (err) {
@@ -2683,6 +2826,9 @@ export function appendRevocationEntry(entryInput, options = {}) {
         assertSafeStorageTarget(txnPath, options);
         if (fs.existsSync(txnPath)) fs.unlinkSync(txnPath);
       } catch (_) {}
+
+      // R12-B02: Update monotonic witness on successful revocation append
+      updateMonotonicWitness(dir, regObj ? regObj.registryVersion : 1, entryIndex);
 
       return {
         success: true,

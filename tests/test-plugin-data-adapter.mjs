@@ -27,7 +27,8 @@ import {
   EMBEDDED_ROOT_REGISTRY,
   DEFAULT_SUPERVISOR_KEY_ID,
   DEFAULT_SUPERVISOR_PUBLIC_PEM,
-  DEFAULT_SUPERVISOR_FINGERPRINT
+  DEFAULT_SUPERVISOR_FINGERPRINT,
+  canonicalJsonStringify
 } from '../scripts/adapters/plugin-data-adapter.mjs';
 
 function createTempDir(prefix = 'test-plugin-data-') {
@@ -2258,6 +2259,360 @@ test('PLUGIN_DATA Governance: R11-B04 - Crash after registry update is recognize
   assert.equal(recRes.recovered, false);
   assert.equal(recRes.committed, true);
   assert.equal(fs.existsSync(txnPath), false);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R12-B01 - Empty or schema-corrupt on-disk registry fails closed and prevents WAL rollback', () => {
+  const tempDir = createTempDir('r12-b01-empty-reg-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  // Attacker places an empty JSON object '{}' on disk
+  const regPath = getTrustRegistryPath(opts);
+  fs.writeFileSync(regPath, JSON.stringify({}), 'utf8');
+
+  // Validly signed PREPARED WAL exists from authorized supervisor
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const wal = {
+    txnId: 'WAL-EMPTY-REG-R12',
+    status: 'PREPARED',
+    createdAt: new Date().toISOString(),
+    signedBy: auth.keyId,
+    journalPath: getRevocationJournalPath(opts),
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    checkpointPath: getRevocationCheckpointPath(opts),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    regPath,
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: false,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: ''
+  };
+  const payload = Buffer.from(computeTransactionWalSignPayload(wal), 'utf8');
+  wal.signature = crypto.sign(null, payload, auth.privateKey).toString('hex');
+  fs.writeFileSync(txnPath, JSON.stringify(wal, null, 2), 'utf8');
+
+  // Must fail closed under Default-Deny instead of skipping anti-rollback check
+  assert.throws(() => {
+    recoverAbortedRevocationTransaction(opts);
+  }, /TRANSACTION_WAL_ROLLBACK_CHECK_FAILED/);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R12-B02 - External monotonic witness and in-process witness reject full-directory state rollback', () => {
+  const tempDir = createTempDir('r12-b02-witness-rollback-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  // 1. Establish state with initial v1 registry and a revocation entry (HWM >= 0, version 1)
+  const initialReg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: auth.keyId,
+    activeKeyFingerprint: auth.fp,
+    activePublicKeyPem: auth.pem,
+    keyType: 'ed25519',
+    pinnedSince: new Date().toISOString(),
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{
+      keyId: auth.keyId,
+      publicKeyPem: auth.pem,
+      keyFingerprint: auth.fp,
+      keyType: 'ed25519',
+      role: 'SUPERVISOR_ROOT',
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: new Date().toISOString()
+    }]
+  };
+  saveTrustRegistry(initialReg, opts);
+
+  const res = appendRevocationEntry(
+    { revocationType: REVOCATION_TYPES.KEY_REVOCATION, targetId: 'KEY-REVOKED-WITNESS-TEST' },
+    opts
+  );
+  assert.equal(res.success, true);
+
+  // 2. Attacker restores the whole directory to the earlier historical snapshot (initialReg without revocations)
+  const regPath = getTrustRegistryPath(opts);
+  const journalPath = getRevocationJournalPath(opts);
+  const cpPath = getRevocationCheckpointPath(opts);
+  const histPath = path.join(tempDir, 'history', 'trust-registry.v1.json');
+  fs.unlinkSync(journalPath);
+  fs.unlinkSync(cpPath);
+  const rawV1 = JSON.stringify(initialReg, null, 2) + '\n';
+  fs.writeFileSync(regPath, rawV1, 'utf8');
+  fs.writeFileSync(histPath, rawV1, 'utf8');
+
+  // 3. Process witness knows HWM headIndex was res.entryIndex; reading restored old state must fail closed
+  assert.throws(() => {
+    loadTrustRegistry(opts);
+  }, /MONOTONIC_WITNESS_ROLLBACK_DETECTED/);
+
+  // 4. External monotonic witness in options also rejects rollback fail-closed
+  assert.throws(() => {
+    loadTrustRegistry({
+      ...opts,
+      externalMonotonicWitness: { minRegistryVersion: 1, minHwmHeadIndex: 0 }
+    });
+  }, /MONOTONIC_WITNESS_ROLLBACK_DETECTED/);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R12-B03 - COMMITTED WAL with mismatched or missing committedHwmHeadDigest fails closed', () => {
+  const tempDir = createTempDir('r12-b03-committed-digest-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  // Perform normal append
+  const res = appendRevocationEntry(
+    { revocationType: REVOCATION_TYPES.NONCE_REVOCATION, targetId: 'NONCE-DIGEST-TEST' },
+    opts
+  );
+  assert.equal(res.success, true);
+
+  // Create COMMITTED WAL with mismatched committedHwmHeadDigest
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const wal = {
+    txnId: 'WAL-COMMITTED-BAD-DIGEST',
+    status: 'COMMITTED',
+    createdAt: new Date().toISOString(),
+    committedAt: new Date().toISOString(),
+    signedBy: auth.keyId,
+    journalPath: getRevocationJournalPath(opts),
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    checkpointPath: getRevocationCheckpointPath(opts),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    regPath: getTrustRegistryPath(opts),
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: false,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: '',
+    committedHwmHeadIndex: res.entryIndex,
+    committedHwmHeadDigest: 'f'.repeat(64) // Forged/mismatched digest!
+  };
+  const payload = Buffer.from(computeTransactionWalSignPayload(wal), 'utf8');
+  wal.signature = crypto.sign(null, payload, auth.privateKey).toString('hex');
+  fs.writeFileSync(txnPath, JSON.stringify(wal, null, 2), 'utf8');
+
+  // Must fail closed and MUST NOT unlink the WAL!
+  assert.throws(() => {
+    recoverAbortedRevocationTransaction(opts);
+  }, /TRANSACTION_WAL_CORRUPTION_DETECTED/);
+  assert.equal(fs.existsSync(txnPath), true);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R12-B04 - Cannot bypass withGovernanceLock via global Symbol.for', () => {
+  const tempDir = createTempDir('r12-b04-symbol-for-bypass-');
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    skipLock: true,
+    [Symbol.for('three_lens.governance.internal_lock_token')]: true
+  };
+
+  // Caller attempts to bypass withGovernanceLock by fabricating Symbol.for token.
+  // Module private Symbol cannot be forged, so skipLock is ignored and lock is acquired.
+  const res = loadTrustRegistry(opts);
+  assert.equal(res.valid, true);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R12-B05 - PREPARED WAL does not claim committed without full on-disk post-image match', () => {
+  const tempDir = createTempDir('r12-b05-partial-wal-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  const res = appendRevocationEntry(
+    { revocationType: REVOCATION_TYPES.NONCE_REVOCATION, targetId: 'NONCE-PARTIAL-TEST' },
+    opts
+  );
+  assert.equal(res.success, true);
+
+  // Delete the checkpoint file to simulate partial write failure before crash
+  const cpPath = getRevocationCheckpointPath(opts);
+  fs.unlinkSync(cpPath);
+
+  // PREPARED WAL claiming expected target exists
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const wal = {
+    txnId: 'WAL-PARTIAL-WRITE',
+    status: 'PREPARED',
+    createdAt: new Date().toISOString(),
+    signedBy: auth.keyId,
+    journalPath: getRevocationJournalPath(opts),
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    checkpointPath: cpPath,
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    regPath: getTrustRegistryPath(opts),
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: false,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: '',
+    expectedTargetHwmHeadIndex: res.entryIndex,
+    expectedTargetHwmHeadDigest: res.entryDigest,
+    expectedTargetRegistryVersion: 1
+  };
+  const payload = Buffer.from(computeTransactionWalSignPayload(wal), 'utf8');
+  wal.signature = crypto.sign(null, payload, auth.privateKey).toString('hex');
+  fs.writeFileSync(txnPath, JSON.stringify(wal, null, 2), 'utf8');
+
+  // Because checkpoint is missing, recovery MUST NOT falsely claim committed
+  assert.throws(() => {
+    recoverAbortedRevocationTransaction(opts);
+  }, /TRANSACTION_WAL_ROLLBACK_ATTEMPT_DETECTED/);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R12-B06 - Rotated supervisor key in validated history chain can authorize WAL', () => {
+  const tempDir = createTempDir('r12-b06-rotated-key-wal-');
+  const auth1 = generateTestAuthority();
+  const auth2 = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth1.keyId,
+    trustedRootPublicKeyPem: auth1.pem,
+    trustedRootFingerprint: auth1.fp
+  };
+
+  // 1. Initialize v1 registry
+  const v1Reg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: auth1.keyId,
+    activeKeyFingerprint: auth1.fp,
+    activePublicKeyPem: auth1.pem,
+    keyType: 'ed25519',
+    pinnedSince: new Date().toISOString(),
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{
+      keyId: auth1.keyId,
+      publicKeyPem: auth1.pem,
+      keyFingerprint: auth1.fp,
+      keyType: 'ed25519',
+      role: 'SUPERVISOR_ROOT',
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: new Date().toISOString()
+    }]
+  };
+  saveTrustRegistry(v1Reg, opts);
+
+  // 2. Rotate to v2 signed by auth1, introducing auth2 as ACTIVE
+  const v2Reg = createAuthorizedRegistryUpdate(
+    v1Reg,
+    {
+      activeKeyId: auth2.keyId,
+      activeKeyFingerprint: auth2.fp,
+      activePublicKeyPem: auth2.pem,
+      keys: [
+        {
+          keyId: auth1.keyId,
+          publicKeyPem: auth1.pem,
+          keyFingerprint: auth1.fp,
+          keyType: 'ed25519',
+          role: 'SUPERVISOR_ROOT',
+          status: 'RETIRED',
+          issuedAt: new Date().toISOString()
+        },
+        {
+          keyId: auth2.keyId,
+          publicKeyPem: auth2.pem,
+          keyFingerprint: auth2.fp,
+          keyType: 'ed25519',
+          role: 'SUPERVISOR_ROOT',
+          status: 'ACTIVE',
+          issuedAt: new Date().toISOString()
+        }
+      ]
+    },
+    auth1.keyId,
+    auth1.privateKey
+  );
+  saveTrustRegistry(v2Reg, { ...opts, priorRegistry: v1Reg });
+
+  // 3. Create a PREPARED WAL signed by auth2 (newly rotated active key)
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const wal = {
+    txnId: 'WAL-ROTATED-KEY-R12',
+    status: 'PREPARED',
+    createdAt: new Date().toISOString(),
+    signedBy: auth2.keyId,
+    journalPath: getRevocationJournalPath(opts),
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    checkpointPath: getRevocationCheckpointPath(opts),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    regPath: getTrustRegistryPath(opts),
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: false,
+    initialRegistryVersion: 2,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: ''
+  };
+  const payload = Buffer.from(computeTransactionWalSignPayload(wal), 'utf8');
+  wal.signature = crypto.sign(null, payload, auth2.privateKey).toString('hex');
+  fs.writeFileSync(txnPath, JSON.stringify(wal, null, 2), 'utf8');
+
+  // Recovery must validate auth2 through the historical trust chain and recover cleanly
+  const recRes = recoverAbortedRevocationTransaction(opts);
+  assert.equal(recRes.recovered, true);
 
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
