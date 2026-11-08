@@ -5218,10 +5218,10 @@ test('R19-B03: WAL recovery synchronizes history/trust-registry.v*.json when cra
   saveTrustRegistry(reg1, opts);
 
   const regPath = getTrustRegistryPath(opts);
-  const histV1Path = path.join(tempDir, 'history', 'trust-registry.v1.json');
+  const histV1Path = path.join(path.dirname(regPath), 'history', 'trust-registry.v1.json');
   const journalPath = getRevocationJournalPath(opts);
   const cpPath = getRevocationCheckpointPath(opts);
-  const walPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const walPath = path.join(path.dirname(regPath), REVOCATION_TXN_FILE);
 
   const preImageRegRaw = fs.readFileSync(regPath);
   const preImageRegObj = JSON.parse(preImageRegRaw.toString('utf8'));
