@@ -39,7 +39,8 @@ import {
   sha256Digest,
   getMonotonicWitness,
   assertSafeStorageTarget,
-  updateMonotonicWitness
+  updateMonotonicWitness,
+  computeRegistryNonHwmDigest
 } from '../scripts/adapters/plugin-data-adapter.mjs';
 
 function createTempDir(prefix = 'test-plugin-data-') {
@@ -4878,46 +4879,441 @@ test('PLUGIN_DATA Governance: R18-B04 - WAL recovery accepts historical journal 
   assert.strictEqual(recResult.committed, true);
   assert.strictEqual(fs.existsSync(walPath), false);
 
-  // 6. Also verify that if entry 1 was forged/signed by retired authA (outside its active window of index <= 0), recovery fails closed
+  // 6. Also verify that if entry 2 is forged/signed by retired authA (outside its active window of index <= 0), recovery and journal load fail closed specifically with RETIRED_KEY_AUTHORIZATION_REJECTED (R19-B04)
   const lines = fs.readFileSync(journalPath, 'utf8').trim().split(/\r?\n/);
-  const forgedEntry1 = JSON.parse(lines[1]);
-  forgedEntry1.signerKeyId = authA.keyId;
-  forgedEntry1.signerKeyFingerprint = authA.fp;
-  const { entryDigest: _ed, signature: _sig, ...unsignedEntry1 } = forgedEntry1;
-  forgedEntry1.entryDigest = sha256Digest(canonicalJsonStringify(unsignedEntry1));
-  forgedEntry1.signature = crypto.sign(null, Buffer.from(forgedEntry1.entryDigest, 'utf8'), authA.privateKey).toString('hex');
-  lines[1] = JSON.stringify(forgedEntry1);
+  const entry1Obj = JSON.parse(lines[1]);
+  const entry1Digest = sha256Digest(canonicalJsonStringify(entry1Obj));
+  const forgedEntry2 = {
+    entryIndex: 2,
+    timestamp: new Date().toISOString(),
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'forged-by-retired-authA',
+    reason: 'forged under v2 by retired authA',
+    prevEntryDigest: entry1Digest,
+    signedBy: authA.keyId
+  };
+  const signPayload2 = Buffer.from(computeRevocationEntrySignPayload(forgedEntry2), 'utf8');
+  forgedEntry2.signature = crypto.sign(null, signPayload2, authA.privateKey).toString('hex');
+  const forgedLine2 = JSON.stringify(forgedEntry2);
+  const forgedEntry2Digest = sha256Digest(canonicalJsonStringify(forgedEntry2));
+  lines.push(forgedLine2);
   fs.writeFileSync(journalPath, lines.join('\n') + '\n', 'utf8');
 
-  // Update checkpoint and registry HWM to match forgedEntry1.entryDigest signed by authB so only journal entry 1's signer is retired authA
-  cp.headDigest = forgedEntry1.entryDigest;
-  const { signature: _cpSig, ...cpToSign } = cp;
-  cp.signature = crypto.sign(null, Buffer.from(canonicalJsonStringify(cpToSign), 'utf8'), authB.privateKey).toString('hex');
+  // Update checkpoint and registry HWM to headIndex=2, headDigest=forgedEntry2Digest signed by active authB so only journal entry 2's signer is retired authA
+  cp.headIndex = 2;
+  cp.headDigest = forgedEntry2Digest;
+  cp.updatedAt = forgedEntry2.timestamp;
   fs.writeFileSync(cpPath, JSON.stringify(cp, null, 2) + '\n', 'utf8');
 
   const curReg2 = JSON.parse(fs.readFileSync(regPath, 'utf8'));
-  curReg2.revocationHighWaterMark.headDigest = forgedEntry1.entryDigest;
-  const hwmSignPayload2 = Buffer.from(JSON.stringify({
-    domain: 'THREE_LENS_REVOCATION_HWM_V1',
-    registryVersion: curReg2.registryVersion,
-    headIndex: curReg2.revocationHighWaterMark.headIndex,
-    headDigest: curReg2.revocationHighWaterMark.headDigest,
-    updatedAt: curReg2.revocationHighWaterMark.updatedAt,
+  curReg2.revocationHighWaterMark = {
+    headIndex: 2,
+    headDigest: forgedEntry2Digest,
+    updatedAt: forgedEntry2.timestamp,
+    authorizedBy: authB.keyId
+  };
+  const hwmSignPayload2 = Buffer.from(canonicalJsonStringify({
+    headIndex: 2,
+    headDigest: forgedEntry2Digest,
+    updatedAt: forgedEntry2.timestamp,
     authorizedBy: authB.keyId
   }), 'utf8');
   curReg2.revocationHighWaterMark.signature = crypto.sign(null, hwmSignPayload2, authB.privateKey).toString('hex');
   fs.writeFileSync(regPath, JSON.stringify(curReg2, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(path.join(tempDir, 'history', 'trust-registry.v2.json'), JSON.stringify(curReg2, null, 2) + '\n', 'utf8');
 
-  walPayload.committedHwmHeadDigest = forgedEntry1.entryDigest;
-  walPayload.expectedTargetHwmHeadDigest = forgedEntry1.entryDigest;
+  // Direct loadRevocationJournal must specifically hit RETIRED_KEY_AUTHORIZATION_REJECTED
+  assert.throws(
+    () => loadRevocationJournal(opts),
+    /RETIRED_KEY_AUTHORIZATION_REJECTED/
+  );
+
+  walPayload.committedHwmHeadIndex = 2;
+  walPayload.committedHwmHeadDigest = forgedEntry2Digest;
+  walPayload.expectedTargetHwmHeadIndex = 2;
+  walPayload.expectedTargetHwmHeadDigest = forgedEntry2Digest;
   const walSignPayload2 = Buffer.from(computeTransactionWalSignPayload(walPayload), 'utf8');
   walPayload.signature = crypto.sign(null, walSignPayload2, authB.privateKey).toString('hex');
   fs.writeFileSync(walPath, JSON.stringify(walPayload, null, 2) + '\n', 'utf8');
 
   assert.throws(
     () => recoverAbortedRevocationTransaction(opts),
-    /RETIRED_KEY_AUTHORIZATION_REJECTED|TRANSACTION_WAL_CORRUPTION_DETECTED/
+    /RETIRED_KEY_AUTHORIZATION_REJECTED/
   );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('R19-B01: Contradictory registry with revokedKeyIds containing ACTIVE key is rejected across validation, save, load, and journal windows', () => {
+  const tempDir = createTempDir('r19-b01-');
+  const rootAuth = generateTestAuthority();
+  const nextAuth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: rootAuth.keyId,
+    trustedRootPublicKeyPem: rootAuth.pem,
+    trustedRootFingerprint: rootAuth.fp
+  };
+
+  const reg1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keys: [{
+      keyId: rootAuth.keyId,
+      keyFingerprint: rootAuth.fp,
+      publicKeyPem: rootAuth.pem,
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: '2026-01-01T00:00:00.000Z'
+    }],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(reg1, opts);
+
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'compromised-r19-b01',
+    reason: 'Revoke 0'
+  }, { ...opts, signerKeyId: rootAuth.keyId, signerPrivateKey: rootAuth.privateKey });
+
+  const curReg1 = loadTrustRegistry(opts).registry;
+  const reg2Contradictory = createAuthorizedRegistryUpdate(
+    curReg1,
+    {
+      activeKeyId: nextAuth.keyId,
+      activeKeyFingerprint: nextAuth.fp,
+      activePublicKeyPem: nextAuth.pem,
+      keys: [
+        {
+          keyId: rootAuth.keyId,
+          keyFingerprint: rootAuth.fp,
+          publicKeyPem: rootAuth.pem,
+          status: 'ACTIVE', // Contradictory! Still ACTIVE while in revokedKeyIds
+          issuedAt: '2026-01-01T00:00:00.000Z'
+        },
+        {
+          keyId: nextAuth.keyId,
+          keyFingerprint: nextAuth.fp,
+          publicKeyPem: nextAuth.pem,
+          status: 'ACTIVE',
+          issuedAt: new Date().toISOString()
+        }
+      ],
+      revokedKeyIds: [rootAuth.keyId]
+    },
+    rootAuth.keyId,
+    rootAuth.privateKey
+  );
+
+  const valRes = validateTrustRegistry(reg2Contradictory, {
+    ...opts,
+    priorRegistry: curReg1
+  });
+  assert.strictEqual(valRes.valid, false);
+  assert.match(valRes.error, /REVOKED_KEY_AUTHORIZATION_REJECTED/);
+
+  assert.throws(
+    () => saveTrustRegistry(reg2Contradictory, opts),
+    /REVOKED_KEY_AUTHORIZATION_REJECTED/
+  );
+
+  // Also test activeKeyId in revokedKeyIds
+  const reg2ActiveRevoked = createAuthorizedRegistryUpdate(
+    curReg1,
+    {
+      activeKeyId: nextAuth.keyId,
+      activeKeyFingerprint: nextAuth.fp,
+      activePublicKeyPem: nextAuth.pem,
+      keys: [
+        {
+          keyId: rootAuth.keyId,
+          keyFingerprint: rootAuth.fp,
+          publicKeyPem: rootAuth.pem,
+          status: 'REVOKED',
+          issuedAt: '2026-01-01T00:00:00.000Z'
+        },
+        {
+          keyId: nextAuth.keyId,
+          keyFingerprint: nextAuth.fp,
+          publicKeyPem: nextAuth.pem,
+          status: 'ACTIVE',
+          issuedAt: new Date().toISOString()
+        }
+      ],
+      revokedKeyIds: [rootAuth.keyId, nextAuth.keyId]
+    },
+    rootAuth.keyId,
+    rootAuth.privateKey
+  );
+
+  const valRes2 = validateTrustRegistry(reg2ActiveRevoked, {
+    ...opts,
+    priorRegistry: curReg1
+  });
+  assert.strictEqual(valRes2.valid, false);
+  assert.match(valRes2.error, /REVOKED_KEY_AUTHORIZATION_REJECTED/);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('R19-B02: Same-version HWM advancement rejects any mutation to non-HWM identity fields (e.g., authorizationProof metadata)', () => {
+  const tempDir = createTempDir('r19-b02-');
+  const authA = generateTestAuthority();
+  const authB = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: authA.keyId,
+    trustedRootPublicKeyPem: authA.pem,
+    trustedRootFingerprint: authA.fp
+  };
+
+  const reg1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: authA.keyId,
+    activeKeyFingerprint: authA.fp,
+    activePublicKeyPem: authA.pem,
+    keys: [{
+      keyId: authA.keyId,
+      keyFingerprint: authA.fp,
+      publicKeyPem: authA.pem,
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: '2026-01-01T00:00:00.000Z'
+    }],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(reg1, opts);
+
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'compromised-r19-b02-0',
+    reason: 'Revoke 0'
+  }, { ...opts, signerKeyId: authA.keyId, signerPrivateKey: authA.privateKey });
+
+  const curReg1 = loadTrustRegistry(opts).registry;
+  const reg2 = createAuthorizedRegistryUpdate(
+    curReg1,
+    {
+      activeKeyId: authB.keyId,
+      activeKeyFingerprint: authB.fp,
+      activePublicKeyPem: authB.pem,
+      keys: [
+        {
+          keyId: authA.keyId,
+          keyFingerprint: authA.fp,
+          publicKeyPem: authA.pem,
+          status: 'RETIRED',
+          issuedAt: '2026-01-01T00:00:00.000Z'
+        },
+        {
+          keyId: authB.keyId,
+          keyFingerprint: authB.fp,
+          publicKeyPem: authB.pem,
+          status: 'ACTIVE',
+          issuedAt: new Date().toISOString()
+        }
+      ]
+    },
+    authA.keyId,
+    authA.privateKey
+  );
+  saveTrustRegistry(reg2, opts);
+
+  // Append entry 1 (advancing HWM from 0 -> 1 at registryVersion 2)
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'compromised-r19-b02-1',
+    reason: 'Revoke 1'
+  }, { ...opts, signerKeyId: authB.keyId, signerPrivateKey: authB.privateKey });
+
+  const regPath = getTrustRegistryPath(opts);
+  const histV2Path = path.join(tempDir, 'history', 'trust-registry.v2.json');
+  const currentReg2 = JSON.parse(fs.readFileSync(regPath, 'utf8'));
+
+  // Construct entry 2 on disk advancing HWM from 1 -> 2, while mutating authorizationProof.signedAt
+  const journalPath = getRevocationJournalPath(opts);
+  const cpPath = getRevocationCheckpointPath(opts);
+  const newEntry = {
+    entryIndex: 2,
+    timestamp: new Date().toISOString(),
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'compromised-r19-b02-2',
+    reason: 'Revoke 2',
+    prevEntryDigest: currentReg2.revocationHighWaterMark.headDigest,
+    signedBy: authB.keyId
+  };
+  newEntry.signature = crypto.sign(null, Buffer.from(computeRevocationEntrySignPayload(newEntry), 'utf8'), authB.privateKey).toString('hex');
+  const newDigest = sha256Digest(canonicalJsonStringify(newEntry));
+  fs.appendFileSync(journalPath, JSON.stringify(newEntry) + '\n', 'utf8');
+  fs.writeFileSync(cpPath, JSON.stringify({
+    headIndex: 2,
+    headDigest: newDigest,
+    updatedAt: newEntry.timestamp,
+    registryVersion: 2
+  }, null, 2) + '\n', 'utf8');
+
+  const tamperedReg2 = structuredClone(currentReg2);
+  tamperedReg2.authorizationProof.signedAt = '2029-12-31T23:59:59.000Z'; // Unauthenticated metadata field in authorizationProof
+  tamperedReg2.revocationHighWaterMark = {
+    headIndex: 2,
+    headDigest: newDigest,
+    updatedAt: newEntry.timestamp,
+    authorizedBy: authB.keyId
+  };
+  tamperedReg2.revocationHighWaterMark.signature = crypto.sign(
+    null,
+    Buffer.from(canonicalJsonStringify({
+      headIndex: 2,
+      headDigest: newDigest,
+      updatedAt: newEntry.timestamp,
+      authorizedBy: authB.keyId
+    }), 'utf8'),
+    authB.privateKey
+  ).toString('hex');
+
+  fs.writeFileSync(regPath, JSON.stringify(tamperedReg2, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(histV2Path, JSON.stringify(tamperedReg2, null, 2) + '\n', 'utf8');
+
+  assert.throws(
+    () => loadTrustRegistry(opts),
+    /REGISTRY_DIVERGENCE_DETECTED/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('R19-B03: WAL recovery synchronizes history/trust-registry.v*.json when crash occurs between regPath write and histPath write', () => {
+  const tempDir = createTempDir('r19-b03-');
+  const rootAuth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: rootAuth.keyId,
+    trustedRootPublicKeyPem: rootAuth.pem,
+    trustedRootFingerprint: rootAuth.fp
+  };
+
+  const reg1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keys: [{
+      keyId: rootAuth.keyId,
+      keyFingerprint: rootAuth.fp,
+      publicKeyPem: rootAuth.pem,
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: '2026-01-01T00:00:00.000Z'
+    }],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(reg1, opts);
+
+  const regPath = getTrustRegistryPath(opts);
+  const histV1Path = path.join(tempDir, 'history', 'trust-registry.v1.json');
+  const journalPath = getRevocationJournalPath(opts);
+  const cpPath = getRevocationCheckpointPath(opts);
+  const walPath = path.join(tempDir, REVOCATION_TXN_FILE);
+
+  const preImageRegRaw = fs.readFileSync(regPath);
+  const preImageRegObj = JSON.parse(preImageRegRaw.toString('utf8'));
+  const preImageRegSha = sha256Digest(preImageRegRaw);
+
+  // Construct entry 0 and write journal + checkpoint + regPath (HWM=0), but leave histV1Path and witness at pre-image (no HWM)
+  const entry0 = {
+    entryIndex: 0,
+    timestamp: new Date().toISOString(),
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'compromised-r19-b03-0',
+    reason: 'Revoke 0',
+    prevEntryDigest: '0'.repeat(64),
+    signedBy: rootAuth.keyId
+  };
+  entry0.signature = crypto.sign(null, Buffer.from(computeRevocationEntrySignPayload(entry0), 'utf8'), rootAuth.privateKey).toString('hex');
+  const entry0Digest = sha256Digest(canonicalJsonStringify(entry0));
+  fs.writeFileSync(journalPath, JSON.stringify(entry0) + '\n', 'utf8');
+  fs.writeFileSync(cpPath, JSON.stringify({
+    headIndex: 0,
+    headDigest: entry0Digest,
+    updatedAt: entry0.timestamp,
+    registryVersion: 1
+  }, null, 2) + '\n', 'utf8');
+
+  const postImageRegObj = structuredClone(preImageRegObj);
+  postImageRegObj.revocationHighWaterMark = {
+    headIndex: 0,
+    headDigest: entry0Digest,
+    updatedAt: entry0.timestamp,
+    authorizedBy: rootAuth.keyId
+  };
+  postImageRegObj.revocationHighWaterMark.signature = crypto.sign(
+    null,
+    Buffer.from(canonicalJsonStringify({
+      headIndex: 0,
+      headDigest: entry0Digest,
+      updatedAt: entry0.timestamp,
+      authorizedBy: rootAuth.keyId
+    }), 'utf8'),
+    rootAuth.privateKey
+  ).toString('hex');
+  const postImageRegRaw = Buffer.from(JSON.stringify(postImageRegObj, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(regPath, postImageRegRaw);
+
+  // Note: histV1Path is still preImageRegRaw (without HWM), and monotonic witness is still at HWM = -1!
+  // Write a PREPARED WAL marker representing that in-flight transaction interrupted between regPath and histV1Path
+  const walPayload = {
+    txnId: 'tx-r19-b03-crash-between-reg-and-hist',
+    status: 'PREPARED',
+    createdAt: new Date().toISOString(),
+    signedBy: rootAuth.keyId,
+    journalPath,
+    checkpointPath: cpPath,
+    regPath,
+    histPath: histV1Path,
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    initialRegistrySha256: preImageRegSha,
+    initialRegistryExisted: true,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: '',
+    initialHistSha256: preImageRegSha,
+    initialHistExisted: true,
+    expectedTargetHwmHeadIndex: 0,
+    expectedTargetHwmHeadDigest: entry0Digest,
+    expectedTargetRegistryVersion: 1,
+    initialCheckpointRawBase64: null,
+    initialRegistryRawBase64: preImageRegRaw.toString('base64'),
+    initialHistRawBase64: preImageRegRaw.toString('base64')
+  };
+  const walSignPayload = Buffer.from(computeTransactionWalSignPayload(walPayload), 'utf8');
+  walPayload.signature = crypto.sign(null, walSignPayload, rootAuth.privateKey).toString('hex');
+  fs.writeFileSync(walPath, JSON.stringify(walPayload, null, 2) + '\n', 'utf8');
+
+  // Recover the transaction: it must recognize post-image completion on regPath/cpPath/journalPath AND synchronize histV1Path
+  const recResult = recoverAbortedRevocationTransaction(opts);
+  assert.strictEqual(recResult.committed, true);
+  assert.strictEqual(fs.existsSync(walPath), false);
+
+  // Verify histV1Path now matches regPath and loadTrustRegistry / loadRevocationJournal succeed without REGISTRY_HISTORY_DESYNC_DETECTED
+  assert.strictEqual(sha256Digest(fs.readFileSync(histV1Path)), sha256Digest(postImageRegRaw));
+  const loadedReg = loadTrustRegistry(opts).registry;
+  assert.strictEqual(loadedReg.revocationHighWaterMark.headIndex, 0);
+  assert.strictEqual(loadedReg.revocationHighWaterMark.headDigest, postImageRegObj.revocationHighWaterMark.headDigest);
+
+  const loadedJournal = loadRevocationJournal(opts);
+  assert.strictEqual(loadedJournal.entries.length, 1);
 
   fs.rmSync(tempDir, { recursive: true, force: true });
 });

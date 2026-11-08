@@ -645,14 +645,18 @@ export function recoverAbortedRevocationTransaction(options = {}) {
 function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
   const trustedKeys = new Map();
   const maxActiveIndexPerKey = new Map();
+  const curRevokedSet = new Set(
+    Array.isArray(currentRegistry?.revokedKeyIds) ? currentRegistry.revokedKeyIds : []
+  );
 
   if (currentRegistry && Array.isArray(currentRegistry.keys)) {
     for (const k of currentRegistry.keys) {
       if (k && k.keyId && k.publicKeyPem) {
-        if (k.status === 'ACTIVE_PINNED_ROOT' || k.status === 'ACTIVE') {
+        const isRevokedInCur = curRevokedSet.has(k.keyId) || k.status === 'REVOKED';
+        if (!isRevokedInCur && (k.status === 'ACTIVE_PINNED_ROOT' || k.status === 'ACTIVE')) {
           trustedKeys.set(k.keyId, k.publicKeyPem);
           maxActiveIndexPerKey.set(k.keyId, Infinity);
-        } else if (k.status === 'RETIRED' || k.status === 'REVOKED') {
+        } else if (isRevokedInCur || k.status === 'RETIRED') {
           trustedKeys.set(k.keyId, k.publicKeyPem);
           maxActiveIndexPerKey.set(k.keyId, -1);
         }
@@ -683,13 +687,15 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
       const hHwmIdx = typeof hReg?.revocationHighWaterMark?.headIndex === 'number'
         ? hReg.revocationHighWaterMark.headIndex
         : -1;
+      const hRevokedSet = new Set(Array.isArray(hReg?.revokedKeyIds) ? hReg.revokedKeyIds : []);
       for (const hk of hReg?.keys || []) {
         if (hk && hk.keyId && hk.publicKeyPem) {
           if (!trustedKeys.has(hk.keyId)) {
             trustedKeys.set(hk.keyId, hk.publicKeyPem);
             maxActiveIndexPerKey.set(hk.keyId, -1);
           }
-          if (hk.status === 'ACTIVE' || hk.status === 'ACTIVE_PINNED_ROOT') {
+          const isRevokedInHist = hRevokedSet.has(hk.keyId) || hk.status === 'REVOKED';
+          if (!isRevokedInHist && (hk.status === 'ACTIVE' || hk.status === 'ACTIVE_PINNED_ROOT')) {
             const cur = maxActiveIndexPerKey.get(hk.keyId);
             if (cur !== Infinity) {
               maxActiveIndexPerKey.set(hk.keyId, Math.max(cur ?? -1, hHwmIdx));
@@ -1026,12 +1032,28 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
         throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL post-image registry failed validation: ${regValidation.error}`);
       }
 
-      // Check curReg against witness freshness and historical continuity
       const curRegDigest = computeRegistryDigest(curReg);
-      assertMonotonicWitnessFreshness(dir, curReg.registryVersion, txnData.committedHwmHeadIndex, txnData.committedHwmHeadDigest, curRegDigest, options);
+      const curNonHwmDigest = computeRegistryNonHwmDigest(curReg);
+
+      // R19-B03: Ensure history/trust-registry.v{curReg.registryVersion}.json is synchronized with verified post-image curReg before witness freshness & update
+      if (!fs.existsSync(histDir)) fs.mkdirSync(histDir, { recursive: true });
+      const activeHistPath = path.join(histDir, `trust-registry.v${curReg.registryVersion}.json`);
+      const onDiskRegRaw = fs.readFileSync(expectedRegPath, 'utf8');
+      if (fs.existsSync(activeHistPath)) {
+        const existingHistObj = JSON.parse(fs.readFileSync(activeHistPath, 'utf8'));
+        if (computeRegistryNonHwmDigest(existingHistObj) !== curNonHwmDigest) {
+          throw new Error('[REGISTRY_DIVERGENCE_DETECTED] On-disk registry non-HWM identity diverged from historical registry during COMMITTED WAL recovery');
+        }
+      }
+      if (!fs.existsSync(activeHistPath) || sha256Digest(fs.readFileSync(activeHistPath, 'utf8')) !== sha256Digest(onDiskRegRaw)) {
+        safeWriteFileSync(activeHistPath, onDiskRegRaw, options);
+      }
+
+      // Check curReg against witness freshness and historical continuity
+      assertMonotonicWitnessFreshness(dir, curReg.registryVersion, txnData.committedHwmHeadIndex, txnData.committedHwmHeadDigest, curRegDigest, { ...options, nonHwmDigest: curNonHwmDigest });
 
       // R15-B02, R16-B03 & R17-B01: Update persistent monotonic witness AFTER complete authorization & continuity validation
-      updateMonotonicWitness(dir, curReg.registryVersion, txnData.committedHwmHeadIndex, txnData.committedHwmHeadDigest, curRegDigest, createPrivilegedWitnessOptions(options));
+      updateMonotonicWitness(dir, curReg.registryVersion, txnData.committedHwmHeadIndex, txnData.committedHwmHeadDigest, curRegDigest, createPrivilegedWitnessOptions({ ...options, nonHwmDigest: curNonHwmDigest }));
 
     assertSafeStorageTarget(txnPath, options);
     try {
@@ -1125,14 +1147,15 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
 
     const curRegVer = currentReg.registryVersion;
     const curRegDigest = computeRegistryDigest(currentReg);
+    const curNonHwmDigest = computeRegistryNonHwmDigest(currentReg);
     const curHwm = currentReg.revocationHighWaterMark;
     const curHwmIdx = curHwm ? curHwm.headIndex : -1;
     const curHwmDigest = curHwm ? curHwm.headDigest : '';
 
     // Enforce monotonic witness freshness before any rollback action
-    assertMonotonicWitnessFreshness(dir, curRegVer, curHwmIdx, curHwmDigest, curRegDigest, options);
+    assertMonotonicWitnessFreshness(dir, curRegVer, curHwmIdx, curHwmDigest, curRegDigest, { ...options, nonHwmDigest: curNonHwmDigest });
 
-    // R11-B04, R12-B05 & R13-B05: Check if transaction actually completed all on-disk mutations before crash
+    // R11-B04, R12-B05, R13-B05 & R19-B03: Check if transaction actually completed all on-disk mutations before crash
     const isTargetExpected = (
       typeof txnData.expectedTargetHwmHeadIndex === 'number' &&
       typeof txnData.expectedTargetHwmHeadDigest === 'string' &&
@@ -1175,15 +1198,34 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
           }
 
           if (cpMatches && journalMatches) {
+            // R19-B03: If process interrupted after writing regPath but before syncing history/trust-registry.v{curRegVer}.json,
+            // verify that currentReg's non-HWM identity matches the initial registry snapshot (or existing history) and sync history BEFORE witness update.
+            if (txnData.initialRegistryRawBase64) {
+              const initRegObj = JSON.parse(Buffer.from(txnData.initialRegistryRawBase64, 'base64').toString('utf8'));
+              if (computeRegistryNonHwmDigest(initRegObj) !== curNonHwmDigest) {
+                throw new Error('[REGISTRY_DIVERGENCE_DETECTED] On-disk registry non-HWM identity diverged from WAL initial snapshot during HWM advancement');
+              }
+            }
+            if (!fs.existsSync(histDir)) fs.mkdirSync(histDir, { recursive: true });
+            const activeHistPath = path.join(histDir, `trust-registry.v${curRegVer}.json`);
+            const onDiskRegRaw = fs.readFileSync(expectedRegPath, 'utf8');
+            if (!fs.existsSync(activeHistPath) || sha256Digest(fs.readFileSync(activeHistPath, 'utf8')) !== sha256Digest(onDiskRegRaw)) {
+              safeWriteFileSync(activeHistPath, onDiskRegRaw, options);
+            }
+
             // The transaction was fully committed to disk before crash!
             // R15-B02 & R17-B01: Update persistent monotonic witness BEFORE unlinking marker
             const committedRegDigest = computeRegistryDigest(currentReg);
-            updateMonotonicWitness(dir, curRegVer, txnData.expectedTargetHwmHeadIndex, txnData.expectedTargetHwmHeadDigest, committedRegDigest, createPrivilegedWitnessOptions(options));
+            updateMonotonicWitness(dir, curRegVer, txnData.expectedTargetHwmHeadIndex, txnData.expectedTargetHwmHeadDigest, committedRegDigest, createPrivilegedWitnessOptions({ ...options, nonHwmDigest: curNonHwmDigest }));
             assertSafeStorageTarget(txnPath, options);
             fs.unlinkSync(txnPath);
             return { recovered: false, committed: true, txnId: txnData.txnId };
           }
-        } catch (_) {}
+        } catch (commitCheckErr) {
+          if (commitCheckErr.message && commitCheckErr.message.includes('REGISTRY_DIVERGENCE_DETECTED')) {
+            throw commitCheckErr;
+          }
+        }
       }
     }
 
@@ -1461,6 +1503,49 @@ export function computeRegistryIdentityPayload(registry) {
 }
 
 /**
+ * Computes canonical non-HWM identity commitment payload for trust registry.
+ * R19-B02: Binds all non-HWM identity and authorizationProof fields. During a same-version HWM advancement,
+ * this non-HWM identity digest MUST remain strictly invariant unless a new Registry version is authorized.
+ *
+ * @param {object} registry
+ * @returns {string} Domain-separated canonical string
+ */
+export function computeRegistryNonHwmIdentityPayload(registry) {
+  if (!registry || typeof registry !== 'object') return '';
+  const authPayload = computeRegistryAuthorizationPayload(registry);
+  const proof = (registry.authorizationProof && typeof registry.authorizationProof === 'object')
+    ? registry.authorizationProof
+    : null;
+  const normalizedProof = proof
+    ? {
+        authorizedBy: typeof proof.authorizedBy === 'string' ? proof.authorizedBy : '',
+        signerKeyId: typeof proof.signerKeyId === 'string' ? proof.signerKeyId : '',
+        signature: typeof proof.signature === 'string' ? proof.signature : '',
+        timestamp: typeof proof.timestamp === 'string' ? proof.timestamp : '',
+        signedAt: typeof proof.signedAt === 'string' ? proof.signedAt : '',
+        algorithm: typeof proof.algorithm === 'string' ? proof.algorithm : 'ed25519',
+        priorRegistryVersion: typeof proof.priorRegistryVersion === 'number' ? proof.priorRegistryVersion : 0
+      }
+    : null;
+  const nonHwmObj = {
+    authPayload,
+    signature: typeof registry.signature === 'string' ? registry.signature : '',
+    pinnedSince: typeof registry.pinnedSince === 'string' ? registry.pinnedSince : '',
+    rotationPolicy: typeof registry.rotationPolicy === 'string' ? registry.rotationPolicy : '',
+    keyType: typeof registry.keyType === 'string' ? registry.keyType : '',
+    validFrom: typeof registry.validFrom === 'string' ? registry.validFrom : '',
+    validUntil: typeof registry.validUntil === 'string' ? registry.validUntil : '',
+    authorizationProof: normalizedProof
+  };
+  return 'TRUST_REGISTRY_NON_HWM_IDENTITY_V1:' + canonicalJsonStringify(nonHwmObj);
+}
+
+export function computeRegistryNonHwmDigest(registry) {
+  if (!registry || typeof registry !== 'object') return '';
+  return sha256Digest(computeRegistryNonHwmIdentityPayload(registry));
+}
+
+/**
  * Computes canonical content digest for trust registry authority commitment.
  * Resolves R15-B03 & R16-B04: Deterministic SHA-256 digest over complete canonical identity commitment.
  *
@@ -1583,6 +1668,31 @@ export function validateTrustRegistry(registry, options = {}) {
     };
   }
 
+  // R19-B01: Single non-contradictory revocation authority check:
+  // A key listed in revokedKeyIds MUST NOT be activeKeyId or retain ACTIVE / ACTIVE_PINNED_ROOT status in keys[].
+  if (registry.revokedKeyIds.includes(registry.activeKeyId)) {
+    return {
+      valid: false,
+      error: `[REVOKED_KEY_AUTHORIZATION_REJECTED] activeKeyId '${registry.activeKeyId}' is listed in revokedKeyIds and cannot be active`,
+      cryptographicValidity: false,
+      monotonicValidity: true,
+      ancestryContinuity: true
+    };
+  }
+  for (const k of registry.keys) {
+    if (k && k.keyId && registry.revokedKeyIds.includes(k.keyId)) {
+      if (k.status === 'ACTIVE' || k.status === 'ACTIVE_PINNED_ROOT') {
+        return {
+          valid: false,
+          error: `[REVOKED_KEY_AUTHORIZATION_REJECTED] Key '${k.keyId}' is listed in revokedKeyIds but has contradictory active status '${k.status}' in keys[]`,
+          cryptographicValidity: false,
+          monotonicValidity: true,
+          ancestryContinuity: true
+        };
+      }
+    }
+  }
+
   // Resolve prior registry from options or historical chain
   let priorReg = options.priorRegistry || null;
   if (!priorReg && registry.registryVersion > 1) {
@@ -1677,21 +1787,23 @@ export function validateTrustRegistry(registry, options = {}) {
       };
     }
 
-    // R14-B04: Key Lifecycle Boundary: A RETIRED or REVOKED key can NEVER authorize a new or modified HWM.
-    // It is only accepted if it is an exact historical carry-over from priorRegistry where the key was active.
-    if (hwmSignerKey.status === 'RETIRED' || hwmSignerKey.status === 'REVOKED') {
+    // R14-B04 & R19-B01: Key Lifecycle Boundary: A RETIRED or REVOKED key (whether via keys[].status or revokedKeyIds)
+    // can NEVER authorize a new or modified HWM. It is only accepted if it is an exact historical carry-over from priorRegistry where the key was active.
+    const isHwmSignerRevokedInCurrent = Array.isArray(registry.revokedKeyIds) && registry.revokedKeyIds.includes(hwm.authorizedBy);
+    if (hwmSignerKey.status === 'RETIRED' || hwmSignerKey.status === 'REVOKED' || isHwmSignerRevokedInCurrent) {
       const priorHwm = priorReg?.revocationHighWaterMark;
       const isExactPriorMatch = Boolean(
         priorHwm &&
         priorHwm.authorizedBy === hwm.authorizedBy &&
         priorHwm.headIndex === hwm.headIndex &&
         priorHwm.headDigest === hwm.headDigest &&
+        priorHwm.updatedAt === hwm.updatedAt &&
         priorHwm.signature === hwm.signature
       );
       if (!isExactPriorMatch) {
         return {
           valid: false,
-          error: `[RETIRED_KEY_AUTHORIZATION_REJECTED] Signer '${hwm.authorizedBy}' for revocationHighWaterMark has status '${hwmSignerKey.status}' and cannot authorize new or modified revocation high-water mark`,
+          error: `[REVOKED_KEY_AUTHORIZATION_REJECTED] [RETIRED_KEY_AUTHORIZATION_REJECTED] Signer '${hwm.authorizedBy}' for revocationHighWaterMark is retired or revoked and cannot authorize new or modified revocation high-water mark`,
           cryptographicValidity: false,
           monotonicValidity: true,
           ancestryContinuity: true
@@ -2140,14 +2252,14 @@ function doLoadTrustRegistry(options = {}) {
             if (v > maxHistVersion) maxHistVersion = v;
             try {
               const histObj = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
-              // R16-B01 & R18-B02: Verify historical registry against monotonic witness commitment.
-              // Digest advancement at the active version is permitted strictly when HWM headIndex advances.
+              // R16-B01, R18-B02 & R19-B02: Verify historical registry against monotonic witness commitment.
+              // Digest advancement at the active version is permitted strictly when HWM headIndex advances AND non-HWM identity is invariant.
               const curWitness = getMonotonicWitness(dir, options);
+              const histHwmIdx = typeof histObj?.revocationHighWaterMark?.headIndex === 'number'
+                ? histObj.revocationHighWaterMark.headIndex
+                : -1;
               if (curWitness.registryDigests && curWitness.registryDigests[String(v)]) {
                 const histDigest = computeRegistryDigest(histObj);
-                const histHwmIdx = typeof histObj?.revocationHighWaterMark?.headIndex === 'number'
-                  ? histObj.revocationHighWaterMark.headIndex
-                  : -1;
                 const isActiveHwmAdvancing = (
                   v === curWitness.maxSeenRegistryVersion &&
                   v === parsed.registryVersion &&
@@ -2155,6 +2267,24 @@ function doLoadTrustRegistry(options = {}) {
                 );
                 if (histDigest !== curWitness.registryDigests[String(v)] && !isActiveHwmAdvancing) {
                   const errorMsg = `[REGISTRY_ROLLBACK_DETECTED] [REGISTRY_DIVERGENCE_DETECTED] [REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_ROLLBACK_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Historical registry ${hf} digest (${histDigest}) diverges from witnessed historical commitment (${curWitness.registryDigests[String(v)]})`;
+                  if (options.failClosed !== false) {
+                    throw new Error(errorMsg);
+                  }
+                  return {
+                    source: 'PLUGIN_DATA',
+                    registry: null,
+                    valid: false,
+                    error: errorMsg,
+                    cryptographicValidity: false,
+                    monotonicValidity: false,
+                    ancestryContinuity: false
+                  };
+                }
+              }
+              if (curWitness.registryNonHwmDigests && curWitness.registryNonHwmDigests[String(v)]) {
+                const histNonHwmDigest = computeRegistryNonHwmDigest(histObj);
+                if (histNonHwmDigest !== curWitness.registryNonHwmDigests[String(v)]) {
+                  const errorMsg = `[REGISTRY_DIVERGENCE_DETECTED] [REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Historical registry ${hf} non-HWM identity (${histNonHwmDigest}) diverges from witnessed non-HWM commitment (${curWitness.registryNonHwmDigests[String(v)]})`;
                   if (options.failClosed !== false) {
                     throw new Error(errorMsg);
                   }
@@ -2178,7 +2308,7 @@ function doLoadTrustRegistry(options = {}) {
                 }
               }
             } catch (histErr) {
-              if (histErr.message && (histErr.message.includes('REGISTRY_HISTORY_DIVERGENCE_DETECTED') || histErr.message.includes('MONOTONIC_WITNESS_DIVERGENCE_DETECTED'))) {
+              if (histErr.message && (histErr.message.includes('REGISTRY_HISTORY_DIVERGENCE_DETECTED') || histErr.message.includes('MONOTONIC_WITNESS_DIVERGENCE_DETECTED') || histErr.message.includes('REGISTRY_DIVERGENCE_DETECTED'))) {
                 throw histErr;
               }
               const errorMsg = `[HISTORY_CORRUPTION_DETECTED] [REGISTRY_HISTORY_DIVERGENCE_DETECTED] Historical registry ${hf} in ${histDir} is corrupted or cannot be parsed: ${histErr.message}`;
@@ -2234,28 +2364,6 @@ function doLoadTrustRegistry(options = {}) {
           };
         }
 
-        // R08-B04: Match on-disk registry content against historical counterpart
-        if (sameVersionHistRegistry) {
-          const histContent = fs.readFileSync(path.join(histDir, `trust-registry.v${parsed.registryVersion}.json`), 'utf8');
-          const diskHash = sha256Digest(raw);
-          const histHash = sha256Digest(histContent);
-          if (diskHash !== histHash) {
-            const errorMsg = `[REGISTRY_ROLLBACK_DETECTED] [REGISTRY_HISTORY_DESYNC_DETECTED] On-disk trust registry content (SHA-256 ${diskHash}) does not match historical trust-registry.v${parsed.registryVersion}.json (SHA-256 ${histHash})`;
-            if (options.failClosed !== false) {
-              throw new Error(errorMsg);
-            }
-            return {
-              source: 'PLUGIN_DATA',
-              registry: null,
-              valid: false,
-              error: errorMsg,
-              cryptographicValidity: false,
-              monotonicValidity: false,
-              ancestryContinuity: false
-            };
-          }
-        }
-
         // Same-version anti-rollback check (e.g. Genesis v1 with established HWM)
         if (sameVersionHistRegistry) {
           if (sameVersionHistRegistry.revocationHighWaterMark && !parsed.revocationHighWaterMark) {
@@ -2279,6 +2387,42 @@ function doLoadTrustRegistry(options = {}) {
             parsed.revocationHighWaterMark.headIndex < sameVersionHistRegistry.revocationHighWaterMark.headIndex
           ) {
             const errorMsg = `[HIGH_WATER_MARK_ROLLBACK_DETECTED] On-disk registry high-water mark (${parsed.revocationHighWaterMark.headIndex}) is behind historical version ${parsed.registryVersion} mark (${sameVersionHistRegistry.revocationHighWaterMark.headIndex})`;
+            if (options.failClosed !== false) {
+              throw new Error(errorMsg);
+            }
+            return {
+              source: 'PLUGIN_DATA',
+              registry: null,
+              valid: false,
+              error: errorMsg,
+              cryptographicValidity: false,
+              monotonicValidity: false,
+              ancestryContinuity: false
+            };
+          }
+          // R08-B04 & R19-B02: Match on-disk registry non-HWM identity and content against historical counterpart
+          const diskNonHwmDigest = computeRegistryNonHwmDigest(parsed);
+          const histNonHwmDigest = computeRegistryNonHwmDigest(sameVersionHistRegistry);
+          if (diskNonHwmDigest !== histNonHwmDigest) {
+            const errorMsg = `[REGISTRY_DIVERGENCE_DETECTED] [REGISTRY_HISTORY_DIVERGENCE_DETECTED] On-disk trust registry non-HWM identity (${diskNonHwmDigest}) diverges from historical trust-registry.v${parsed.registryVersion}.json (${histNonHwmDigest})`;
+            if (options.failClosed !== false) {
+              throw new Error(errorMsg);
+            }
+            return {
+              source: 'PLUGIN_DATA',
+              registry: null,
+              valid: false,
+              error: errorMsg,
+              cryptographicValidity: false,
+              monotonicValidity: false,
+              ancestryContinuity: false
+            };
+          }
+          const histContent = fs.readFileSync(path.join(histDir, `trust-registry.v${parsed.registryVersion}.json`), 'utf8');
+          const diskHash = sha256Digest(raw);
+          const histHash = sha256Digest(histContent);
+          if (diskHash !== histHash) {
+            const errorMsg = `[REGISTRY_ROLLBACK_DETECTED] [REGISTRY_HISTORY_DESYNC_DETECTED] On-disk trust registry content (SHA-256 ${diskHash}) does not match historical trust-registry.v${parsed.registryVersion}.json (SHA-256 ${histHash})`;
             if (options.failClosed !== false) {
               throw new Error(errorMsg);
             }
@@ -2500,7 +2644,7 @@ function doLoadTrustRegistry(options = {}) {
         };
       }
 
-      // R12-B02, R14-B07, R15-B01 & R15-B03: Enforce monotonic witness freshness with candidate HWM and registry digests
+      // R12-B02, R14-B07, R15-B01, R15-B03 & R19-B02: Enforce monotonic witness freshness with candidate HWM, full registry, and non-HWM digests
       const currentHwmIdx = typeof parsed.revocationHighWaterMark?.headIndex === 'number'
         ? parsed.revocationHighWaterMark.headIndex
         : -1;
@@ -2508,8 +2652,9 @@ function doLoadTrustRegistry(options = {}) {
         ? parsed.revocationHighWaterMark.headDigest
         : '';
       const currentRegDigest = computeRegistryDigest(parsed);
-      assertMonotonicWitnessFreshness(dir, parsed.registryVersion, currentHwmIdx, currentHwmDigest, currentRegDigest, options);
-      updateMonotonicWitness(dir, parsed.registryVersion, currentHwmIdx, currentHwmDigest, currentRegDigest, createPrivilegedWitnessOptions(options));
+      const currentNonHwmDigest = computeRegistryNonHwmDigest(parsed);
+      assertMonotonicWitnessFreshness(dir, parsed.registryVersion, currentHwmIdx, currentHwmDigest, currentRegDigest, { ...options, nonHwmDigest: currentNonHwmDigest });
+      updateMonotonicWitness(dir, parsed.registryVersion, currentHwmIdx, currentHwmDigest, currentRegDigest, createPrivilegedWitnessOptions({ ...options, nonHwmDigest: currentNonHwmDigest }));
 
       return {
         source: 'PLUGIN_DATA',
@@ -2655,6 +2800,7 @@ export function getMonotonicWitness(dir, options = {}) {
       maxSeenRegistryVersion: 1,
       maxSeenRegistryDigest: '',
       registryDigests: {},
+      registryNonHwmDigests: {},
       maxSeenHwmHeadIndex: -1,
       maxSeenHwmHeadDigest: ''
     });
@@ -2663,6 +2809,7 @@ export function getMonotonicWitness(dir, options = {}) {
   let maxRegVer = memWitness.maxSeenRegistryVersion;
   let maxRegDigest = memWitness.maxSeenRegistryDigest || '';
   const registryDigestsMap = { ...(memWitness.registryDigests || {}) };
+  const registryNonHwmDigestsMap = { ...(memWitness.registryNonHwmDigests || {}) };
   let maxHwmIdx = memWitness.maxSeenHwmHeadIndex;
   let maxHwmDigest = memWitness.maxSeenHwmHeadDigest || '';
 
@@ -2741,8 +2888,28 @@ export function getMonotonicWitness(dir, options = {}) {
         }
       }
 
-      // R15-B03 & R18-B02: Check registry digest divergence at same version.
-      // Same-version digest advancement is permitted strictly when HWM headIndex advances.
+      // R19-B02: Validate optional registryNonHwmDigests dictionary if present in witness file
+      if (raw.registryNonHwmDigests !== undefined) {
+        if (!raw.registryNonHwmDigests || typeof raw.registryNonHwmDigests !== 'object' || Array.isArray(raw.registryNonHwmDigests)) {
+          throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} has invalid 'registryNonHwmDigests' dictionary`);
+        }
+        for (const [v, nd] of Object.entries(raw.registryNonHwmDigests)) {
+          const vNum = parseInt(v, 10);
+          if (!Number.isInteger(vNum) || vNum < 1 || String(vNum) !== v) {
+            throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} contains invalid version key '${v}' in registryNonHwmDigests`);
+          }
+          if (typeof nd !== 'string' || !/^[a-f0-9]{64}$/.test(nd)) {
+            throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} contains invalid digest format for version ${v} in registryNonHwmDigests`);
+          }
+          if (registryNonHwmDigestsMap[v] && registryNonHwmDigestsMap[v] !== nd) {
+            throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Persistent witness non-HWM registry identity divergence at version ${v} in ${filePath}`);
+          }
+          registryNonHwmDigestsMap[v] = nd;
+        }
+      }
+
+      // R15-B03, R18-B02 & R19-B02: Check registry digest divergence at same version.
+      // Same-version digest advancement is permitted strictly when HWM headIndex advances AND non-HWM identity is invariant.
       if (raw.maxSeenRegistryVersion > maxRegVer) {
         maxRegVer = raw.maxSeenRegistryVersion;
         maxRegDigest = raw.maxSeenRegistryDigest || '';
@@ -2806,12 +2973,14 @@ export function getMonotonicWitness(dir, options = {}) {
   memWitness.maxSeenRegistryVersion = maxRegVer;
   memWitness.maxSeenRegistryDigest = maxRegDigest;
   memWitness.registryDigests = { ...registryDigestsMap };
+  memWitness.registryNonHwmDigests = { ...registryNonHwmDigestsMap };
   memWitness.maxSeenHwmHeadIndex = maxHwmIdx;
   memWitness.maxSeenHwmHeadDigest = maxHwmDigest;
 
   let effRegVer = maxRegVer;
   let effRegDigest = maxRegDigest;
   const effRegistryDigestsMap = { ...registryDigestsMap };
+  const effRegistryNonHwmDigestsMap = { ...registryNonHwmDigestsMap };
   let effHwmIdx = maxHwmIdx;
   let effHwmDigest = maxHwmDigest;
 
@@ -2840,6 +3009,16 @@ export function getMonotonicWitness(dir, options = {}) {
         }
       }
     }
+    if (externalWitness.registryNonHwmDigests && typeof externalWitness.registryNonHwmDigests === 'object') {
+      for (const [v, nd] of Object.entries(externalWitness.registryNonHwmDigests)) {
+        if (typeof nd === 'string') {
+          if (effRegistryNonHwmDigestsMap[v] && effRegistryNonHwmDigestsMap[v] !== nd) {
+            throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] External witness non-HWM registry identity digest diverges at version ${v}`);
+          }
+          effRegistryNonHwmDigestsMap[v] = nd;
+        }
+      }
+    }
     if (typeof externalWitness.minHwmHeadIndex === 'number') {
       if (externalWitness.minHwmHeadIndex > effHwmIdx) {
         effHwmIdx = externalWitness.minHwmHeadIndex;
@@ -2857,6 +3036,7 @@ export function getMonotonicWitness(dir, options = {}) {
     maxSeenRegistryVersion: effRegVer,
     maxSeenRegistryDigest: effRegDigest,
     registryDigests: Object.freeze({ ...effRegistryDigestsMap }),
+    registryNonHwmDigests: Object.freeze({ ...effRegistryNonHwmDigestsMap }),
     maxSeenHwmHeadIndex: effHwmIdx,
     maxSeenHwmHeadDigest: effHwmDigest
   });
@@ -2912,6 +3092,9 @@ function normalizeWitnessCallArgs(arg4, arg5, arg6) {
 
 export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4, arg5, arg6) {
   const { headDigest: hwmHeadDigest, regDigest: registryDigest, options } = normalizeWitnessCallArgs(arg4, arg5, arg6);
+  const candidateNonHwmDigest = typeof options.nonHwmDigest === 'string'
+    ? options.nonHwmDigest
+    : (options.registry && typeof options.registry === 'object' ? computeRegistryNonHwmDigest(options.registry) : '');
 
   // R17-B01: External callers cannot call updateMonotonicWitness directly to escalate witness version
   if (!options || typeof options !== 'object' || !INTERNAL_WITNESS_PRIVILEGED_OPTIONS.has(options) || options[INTERNAL_WITNESS_WRITE_TOKEN] !== true) {
@@ -2924,6 +3107,7 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
     maxSeenRegistryVersion: current.maxSeenRegistryVersion,
     maxSeenRegistryDigest: current.maxSeenRegistryDigest || '',
     registryDigests: { ...(current.registryDigests || {}) },
+    registryNonHwmDigests: { ...(current.registryNonHwmDigests || {}) },
     maxSeenHwmHeadIndex: current.maxSeenHwmHeadIndex,
     maxSeenHwmHeadDigest: current.maxSeenHwmHeadDigest || ''
   };
@@ -2936,9 +3120,23 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
     hwmHeadIndex > witness.maxSeenHwmHeadIndex
   );
 
-  // R15-B03 & R18-B02: Check and update registry version and content commitment.
-  // At the active registryVersion, a digest update is permitted strictly when HWM headIndex advances.
+  // R15-B03, R18-B02 & R19-B02: Check and update registry version, content commitment, and non-HWM identity commitment.
+  // At the active registryVersion, a digest update is permitted strictly when HWM headIndex advances AND non-HWM identity is invariant.
   if (typeof registryVersion === 'number') {
+    const verKey = String(registryVersion);
+    if (candidateNonHwmDigest) {
+      if (!witness.registryNonHwmDigests) witness.registryNonHwmDigests = {};
+      if (witness.registryNonHwmDigests[verKey] && witness.registryNonHwmDigests[verKey] !== candidateNonHwmDigest) {
+        throw new Error(
+          `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Monotonic witness non-HWM identity divergence at version ${registryVersion}: existing non-HWM digest ${witness.registryNonHwmDigests[verKey]} !== candidate non-HWM digest ${candidateNonHwmDigest}`
+        );
+      }
+      if (!witness.registryNonHwmDigests[verKey]) {
+        witness.registryNonHwmDigests[verKey] = candidateNonHwmDigest;
+        changed = true;
+      }
+    }
+
     if (registryVersion > witness.maxSeenRegistryVersion) {
       witness.maxSeenRegistryVersion = registryVersion;
       witness.maxSeenRegistryDigest = registryDigest || '';
@@ -2961,7 +3159,6 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
     }
     if (registryDigest) {
       if (!witness.registryDigests) witness.registryDigests = {};
-      const verKey = String(registryVersion);
       if (witness.registryDigests[verKey] && witness.registryDigests[verKey] !== registryDigest) {
         if (isHwmAdvancingAtActiveVersion) {
           witness.registryDigests[verKey] = registryDigest;
@@ -2998,7 +3195,7 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
     }
   }
 
-  // R16-B01: Automatically seal all existing history registries on disk into witness.registryDigests
+  // R16-B01 & R19-B02: Automatically seal all existing history registries on disk into witness.registryDigests and registryNonHwmDigests
   const histDir = path.join(dir, 'history');
   if (fs.existsSync(histDir)) {
     try {
@@ -3007,13 +3204,17 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
         const m = hf.match(/^trust-registry\.v(\d+)\.json$/);
         if (m) {
           const v = m[1];
-          if (!witness.registryDigests[v]) {
-            try {
-              const histObj = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
+          try {
+            const histObj = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
+            if (!witness.registryDigests[v]) {
               witness.registryDigests[v] = computeRegistryDigest(histObj);
               changed = true;
-            } catch (_) {}
-          }
+            }
+            if (!witness.registryNonHwmDigests[v]) {
+              witness.registryNonHwmDigests[v] = computeRegistryNonHwmDigest(histObj);
+              changed = true;
+            }
+          } catch (_) {}
         }
       }
     } catch (_) {}
@@ -3034,6 +3235,7 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
     maxSeenRegistryVersion: witness.maxSeenRegistryVersion,
     maxSeenRegistryDigest: witness.maxSeenRegistryDigest || '',
     registryDigests: { ...(witness.registryDigests || {}) },
+    registryNonHwmDigests: { ...(witness.registryNonHwmDigests || {}) },
     maxSeenHwmHeadIndex: witness.maxSeenHwmHeadIndex,
     maxSeenHwmHeadDigest: witness.maxSeenHwmHeadDigest || ''
   });
@@ -3049,6 +3251,7 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
         maxSeenRegistryVersion: witness.maxSeenRegistryVersion,
         maxSeenRegistryDigest: witness.maxSeenRegistryDigest || '',
         registryDigests: witness.registryDigests || {},
+        registryNonHwmDigests: witness.registryNonHwmDigests || {},
         maxSeenHwmHeadIndex: witness.maxSeenHwmHeadIndex,
         maxSeenHwmHeadDigest: witness.maxSeenHwmHeadDigest || '',
         updatedAt: new Date().toISOString()
@@ -3062,10 +3265,22 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
 
   writeWitness(localWitnessFile);
   writeWitness(systemWitnessFile);
+
+  return Object.freeze({
+    maxSeenRegistryVersion: witness.maxSeenRegistryVersion,
+    maxSeenRegistryDigest: witness.maxSeenRegistryDigest || '',
+    registryDigests: Object.freeze({ ...(witness.registryDigests || {}) }),
+    registryNonHwmDigests: Object.freeze({ ...(witness.registryNonHwmDigests || {}) }),
+    maxSeenHwmHeadIndex: witness.maxSeenHwmHeadIndex,
+    maxSeenHwmHeadDigest: witness.maxSeenHwmHeadDigest || ''
+  });
 }
 
 export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, candidateHwmHeadIndex, arg4, arg5, arg6) {
   const { headDigest: candidateHwmHeadDigest, regDigest: candidateRegistryDigest, options } = normalizeWitnessCallArgs(arg4, arg5, arg6);
+  const candidateNonHwmDigest = typeof options.nonHwmDigest === 'string'
+    ? options.nonHwmDigest
+    : (options.registry && typeof options.registry === 'object' ? computeRegistryNonHwmDigest(options.registry) : '');
 
   const externalWitness = options.externalMonotonicWitness || {};
   const witness = getMonotonicWitness(dir, options);
@@ -3091,8 +3306,8 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
     );
   }
 
-  // R15-B03, R16-B01 & R18-B02: Check registryDigest divergence for candidate and traverse historical ancestor commitments.
-  // At the active registryVersion, a digest update is permitted strictly when HWM headIndex strictly advances.
+  // R15-B03, R16-B01, R18-B02 & R19-B02: Check registryDigest divergence for candidate and traverse historical ancestor commitments.
+  // At the active registryVersion, a digest update is permitted strictly when HWM headIndex strictly advances AND non-HWM identity is invariant.
   if (typeof candidateRegistryVersion === 'number') {
     const isHwmAdvancingAtActiveVersion = (
       candidateRegistryVersion === witness.maxSeenRegistryVersion &&
@@ -3100,8 +3315,17 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
       candidateHwmHeadIndex > witness.maxSeenHwmHeadIndex
     );
 
-    // 1. Check candidate version if a witnessed digest exists
     const candKey = String(candidateRegistryVersion);
+    // R19-B02: Non-HWM identity commitment MUST match witnessed nonHwmDigest for the version even when HWM advances
+    if (candidateNonHwmDigest && witness.registryNonHwmDigests && witness.registryNonHwmDigests[candKey]) {
+      if (candidateNonHwmDigest !== witness.registryNonHwmDigests[candKey]) {
+        throw new Error(
+          `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate non-HWM registry identity digest (${candidateNonHwmDigest}) diverges from witnessed non-HWM identity (${witness.registryNonHwmDigests[candKey]}) at registryVersion ${candidateRegistryVersion}`
+        );
+      }
+    }
+
+    // 1. Check candidate version if a witnessed digest exists
     if (witness.registryDigests && witness.registryDigests[candKey] && candidateRegistryDigest) {
       if (candidateRegistryDigest !== witness.registryDigests[candKey] && !isHwmAdvancingAtActiveVersion) {
         throw new Error(
@@ -3116,7 +3340,7 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
       }
     }
 
-    // 2. R16-B01: Traverse and verify ALL witnessed historical versions against on-disk history
+    // 2. R16-B01 & R19-B02: Traverse and verify ALL witnessed historical versions against on-disk history
     if (witness.registryDigests && typeof witness.registryDigests === 'object') {
       const histDir = path.join(dir, 'history');
       for (const [vStr, expectedDigest] of Object.entries(witness.registryDigests)) {
@@ -3130,13 +3354,26 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
             );
           }
         }
-        // R17-B02: If on-disk historical artifact exists for this version (even if v === candidateRegistryVersion),
-        // verify its content digest matches the monotonic witness commitment (or candidateRegistryDigest if advancing HWM) and fail closed if corrupted
+        // R17-B02 & R19-B02: If on-disk historical artifact exists for this version (even if v === candidateRegistryVersion),
+        // verify its content digest and non-HWM identity digest match the monotonic witness commitment and fail closed if corrupted
         const histPath = path.join(histDir, `trust-registry.v${v}.json`);
         if (fs.existsSync(histPath)) {
           try {
             const histObj = JSON.parse(fs.readFileSync(histPath, 'utf8'));
             const actualHistDigest = computeRegistryDigest(histObj);
+            const actualHistNonHwmDigest = computeRegistryNonHwmDigest(histObj);
+            if (witness.registryNonHwmDigests && witness.registryNonHwmDigests[vStr]) {
+              if (actualHistNonHwmDigest !== witness.registryNonHwmDigests[vStr]) {
+                throw new Error(
+                  `[REGISTRY_DIVERGENCE_DETECTED] [REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Historical registry trust-registry.v${v}.json non-HWM identity (${actualHistNonHwmDigest}) diverges from witnessed non-HWM commitment (${witness.registryNonHwmDigests[vStr]})`
+                );
+              }
+            }
+            if (isThisVersionAdvancingHwm && candidateNonHwmDigest && actualHistNonHwmDigest !== candidateNonHwmDigest) {
+              throw new Error(
+                `[REGISTRY_DIVERGENCE_DETECTED] [REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate non-HWM identity (${candidateNonHwmDigest}) diverges from historical trust-registry.v${v}.json non-HWM identity (${actualHistNonHwmDigest})`
+              );
+            }
             const targetHistDigest = (isThisVersionAdvancingHwm && candidateRegistryDigest)
               ? candidateRegistryDigest
               : expectedDigest;
@@ -3246,7 +3483,8 @@ export function saveTrustRegistry(registry, options = {}) {
       ? registry.revocationHighWaterMark.headDigest
       : '';
     const saveRegDigest = computeRegistryDigest(registry);
-    assertMonotonicWitnessFreshness(dir, registry.registryVersion, saveHwmIdx, saveHwmDigest, saveRegDigest, opts);
+    const saveNonHwmDigest = computeRegistryNonHwmDigest(registry);
+    assertMonotonicWitnessFreshness(dir, registry.registryVersion, saveHwmIdx, saveHwmDigest, saveRegDigest, { ...opts, nonHwmDigest: saveNonHwmDigest });
     let priorRegistry = null;
     // Check against existing on-disk registry if present
     if (fs.existsSync(regPath)) {
@@ -3417,7 +3655,7 @@ export function saveTrustRegistry(registry, options = {}) {
     }
     safeWriteFileSync(checkpointPath, JSON.stringify(cpData, null, 2) + '\n', opts);
 
-    // R12-B02, R14-B07, R15-B01, R15-B03 & R17-B01: Update monotonic witness on successful save
+    // R12-B02, R14-B07, R15-B01, R15-B03, R17-B01 & R19-B02: Update monotonic witness on successful save
     const finalHwmIdx = typeof registry.revocationHighWaterMark?.headIndex === 'number'
       ? registry.revocationHighWaterMark.headIndex
       : -1;
@@ -3425,7 +3663,8 @@ export function saveTrustRegistry(registry, options = {}) {
       ? registry.revocationHighWaterMark.headDigest
       : '';
     const finalRegDigest = computeRegistryDigest(registry);
-    updateMonotonicWitness(dir, registry.registryVersion, finalHwmIdx, finalHwmDigest, finalRegDigest, createPrivilegedWitnessOptions(opts));
+    const finalNonHwmDigest = computeRegistryNonHwmDigest(registry);
+    updateMonotonicWitness(dir, registry.registryVersion, finalHwmIdx, finalHwmDigest, finalRegDigest, createPrivilegedWitnessOptions({ ...opts, nonHwmDigest: finalNonHwmDigest }));
 
     return {
       success: true,
@@ -3497,13 +3736,14 @@ function doLoadRevocationJournal(options = {}) {
       if (options.failClosed !== false) throw new Error(msg);
       return { valid: false, entries: [], error: msg, count: 0, path: journalPath };
     }
-    // R13-B03, R15-B01 & R15-B03: Enforce freshness check even when journal file does not exist
+    // R13-B03, R15-B01, R15-B03 & R19-B02: Enforce freshness check even when journal file does not exist
     const activeHeadIndex = checkpoint ? checkpoint.headIndex : (registryHwm ? registryHwm.headIndex : -1);
     const activeHeadDigest = checkpoint ? checkpoint.headDigest : (registryHwm ? registryHwm.headDigest : '');
     const journalRegDigest = trustRegistryLoad.registry ? computeRegistryDigest(trustRegistryLoad.registry) : '';
+    const journalNonHwmDigest = trustRegistryLoad.registry ? computeRegistryNonHwmDigest(trustRegistryLoad.registry) : '';
     const journalRegVer = trustRegistryLoad.registry ? trustRegistryLoad.registry.registryVersion : undefined;
     try {
-      assertMonotonicWitnessFreshness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, options);
+      assertMonotonicWitnessFreshness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, { ...options, nonHwmDigest: journalNonHwmDigest });
     } catch (witnessErr) {
       if (options.failClosed !== false) throw witnessErr;
       return { valid: false, entries: [], error: witnessErr.message, count: 0, path: journalPath };
@@ -3519,6 +3759,7 @@ function doLoadRevocationJournal(options = {}) {
       const activeHeadIndex = checkpoint ? checkpoint.headIndex : (registryHwm ? registryHwm.headIndex : -1);
       const activeHeadDigest = checkpoint ? checkpoint.headDigest : (registryHwm ? registryHwm.headDigest : '');
       const journalRegDigest = trustRegistryLoad.registry ? computeRegistryDigest(trustRegistryLoad.registry) : '';
+      const journalNonHwmDigest = trustRegistryLoad.registry ? computeRegistryNonHwmDigest(trustRegistryLoad.registry) : '';
       const journalRegVer = trustRegistryLoad.registry ? trustRegistryLoad.registry.registryVersion : undefined;
       if (activeHeadIndex >= 0) {
         const msg = `[JOURNAL_TRUNCATION_DETECTED] Journal is empty but records exist at headIndex ${activeHeadIndex}`;
@@ -3526,7 +3767,7 @@ function doLoadRevocationJournal(options = {}) {
         return { valid: false, entries: [], error: msg, count: 0, path: journalPath };
       }
       try {
-        assertMonotonicWitnessFreshness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, options);
+        assertMonotonicWitnessFreshness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, { ...options, nonHwmDigest: journalNonHwmDigest });
       } catch (witnessErr) {
         if (options.failClosed !== false) throw witnessErr;
         return { valid: false, entries: [], error: witnessErr.message, count: 0, path: journalPath };
@@ -3671,13 +3912,14 @@ function doLoadRevocationJournal(options = {}) {
       }
     }
 
-    // R12-B02, R14-B07, R15-B01 & R15-B03: Enforce monotonic witness freshness
+    // R12-B02, R14-B07, R15-B01, R15-B03 & R19-B02: Enforce monotonic witness freshness
     const activeHeadIndex = checkpoint ? checkpoint.headIndex : (registryHwm ? registryHwm.headIndex : -1);
     const activeHeadDigest = checkpoint ? checkpoint.headDigest : (registryHwm ? registryHwm.headDigest : (entries.length > 0 && activeHeadIndex >= 0 && entries[activeHeadIndex] ? sha256Digest(canonicalJsonStringify(entries[activeHeadIndex])) : ''));
     const journalRegDigest = trustRegistryLoad.registry ? computeRegistryDigest(trustRegistryLoad.registry) : '';
+    const journalNonHwmDigest = trustRegistryLoad.registry ? computeRegistryNonHwmDigest(trustRegistryLoad.registry) : '';
     const journalRegVer = trustRegistryLoad.registry ? trustRegistryLoad.registry.registryVersion : undefined;
-    assertMonotonicWitnessFreshness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, options);
-    updateMonotonicWitness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, createPrivilegedWitnessOptions(options));
+    assertMonotonicWitnessFreshness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, { ...options, nonHwmDigest: journalNonHwmDigest });
+    updateMonotonicWitness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, createPrivilegedWitnessOptions({ ...options, nonHwmDigest: journalNonHwmDigest }));
 
     return { valid: true, entries, error: null, count: entries.length, path: journalPath };
   } catch (err) {
@@ -3974,9 +4216,10 @@ export function appendRevocationEntry(entryInput, options = {}) {
       txnData.signature = crypto.sign(null, committedSignPayload, options.signerPrivateKey).toString('hex');
       safeWriteFileSync(txnPath, JSON.stringify(txnData, null, 2) + '\n', options);
 
-      // R14-B05, R15-B01, R15-B03 & R17-B01: Update persistent monotonic witness BEFORE unlinking WAL marker
+      // R14-B05, R15-B01, R15-B03, R17-B01 & R19-B02: Update persistent monotonic witness BEFORE unlinking WAL marker
       const committedRegDigest = computeRegistryDigest(regObj);
-      updateMonotonicWitness(dir, regObj ? regObj.registryVersion : 1, entryIndex, entryDigest, committedRegDigest, createPrivilegedWitnessOptions(options));
+      const committedNonHwmDigest = computeRegistryNonHwmDigest(regObj);
+      updateMonotonicWitness(dir, regObj ? regObj.registryVersion : 1, entryIndex, entryDigest, committedRegDigest, createPrivilegedWitnessOptions({ ...options, nonHwmDigest: committedNonHwmDigest }));
 
       // Successfully committed and witnessed: remove WAL marker
       try {
