@@ -58,8 +58,13 @@ function pathsEqual(p1, p2) {
 
 export function isGovernanceLockHeld(dir) {
   const store = _governanceLockStorage.getStore();
-  if (!store || !store.active) return false;
-  return pathsEqual(store.dir, dir);
+  if (!store || store.active !== true) return false;
+  if (!pathsEqual(store.dir, dir)) return false;
+  if (store.lockTarget && !fs.existsSync(store.lockTarget + '.lock')) {
+    store.active = false;
+    return false;
+  }
+  return true;
 }
 
 export const REVOCATION_TYPES = Object.freeze({
@@ -570,14 +575,22 @@ export function withGovernanceLock(options, fn) {
   }
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const lockTarget = path.join(dir, GOVERNANCE_LOCK_TARGET);
+  const lockContext = { dir: canonicalizeDirPath(dir), active: true, lockTarget };
   return withFileLock(lockTarget, () => {
-    const lockContext = { dir: canonicalizeDirPath(dir), active: true };
-    return _governanceLockStorage.run(lockContext, () => {
-      return callback({
-        ...opts,
-        skipLock: true
+    try {
+      const result = _governanceLockStorage.run(lockContext, () => {
+        return callback({
+          ...opts,
+          skipLock: true
+        });
       });
-    });
+      if (result && typeof result.then === 'function') {
+        throw new Error('[UNSUPPORTED_ASYNC_OPERATION] withGovernanceLock does not support asynchronous callbacks');
+      }
+      return result;
+    } finally {
+      lockContext.active = false;
+    }
   }, opts);
 }
 
@@ -665,7 +678,29 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
     throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Transaction WAL missing required paths, sizes, or cryptographic metadata');
   }
 
-  // R10-B01 & R11-B01 & R12-B06: Authenticate signer public key against trusted root or validated registry
+  // R10-B01 & R11-B01 & R12-B06 & R14-B03: Authenticate signer public key against trusted root or validated registry
+  // Prevent retired or revoked keys from authorizing a WAL if on-disk registry exists
+  if (fs.existsSync(expectedRegPath)) {
+    try {
+      const curRegRaw = JSON.parse(fs.readFileSync(expectedRegPath, 'utf8'));
+      if (curRegRaw && Array.isArray(curRegRaw.keys)) {
+        const curKey = curRegRaw.keys.find(k => k.keyId === txnData.signedBy);
+        if (curKey) {
+          if (curKey.status === 'RETIRED') {
+            throw new Error(`[RETIRED_KEY_AUTHORIZATION_REJECTED] Signer '${txnData.signedBy}' in WAL is retired in current trust registry`);
+          }
+          if (curKey.status === 'REVOKED') {
+            throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer '${txnData.signedBy}' in WAL is revoked in current trust registry`);
+          }
+        }
+      }
+    } catch (e) {
+      if (e.message && (e.message.includes('RETIRED_KEY_AUTHORIZATION_REJECTED') || e.message.includes('REVOKED_KEY_AUTHORIZATION_REJECTED'))) {
+        throw e;
+      }
+    }
+  }
+
   let signerPublicKeyPem = null;
   if (options.trustedRootKeyId === txnData.signedBy && options.trustedRootPublicKeyPem) {
     signerPublicKeyPem = options.trustedRootPublicKeyPem;
@@ -742,7 +777,7 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
       ) {
         throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL registryVersion does not match on-disk registry');
       }
-      // R13-B05: Verify Journal physical entries and tail record match
+      // R13-B05 & R14-B08: Verify Journal physical entries, tail record match, and cryptographic signature
       const journalRaw = fs.readFileSync(expectedJournalPath, 'utf8').trim();
       if (!journalRaw) {
         throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL exists but on-disk journal is empty');
@@ -757,6 +792,31 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
         tailDigest !== txnData.committedHwmHeadDigest
       ) {
         throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL committedHwmHeadIndex/headDigest does not match journal tail entry');
+      }
+
+      // R14-B08: Cryptographically verify tail entry signature against active supervisor key
+      if (!lastEntry.signedBy || typeof lastEntry.signedBy !== 'string' || !lastEntry.signature || typeof lastEntry.signature !== 'string') {
+        throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL journal tail entry missing signature or signedBy');
+      }
+      let tailSignerPem = null;
+      if (curReg && Array.isArray(curReg.keys)) {
+        const kRec = curReg.keys.find(k => k.keyId === lastEntry.signedBy);
+        if (kRec && (kRec.status === 'ACTIVE' || kRec.status === 'ACTIVE_PINNED_ROOT')) {
+          tailSignerPem = kRec.publicKeyPem;
+        } else if (kRec) {
+          throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL journal tail entry signed by inactive/retired key '${lastEntry.signedBy}'`);
+        }
+      }
+      if (!tailSignerPem && (options.trustedRootKeyId === lastEntry.signedBy || DEFAULT_SUPERVISOR_KEY_ID === lastEntry.signedBy)) {
+        tailSignerPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
+      }
+      if (!tailSignerPem) {
+        throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL journal tail signer '${lastEntry.signedBy}' is unauthenticated`);
+      }
+      const tailSignPayload = Buffer.from(computeRevocationEntrySignPayload(lastEntry), 'utf8');
+      const isTailSigValid = crypto.verify(null, tailSignPayload, tailSignerPem, Buffer.from(lastEntry.signature, 'hex'));
+      if (!isTailSigValid) {
+        throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL journal tail entry signature verification failed');
       }
     } catch (parseErr) {
       if (parseErr.message && parseErr.message.includes('TRANSACTION_WAL_CORRUPTION_DETECTED')) {
@@ -773,17 +833,57 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
     return { recovered: false, committed: true, txnId: txnData.txnId };
   }
 
-  // R10-B01: Verify snapshot digests against signed hash commitments
+  // R10-B01 & R14-B03: Verify snapshot digests and semantic bindings against signed commitments
   if (txnData.initialCheckpointRawBase64) {
     const cpBuf = Buffer.from(txnData.initialCheckpointRawBase64, 'base64');
     if (sha256Digest(cpBuf) !== txnData.initialCheckpointSha256) {
       throw new Error('[TRANSACTION_WAL_DIGEST_MISMATCH_DETECTED] Checkpoint snapshot digest does not match signed initialCheckpointSha256');
+    }
+    let parsedCp = null;
+    try {
+      parsedCp = JSON.parse(cpBuf.toString('utf8'));
+    } catch (e) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Checkpoint snapshot is invalid JSON: ${e.message}`);
+    }
+    const cpHwmIdx = typeof parsedCp.headIndex === 'number' ? parsedCp.headIndex : -1;
+    const cpHwmDigest = parsedCp.headDigest || '';
+    if (cpHwmIdx !== txnData.initialHwmHeadIndex) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Checkpoint snapshot headIndex (${cpHwmIdx}) does not match WAL initialHwmHeadIndex (${txnData.initialHwmHeadIndex})`);
+    }
+    if (txnData.initialHwmHeadDigest && cpHwmDigest !== txnData.initialHwmHeadDigest) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Checkpoint snapshot headDigest (${cpHwmDigest}) does not match WAL initialHwmHeadDigest (${txnData.initialHwmHeadDigest})`);
     }
   }
   if (txnData.initialRegistryRawBase64) {
     const regBuf = Buffer.from(txnData.initialRegistryRawBase64, 'base64');
     if (sha256Digest(regBuf) !== txnData.initialRegistrySha256) {
       throw new Error('[TRANSACTION_WAL_DIGEST_MISMATCH_DETECTED] Registry snapshot digest does not match signed initialRegistrySha256');
+    }
+    let parsedReg = null;
+    try {
+      parsedReg = JSON.parse(regBuf.toString('utf8'));
+    } catch (e) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Registry snapshot is invalid JSON: ${e.message}`);
+    }
+    if (typeof parsedReg.registryVersion !== 'number' || parsedReg.registryVersion !== txnData.initialRegistryVersion) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Registry snapshot version (${parsedReg.registryVersion}) does not match WAL initialRegistryVersion (${txnData.initialRegistryVersion})`);
+    }
+    const snapHwm = parsedReg.revocationHighWaterMark;
+    const snapHwmIdx = snapHwm && typeof snapHwm.headIndex === 'number' ? snapHwm.headIndex : -1;
+    const snapHwmDigest = snapHwm ? snapHwm.headDigest : '';
+    if (snapHwmIdx !== txnData.initialHwmHeadIndex) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Registry snapshot HWM headIndex (${snapHwmIdx}) does not match WAL initialHwmHeadIndex (${txnData.initialHwmHeadIndex})`);
+    }
+    if (txnData.initialHwmHeadDigest && snapHwmDigest !== txnData.initialHwmHeadDigest) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Registry snapshot HWM headDigest (${snapHwmDigest}) does not match WAL initialHwmHeadDigest (${txnData.initialHwmHeadDigest})`);
+    }
+    const snapValidation = validateTrustRegistry(parsedReg, {
+      ...options,
+      skipLock: true,
+      allowEmbeddedFallback: true
+    });
+    if (!snapValidation.valid) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Registry snapshot failed schema and cryptographic validation: ${snapValidation.error}`);
     }
   }
   if (txnData.initialHistRawBase64) {
@@ -820,7 +920,7 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
     const curHwmDigest = curHwm ? curHwm.headDigest : '';
 
     // Enforce monotonic witness freshness before any rollback action
-    assertMonotonicWitnessFreshness(dir, curRegVer, curHwmIdx, options);
+    assertMonotonicWitnessFreshness(dir, curRegVer, curHwmIdx, curHwmDigest, options);
 
     // R11-B04, R12-B05 & R13-B05: Check if transaction actually completed all on-disk mutations before crash
     const isTargetExpected = (
@@ -887,7 +987,7 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
     }
   } else {
     // If on-disk registry does not exist, verify that monotonic witness does not expect a higher state
-    assertMonotonicWitnessFreshness(dir, 1, -1, options);
+    assertMonotonicWitnessFreshness(dir, 1, -1, '', options);
   }
 
   // R11-B03: Verify that the journal prefix up to initialJournalSize matches initialJournalSha256 before truncation
@@ -1197,6 +1297,37 @@ export function validateTrustRegistry(registry, options = {}) {
     };
   }
 
+  // Resolve prior registry from options or historical chain
+  let priorReg = options.priorRegistry || null;
+  if (!priorReg && registry.registryVersion > 1) {
+    if (registry.registryVersion === 2 && options.allowEmbeddedFallback !== false) {
+      const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
+      const rootPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
+      const rootFp = options.trustedRootFingerprint || DEFAULT_SUPERVISOR_FINGERPRINT;
+      priorReg = {
+        schemaVersion: '1.0.0',
+        registryVersion: 1,
+        authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+        activeKeyId: rootId,
+        activeKeyFingerprint: rootFp,
+        activePublicKeyPem: rootPem,
+        keyType: 'ed25519',
+        pinnedSince: '2026-10-16T06:55:39.565Z',
+        rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+        revokedKeyIds: [],
+        keys: [{ keyId: rootId, keyFingerprint: rootFp, publicKeyPem: rootPem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' }]
+      };
+    } else {
+      try {
+        const dir = resolvePluginDataDir(options);
+        const priorHistPath = path.join(dir, 'history', `trust-registry.v${registry.registryVersion - 1}.json`);
+        if (fs.existsSync(priorHistPath)) {
+          priorReg = JSON.parse(fs.readFileSync(priorHistPath, 'utf8'));
+        }
+      } catch (_) {}
+    }
+  }
+
   // High-water mark validation if present (R05-B01)
   if (registry.revocationHighWaterMark !== undefined && registry.revocationHighWaterMark !== null) {
     const hwm = registry.revocationHighWaterMark;
@@ -1229,7 +1360,7 @@ export function validateTrustRegistry(registry, options = {}) {
     // R08-B05: Signer must not have been already revoked in priorRegistry.
     // However, if the key was active when it signed the historical HWM and only revoked in this version,
     // its historical cryptographic signature remains valid against its public key.
-    if (options.priorRegistry && Array.isArray(options.priorRegistry.revokedKeyIds) && options.priorRegistry.revokedKeyIds.includes(hwm.authorizedBy)) {
+    if (priorReg && Array.isArray(priorReg.revokedKeyIds) && priorReg.revokedKeyIds.includes(hwm.authorizedBy)) {
       return {
         valid: false,
         error: `[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer '${hwm.authorizedBy}' for revocationHighWaterMark was already revoked in prior registry`,
@@ -1251,6 +1382,29 @@ export function validateTrustRegistry(registry, options = {}) {
         ancestryContinuity: true
       };
     }
+
+    // R14-B04: Key Lifecycle Boundary: A RETIRED or REVOKED key can NEVER authorize a new or modified HWM.
+    // It is only accepted if it is an exact historical carry-over from priorRegistry where the key was active.
+    if (hwmSignerKey.status === 'RETIRED' || hwmSignerKey.status === 'REVOKED') {
+      const priorHwm = priorReg?.revocationHighWaterMark;
+      const isExactPriorMatch = Boolean(
+        priorHwm &&
+        priorHwm.authorizedBy === hwm.authorizedBy &&
+        priorHwm.headIndex === hwm.headIndex &&
+        priorHwm.headDigest === hwm.headDigest &&
+        priorHwm.signature === hwm.signature
+      );
+      if (!isExactPriorMatch) {
+        return {
+          valid: false,
+          error: `[RETIRED_KEY_AUTHORIZATION_REJECTED] Signer '${hwm.authorizedBy}' for revocationHighWaterMark has status '${hwmSignerKey.status}' and cannot authorize new or modified revocation high-water mark`,
+          cryptographicValidity: false,
+          monotonicValidity: true,
+          ancestryContinuity: true
+        };
+      }
+    }
+
     const hwmPayload = Buffer.from(canonicalJsonStringify({
       headIndex: hwm.headIndex,
       headDigest: hwm.headDigest,
@@ -1266,37 +1420,6 @@ export function validateTrustRegistry(registry, options = {}) {
         monotonicValidity: true,
         ancestryContinuity: true
       };
-    }
-  }
-
-  // Resolve prior registry from options or historical chain
-  let priorReg = options.priorRegistry || null;
-  if (!priorReg && registry.registryVersion > 1) {
-    if (registry.registryVersion === 2 && options.allowEmbeddedFallback !== false) {
-      const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
-      const rootPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
-      const rootFp = options.trustedRootFingerprint || DEFAULT_SUPERVISOR_FINGERPRINT;
-      priorReg = {
-        schemaVersion: '1.0.0',
-        registryVersion: 1,
-        authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
-        activeKeyId: rootId,
-        activeKeyFingerprint: rootFp,
-        activePublicKeyPem: rootPem,
-        keyType: 'ed25519',
-        pinnedSince: '2026-10-16T06:55:39.565Z',
-        rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
-        revokedKeyIds: [],
-        keys: [{ keyId: rootId, keyFingerprint: rootFp, publicKeyPem: rootPem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' }]
-      };
-    } else {
-      try {
-        const dir = resolvePluginDataDir(options);
-        const priorHistPath = path.join(dir, 'history', `trust-registry.v${registry.registryVersion - 1}.json`);
-        if (fs.existsSync(priorHistPath)) {
-          priorReg = JSON.parse(fs.readFileSync(priorHistPath, 'utf8'));
-        }
-      } catch (_) {}
     }
   }
 
@@ -1611,11 +1734,13 @@ export function createAuthorizedRegistryUpdate(currentRegistry, updates, signerK
     registryVersion: (currentRegistry.registryVersion || 1) + 1
   };
 
-  // R08-B05: If HWM exists and its prior signer was revoked, or if re-signing requested,
-  // re-sign HWM with the new authorized signer
+  // R08-B05 & R14-B04: If HWM exists and its prior signer is not active in updated registry,
+  // or if re-signing requested, re-sign HWM with the new authorized signer
   if (updated.revocationHighWaterMark) {
     const isSignerRevoked = Array.isArray(updated.revokedKeyIds) && updated.revokedKeyIds.includes(updated.revocationHighWaterMark.authorizedBy);
-    if (isSignerRevoked || updates.reSignHighWaterMark === true) {
+    const signerInUpdated = Array.isArray(updated.keys) && updated.keys.find(k => k.keyId === updated.revocationHighWaterMark.authorizedBy);
+    const isSignerInactive = !signerInUpdated || (signerInUpdated.status !== 'ACTIVE' && signerInUpdated.status !== 'ACTIVE_PINNED_ROOT');
+    if (isSignerRevoked || isSignerInactive || updates.reSignHighWaterMark === true) {
       const hwmPayload = Buffer.from(canonicalJsonStringify({
         headIndex: updated.revocationHighWaterMark.headIndex,
         headDigest: updated.revocationHighWaterMark.headDigest,
@@ -2181,26 +2306,43 @@ function getWitnessStoragePaths(dir) {
 export function getMonotonicWitness(dir, options = {}) {
   const norm = path.resolve(dir);
   if (!_DIR_MONOTONIC_WITNESS.has(norm)) {
-    _DIR_MONOTONIC_WITNESS.set(norm, { maxSeenRegistryVersion: 1, maxSeenHwmHeadIndex: -1 });
+    _DIR_MONOTONIC_WITNESS.set(norm, { maxSeenRegistryVersion: 1, maxSeenHwmHeadIndex: -1, maxSeenHwmHeadDigest: '' });
   }
   const memWitness = _DIR_MONOTONIC_WITNESS.get(norm);
   let maxRegVer = memWitness.maxSeenRegistryVersion;
   let maxHwmIdx = memWitness.maxSeenHwmHeadIndex;
+  let maxHwmDigest = memWitness.maxSeenHwmHeadDigest || '';
 
   // Read persistent anchors
   const { localWitnessFile, systemWitnessFile } = getWitnessStoragePaths(norm);
   const readWitnessFile = (filePath) => {
-    try {
-      if (fs.existsSync(filePath)) {
-        const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-        if (typeof raw.maxSeenRegistryVersion === 'number' && raw.maxSeenRegistryVersion > maxRegVer) {
-          maxRegVer = raw.maxSeenRegistryVersion;
-        }
-        if (typeof raw.maxSeenHwmHeadIndex === 'number' && raw.maxSeenHwmHeadIndex > maxHwmIdx) {
+    if (fs.existsSync(filePath)) {
+      let raw = null;
+      try {
+        raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      } catch (err) {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} is corrupted or cannot be parsed: ${err.message}`);
+      }
+      if (!raw || typeof raw !== 'object') {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} contains invalid JSON payload`);
+      }
+      if (typeof raw.maxSeenRegistryVersion === 'number' && raw.maxSeenRegistryVersion > maxRegVer) {
+        maxRegVer = raw.maxSeenRegistryVersion;
+      }
+      if (typeof raw.maxSeenHwmHeadIndex === 'number') {
+        if (raw.maxSeenHwmHeadIndex > maxHwmIdx) {
           maxHwmIdx = raw.maxSeenHwmHeadIndex;
+          maxHwmDigest = typeof raw.maxSeenHwmHeadDigest === 'string' ? raw.maxSeenHwmHeadDigest : '';
+        } else if (raw.maxSeenHwmHeadIndex === maxHwmIdx && maxHwmIdx >= 0) {
+          if (raw.maxSeenHwmHeadDigest && maxHwmDigest && raw.maxSeenHwmHeadDigest !== maxHwmDigest) {
+            throw new Error(`[MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Persistent witness divergence at index ${maxHwmIdx} in ${filePath}`);
+          }
+          if (!maxHwmDigest && raw.maxSeenHwmHeadDigest) {
+            maxHwmDigest = raw.maxSeenHwmHeadDigest;
+          }
         }
       }
-    } catch (_) {}
+    }
   };
 
   readWitnessFile(localWitnessFile);
@@ -2212,26 +2354,54 @@ export function getMonotonicWitness(dir, options = {}) {
     if (typeof externalWitness.minRegistryVersion === 'number' && externalWitness.minRegistryVersion > maxRegVer) {
       maxRegVer = externalWitness.minRegistryVersion;
     }
-    if (typeof externalWitness.minHwmHeadIndex === 'number' && externalWitness.minHwmHeadIndex > maxHwmIdx) {
-      maxHwmIdx = externalWitness.minHwmHeadIndex;
+    if (typeof externalWitness.minHwmHeadIndex === 'number') {
+      if (externalWitness.minHwmHeadIndex > maxHwmIdx) {
+        maxHwmIdx = externalWitness.minHwmHeadIndex;
+        if (externalWitness.minHwmHeadDigest) maxHwmDigest = externalWitness.minHwmHeadDigest;
+      } else if (externalWitness.minHwmHeadIndex === maxHwmIdx && maxHwmIdx >= 0 && externalWitness.minHwmHeadDigest && maxHwmDigest) {
+        if (externalWitness.minHwmHeadDigest !== maxHwmDigest) {
+          throw new Error(`[MONOTONIC_WITNESS_DIVERGENCE_DETECTED] External witness digest diverges at index ${maxHwmIdx}`);
+        }
+      }
     }
   }
 
   memWitness.maxSeenRegistryVersion = maxRegVer;
   memWitness.maxSeenHwmHeadIndex = maxHwmIdx;
+  memWitness.maxSeenHwmHeadDigest = maxHwmDigest;
   return memWitness;
 }
 
-export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, options = {}) {
+export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, hwmHeadDigestOrOptions = {}, maybeOptions = {}) {
+  let hwmHeadDigest = null;
+  let options = maybeOptions;
+  if (typeof hwmHeadDigestOrOptions === 'string') {
+    hwmHeadDigest = hwmHeadDigestOrOptions;
+  } else if (hwmHeadDigestOrOptions && typeof hwmHeadDigestOrOptions === 'object') {
+    options = hwmHeadDigestOrOptions;
+    hwmHeadDigest = options.hwmHeadDigest || null;
+  }
+
   const witness = getMonotonicWitness(dir, options);
   let changed = false;
   if (typeof registryVersion === 'number' && registryVersion > witness.maxSeenRegistryVersion) {
     witness.maxSeenRegistryVersion = registryVersion;
     changed = true;
   }
-  if (typeof hwmHeadIndex === 'number' && hwmHeadIndex > witness.maxSeenHwmHeadIndex) {
-    witness.maxSeenHwmHeadIndex = hwmHeadIndex;
-    changed = true;
+  if (typeof hwmHeadIndex === 'number') {
+    if (hwmHeadIndex > witness.maxSeenHwmHeadIndex) {
+      witness.maxSeenHwmHeadIndex = hwmHeadIndex;
+      witness.maxSeenHwmHeadDigest = hwmHeadDigest || '';
+      changed = true;
+    } else if (hwmHeadIndex === witness.maxSeenHwmHeadIndex && hwmHeadIndex >= 0) {
+      if (hwmHeadDigest && witness.maxSeenHwmHeadDigest && witness.maxSeenHwmHeadDigest !== hwmHeadDigest) {
+        throw new Error(`[MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Monotonic witness divergence at headIndex ${hwmHeadIndex}: existing digest ${witness.maxSeenHwmHeadDigest} !== candidate digest ${hwmHeadDigest}`);
+      }
+      if (!witness.maxSeenHwmHeadDigest && hwmHeadDigest) {
+        witness.maxSeenHwmHeadDigest = hwmHeadDigest;
+        changed = true;
+      }
+    }
   }
 
   const { localWitnessFile, systemWitnessFile } = getWitnessStoragePaths(dir);
@@ -2244,33 +2414,29 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, optio
         dir: path.resolve(dir),
         maxSeenRegistryVersion: witness.maxSeenRegistryVersion,
         maxSeenHwmHeadIndex: witness.maxSeenHwmHeadIndex,
+        maxSeenHwmHeadDigest: witness.maxSeenHwmHeadDigest || '',
         updatedAt: new Date().toISOString()
       }, null, 2) + '\n';
-      fs.writeFileSync(filePath, payload, { encoding: 'utf8', flag: 'w' });
-    } catch (_) {}
+      safeWriteFileSync(filePath, payload, options);
+    } catch (writeErr) {
+      throw new Error(`[STORAGE_DURABILITY_FAILURE] Failed to persist monotonic witness at ${filePath}: ${writeErr.message}`);
+    }
   };
 
   writeWitness(localWitnessFile);
   writeWitness(systemWitnessFile);
 }
 
-// Internal test-only helper (strictly protected against unauthorized callers)
-export function resetMonotonicWitnessForTest(dir, testOptions = {}) {
-  if (testOptions.allowInWorkspace !== true) {
-    throw new Error('[PERMISSION_DENIED] resetMonotonicWitnessForTest is strictly restricted to test harnesses');
+export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, candidateHwmHeadIndex, candidateHwmHeadDigestOrOptions = {}, maybeOptions = {}) {
+  let candidateHwmHeadDigest = null;
+  let options = maybeOptions;
+  if (typeof candidateHwmHeadDigestOrOptions === 'string') {
+    candidateHwmHeadDigest = candidateHwmHeadDigestOrOptions;
+  } else if (candidateHwmHeadDigestOrOptions && typeof candidateHwmHeadDigestOrOptions === 'object') {
+    options = candidateHwmHeadDigestOrOptions;
+    candidateHwmHeadDigest = options.candidateHwmHeadDigest || null;
   }
-  if (dir) {
-    const norm = path.resolve(dir);
-    _DIR_MONOTONIC_WITNESS.delete(norm);
-    const { localWitnessFile, systemWitnessFile } = getWitnessStoragePaths(norm);
-    try { fs.unlinkSync(localWitnessFile); } catch (_) {}
-    try { fs.unlinkSync(systemWitnessFile); } catch (_) {}
-  } else {
-    _DIR_MONOTONIC_WITNESS.clear();
-  }
-}
 
-export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, candidateHwmHeadIndex, options = {}) {
   const externalWitness = options.externalMonotonicWitness || {};
   const witness = getMonotonicWitness(dir, options);
   const minRegVer = Math.max(
@@ -2292,6 +2458,19 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
   if (typeof candidateHwmHeadIndex === 'number' && candidateHwmHeadIndex < minHwmIdx) {
     throw new Error(
       `[REGISTRY_ROLLBACK_DETECTED] [HIGH_WATER_MARK_ROLLBACK_DETECTED] [MONOTONIC_WITNESS_ROLLBACK_DETECTED] Loaded HWM headIndex (${candidateHwmHeadIndex}) is behind authenticated monotonic witness (${minHwmIdx})`
+    );
+  }
+  // R14-B07: Check headDigest divergence at same index
+  if (
+    typeof candidateHwmHeadIndex === 'number' &&
+    candidateHwmHeadIndex === witness.maxSeenHwmHeadIndex &&
+    candidateHwmHeadIndex >= 0 &&
+    candidateHwmHeadDigest &&
+    witness.maxSeenHwmHeadDigest &&
+    candidateHwmHeadDigest !== witness.maxSeenHwmHeadDigest
+  ) {
+    throw new Error(
+      `[MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate HWM headDigest (${candidateHwmHeadDigest}) diverges from monotonic witness headDigest (${witness.maxSeenHwmHeadDigest}) at index ${candidateHwmHeadIndex}`
     );
   }
 }
@@ -2654,26 +2833,47 @@ function doLoadRevocationJournal(options = {}) {
     }
 
     const trustedKeys = new Map();
+    const maxActiveIndexPerKey = new Map();
 
     if (trustRegistryLoad.valid && trustRegistryLoad.registry) {
       for (const k of trustRegistryLoad.registry.keys || []) {
-        if (['ACTIVE_PINNED_ROOT', 'ACTIVE', 'RETIRED'].includes(k.status)) {
+        if (['ACTIVE_PINNED_ROOT', 'ACTIVE'].includes(k.status)) {
           trustedKeys.set(k.keyId, k.publicKeyPem);
+          maxActiveIndexPerKey.set(k.keyId, Infinity);
+        } else if (['RETIRED', 'REVOKED'].includes(k.status)) {
+          trustedKeys.set(k.keyId, k.publicKeyPem);
+          maxActiveIndexPerKey.set(k.keyId, -1);
         }
       }
     }
 
-    // Historical key lifecycle resolution: load historical public keys from history/
+    // Historical key lifecycle resolution: load historical public keys and track active windows from history/
     const histDir = path.join(path.dirname(journalPath), 'history');
     if (fs.existsSync(histDir)) {
       try {
         const histFiles = fs.readdirSync(histDir).filter(f => /^trust-registry\.v(\d+)\.json$/.test(f));
+        histFiles.sort((a, b) => {
+          const vA = parseInt(a.match(/^trust-registry\.v(\d+)\.json$/)[1], 10);
+          const vB = parseInt(b.match(/^trust-registry\.v(\d+)\.json$/)[1], 10);
+          return vA - vB;
+        });
         for (const hf of histFiles) {
           try {
             const hReg = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
+            const hHwmIdx = typeof hReg.revocationHighWaterMark?.headIndex === 'number'
+              ? hReg.revocationHighWaterMark.headIndex
+              : -1;
             for (const hk of hReg.keys || []) {
-              if (hk.keyId && hk.publicKeyPem && !trustedKeys.has(hk.keyId)) {
-                trustedKeys.set(hk.keyId, hk.publicKeyPem);
+              if (hk.keyId && hk.publicKeyPem) {
+                if (!trustedKeys.has(hk.keyId)) {
+                  trustedKeys.set(hk.keyId, hk.publicKeyPem);
+                }
+                if (hk.status === 'ACTIVE' || hk.status === 'ACTIVE_PINNED_ROOT') {
+                  const cur = maxActiveIndexPerKey.get(hk.keyId);
+                  if (cur !== Infinity) {
+                    maxActiveIndexPerKey.set(hk.keyId, Math.max(cur ?? -1, hHwmIdx));
+                  }
+                }
               }
             }
           } catch (_) {}
@@ -2681,10 +2881,13 @@ function doLoadRevocationJournal(options = {}) {
       } catch (_) {}
     }
 
-    // Always include genesis root anchor
+    // Include genesis root anchor if not already configured with an explicit status
     const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
     const rootPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
-    trustedKeys.set(rootId, rootPem);
+    if (!trustedKeys.has(rootId)) {
+      trustedKeys.set(rootId, rootPem);
+      maxActiveIndexPerKey.set(rootId, Infinity);
+    }
 
     const entries = [];
     let expectedPrevDigest = '0'.repeat(64);
@@ -2728,6 +2931,14 @@ function doLoadRevocationJournal(options = {}) {
       const signerPem = trustedKeys.get(parsed.signedBy);
       if (!signerPem) {
         const msg = `Signer '${parsed.signedBy}' at line ${i + 1} is not a trusted supervisor key`;
+        if (options.failClosed !== false) throw new Error(msg);
+        return { valid: false, entries: [], error: msg, count: i };
+      }
+
+      // R14-B04: If signer was retired or revoked, enforce that entryIndex <= maxActiveIndex
+      const maxIdxForSigner = maxActiveIndexPerKey.get(parsed.signedBy);
+      if (typeof maxIdxForSigner === 'number' && maxIdxForSigner !== Infinity && parsed.entryIndex > maxIdxForSigner) {
+        const msg = `[RETIRED_KEY_AUTHORIZATION_REJECTED] Signer '${parsed.signedBy}' was retired at index ${maxIdxForSigner} and cannot authorize revocation record at index ${parsed.entryIndex}`;
         if (options.failClosed !== false) throw new Error(msg);
         return { valid: false, entries: [], error: msg, count: i };
       }
@@ -3066,14 +3277,14 @@ export function appendRevocationEntry(entryInput, options = {}) {
       txnData.signature = crypto.sign(null, committedSignPayload, options.signerPrivateKey).toString('hex');
       safeWriteFileSync(txnPath, JSON.stringify(txnData, null, 2) + '\n', options);
 
-      // Successfully committed: remove WAL marker
+      // R14-B05: Update persistent monotonic witness BEFORE unlinking WAL marker
+      updateMonotonicWitness(dir, regObj ? regObj.registryVersion : 1, entryIndex, entryDigest, options);
+
+      // Successfully committed and witnessed: remove WAL marker
       try {
         assertSafeStorageTarget(txnPath, options);
         if (fs.existsSync(txnPath)) fs.unlinkSync(txnPath);
       } catch (_) {}
-
-      // R12-B02: Update monotonic witness on successful revocation append
-      updateMonotonicWitness(dir, regObj ? regObj.registryVersion : 1, entryIndex);
 
       return {
         success: true,

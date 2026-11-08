@@ -38,7 +38,7 @@
         },
         {
           "path": "skills/3lens/tool-integrity-manifest.json",
-          "sha256": "8a84915e6b41e68cbeeae8c37e25373d45a1309375e056c5fc10bfb7f18d6c6f",
+          "sha256": "347632906a218d32812160d925a47be57e2fb4e531c9f98c4b96ebbea0f5b66c",
           "description": "Cryptographic TCB integrity manifest pinning critical script hashes"
         },
         {
@@ -48,7 +48,7 @@
         },
         {
           "path": "skills/3lens/scripts/adapters/plugin-data-adapter.mjs",
-          "sha256": "0bd4931b085a1ebccb491324a67ce5a824e57f5f1b222a1b5dd4f4791e1c2608",
+          "sha256": "f6efc51e481a40dc1f01489fb998f266e6c29c662b1463a7d263935051569148",
           "description": "Persistent Plugin Data Storage and Trust Registry Adapter (atomic mutual exclusion, root authorization chain)"
         },
         {

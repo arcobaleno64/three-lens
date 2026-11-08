@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import {
   resolvePluginDataDir,
   getTrustRegistryPath,
@@ -23,6 +25,7 @@ import {
   withGovernanceLock,
   recoverAbortedRevocationTransaction,
   computeTransactionWalSignPayload,
+  computeRevocationEntrySignPayload,
   REVOCATION_TYPES,
   EMBEDDED_ROOT_REGISTRY,
   DEFAULT_SUPERVISOR_KEY_ID,
@@ -30,7 +33,6 @@ import {
   DEFAULT_SUPERVISOR_FINGERPRINT,
   canonicalJsonStringify,
   isGovernanceLockHeld,
-  resetMonotonicWitnessForTest,
   sha256Digest
 } from '../scripts/adapters/plugin-data-adapter.mjs';
 
@@ -2685,7 +2687,6 @@ test('PLUGIN_DATA Governance: R13-B01 - Incomplete registry schema { registryVer
   assert.equal(fs.readFileSync(journalPath, 'utf8').trim().length > 0, true);
   assert.equal(fs.existsSync(txnPath), true);
 
-  resetMonotonicWitnessForTest(tempDir, { allowInWorkspace: true });
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -2718,10 +2719,7 @@ test('PLUGIN_DATA Governance: R13-B02 & R13-B03 - Persistent monotonic witness s
   const localWitness = path.join(tempDir, '.monotonic-witness.json');
   assert.equal(fs.existsSync(localWitness), true);
 
-  // 2. Clear memory witness cache to simulate cold-start / process restart
-  resetMonotonicWitnessForTest(null, { allowInWorkspace: true });
-
-  // 3. Whole-directory state rollback simulation:
+  // 2. Whole-directory state rollback simulation:
   // Overwrite registry with an old version 1 without HWM, update history to match, and remove local witness
   const regPath = getTrustRegistryPath(opts);
   const v1NoHwm = {
@@ -2748,19 +2746,25 @@ test('PLUGIN_DATA Governance: R13-B02 & R13-B03 - Persistent monotonic witness s
   try { fs.unlinkSync(journalPath); } catch (_) {}
   try { fs.unlinkSync(checkpointPath); } catch (_) {}
 
-  // loadTrustRegistry must detect rollback against persistent system witness
-  assert.throws(
-    () => loadTrustRegistry({ ...opts, failClosed: true }),
-    /MONOTONIC_WITNESS_ROLLBACK_DETECTED/
-  );
+  // 3. Cold-Start / Process Restart Simulation:
+  // Execute in a separate Node.js process with zero in-memory witness state.
+  // The independent persistent system witness on disk MUST detect whole-directory rollback!
+  const adapterUrl = pathToFileURL(path.resolve('scripts/adapters/plugin-data-adapter.mjs')).href;
+  const childScript = `
+    import { loadTrustRegistry, loadRevocationJournal } from '${adapterUrl}';
+    import assert from 'node:assert';
+    const opts = ${JSON.stringify(opts)};
+    assert.throws(
+      () => loadTrustRegistry({ ...opts, failClosed: true }),
+      /MONOTONIC_WITNESS_ROLLBACK_DETECTED/
+    );
+    assert.throws(
+      () => loadRevocationJournal({ ...opts, failClosed: true }),
+      /MONOTONIC_WITNESS_ROLLBACK_DETECTED|TRUST_REGISTRY_INVALID/
+    );
+  `;
+  execFileSync(process.execPath, ['--input-type=module', '-e', childScript], { stdio: 'pipe' });
 
-  // 4. R13-B03: doLoadRevocationJournal fail-closed when registry is invalid or freshness fails
-  assert.throws(
-    () => loadRevocationJournal({ ...opts, failClosed: true }),
-    /MONOTONIC_WITNESS_ROLLBACK_DETECTED|TRUST_REGISTRY_INVALID/
-  );
-
-  resetMonotonicWitnessForTest(tempDir, { allowInWorkspace: true });
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -2804,15 +2808,20 @@ test('PLUGIN_DATA Governance: R13-B05 - COMMITTED WAL strictly verifies physical
   const regPath = getTrustRegistryPath(opts);
   const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
 
-  const entry0 = {
+  const entry0Unsigned = {
     entryIndex: 0,
     timestamp: new Date().toISOString(),
     revocationType: REVOCATION_TYPES.KEY_REVOCATION,
     targetId: 'TARGET-01',
     reason: 'TEST',
     prevEntryDigest: '0'.repeat(64),
-    signedBy: auth.keyId,
-    signature: '0'.repeat(128)
+    signedBy: auth.keyId
+  };
+  const entry0SigPayload = Buffer.from(computeRevocationEntrySignPayload(entry0Unsigned), 'utf8');
+  const entry0Sig = crypto.sign(null, entry0SigPayload, auth.privateKey).toString('hex');
+  const entry0 = {
+    ...entry0Unsigned,
+    signature: entry0Sig
   };
   const entry0Digest = sha256Digest(canonicalJsonStringify(entry0));
 
@@ -2890,13 +2899,20 @@ test('PLUGIN_DATA Governance: R13-B05 - COMMITTED WAL strictly verifies physical
     /TRANSACTION_WAL_CORRUPTION_DETECTED/
   );
 
-  // Case 4: Journal has exact matching tail entry -> succeeds, safely unlinks WAL
+  // Case 3b: Journal tail has invalid cryptographic signature -> fails closed
+  const forgedSigEntry = { ...entry0, signature: '0'.repeat(128) };
+  fs.writeFileSync(journalPath, JSON.stringify(forgedSigEntry) + '\n', 'utf8');
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_CORRUPTION_DETECTED/
+  );
+
+  // Case 4: Journal has exact matching tail entry with valid signature -> succeeds, safely unlinks WAL
   fs.writeFileSync(journalPath, JSON.stringify(entry0) + '\n', 'utf8');
   const res = recoverAbortedRevocationTransaction(opts);
   assert.equal(res.committed, true);
   assert.equal(fs.existsSync(txnPath), false);
 
-  resetMonotonicWitnessForTest(tempDir, { allowInWorkspace: true });
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
@@ -3038,6 +3054,304 @@ test('PLUGIN_DATA Governance: R13-B06 & R13-B08 - Multi-generation key rotation 
   assert.equal(loaded.registry.registryVersion, 3);
   assert.equal(loaded.registry.activeKeyId, auth3.keyId);
 
-  resetMonotonicWitnessForTest(tempDir, { allowInWorkspace: true });
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R14-B01 - AsyncLocalStorage capability deactivation prevents microtask leakage', async () => {
+  const tempDir = createTempDir('r14-b01-als-microtask-');
+  const opts = { pluginDataDir: tempDir, allowInWorkspace: true };
+
+  let microtaskObservedHeld = null;
+  withGovernanceLock(opts, () => {
+    assert.equal(isGovernanceLockHeld(tempDir), true);
+    queueMicrotask(() => {
+      microtaskObservedHeld = isGovernanceLockHeld(tempDir);
+    });
+  });
+
+  // Yield to allow microtask to execute
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(microtaskObservedHeld, false);
+  assert.equal(isGovernanceLockHeld(tempDir), false);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R14-B02 - Persistent monotonic witness has no public deletion entrance', async () => {
+  const adapter = await import('../scripts/adapters/plugin-data-adapter.mjs');
+  assert.equal('resetMonotonicWitnessForTest' in adapter, false);
+});
+
+test('PLUGIN_DATA Governance: R14-B03 - PREPARED WAL snapshot semantic binding and retired signer rejection', () => {
+  const tempDir = createTempDir('r14-b03-wal-semantics-');
+  const auth1 = generateTestAuthority();
+  const auth2 = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth1.keyId,
+    trustedRootPublicKeyPem: auth1.pem,
+    trustedRootFingerprint: auth1.fp
+  };
+
+  const regPath = getTrustRegistryPath(opts);
+  const journalPath = getRevocationJournalPath(opts);
+  const checkpointPath = getRevocationCheckpointPath(opts);
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+
+  // Setup v1 registry
+  const v1Reg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: auth1.keyId,
+    activeKeyFingerprint: auth1.fp,
+    activePublicKeyPem: auth1.pem,
+    keyType: 'ed25519',
+    pinnedSince: new Date().toISOString(),
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{ keyId: auth1.keyId, keyFingerprint: auth1.fp, publicKeyPem: auth1.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: new Date().toISOString() }]
+  };
+  saveTrustRegistry(v1Reg, opts);
+
+  // Rotate to v2 where auth1 is RETIRED and auth2 is ACTIVE
+  const v2Reg = createAuthorizedRegistryUpdate(
+    v1Reg,
+    {
+      activeKeyId: auth2.keyId,
+      activeKeyFingerprint: auth2.fp,
+      activePublicKeyPem: auth2.pem,
+      keys: [
+        { keyId: auth1.keyId, keyFingerprint: auth1.fp, publicKeyPem: auth1.pem, status: 'RETIRED', issuedAt: new Date().toISOString() },
+        { keyId: auth2.keyId, keyFingerprint: auth2.fp, publicKeyPem: auth2.pem, status: 'ACTIVE', issuedAt: new Date().toISOString() }
+      ]
+    },
+    auth1.keyId,
+    auth1.privateKey
+  );
+  saveTrustRegistry(v2Reg, { ...opts, priorRegistry: v1Reg });
+
+  // Attack 1: Retired auth1 attempts to sign a PREPARED WAL
+  const retiredWal = {
+    txnId: 'TXN-RETIRED-SIGNER',
+    status: 'PREPARED',
+    journalPath,
+    checkpointPath,
+    regPath,
+    initialJournalSize: 0,
+    initialRegistryVersion: 2,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: '',
+    signedBy: auth1.keyId
+  };
+  const walSigPayload = Buffer.from(computeTransactionWalSignPayload(retiredWal), 'utf8');
+  retiredWal.signature = crypto.sign(null, walSigPayload, auth1.privateKey).toString('hex');
+  fs.writeFileSync(txnPath, JSON.stringify(retiredWal, null, 2), 'utf8');
+
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /RETIRED_KEY_AUTHORIZATION_REJECTED/
+  );
+
+  // Attack 2: Semantic Snapshot Mismatch: Active auth2 signs WAL declaring initialRegistryVersion 2,
+  // but embedding a v1 snapshot payload
+  const v1RawBase64 = Buffer.from(JSON.stringify(v1Reg)).toString('base64');
+  const v1Sha256 = sha256Digest(Buffer.from(v1RawBase64, 'base64'));
+  const semanticMismatchWal = {
+    txnId: 'TXN-SEMANTIC-MISMATCH',
+    status: 'PREPARED',
+    journalPath,
+    checkpointPath,
+    regPath,
+    initialJournalSize: 0,
+    initialRegistryVersion: 2, // Claims 2
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: '',
+    initialRegistryRawBase64: v1RawBase64, // Embeds 1
+    initialRegistrySha256: v1Sha256,
+    signedBy: auth2.keyId
+  };
+  const wal2SigPayload = Buffer.from(computeTransactionWalSignPayload(semanticMismatchWal), 'utf8');
+  semanticMismatchWal.signature = crypto.sign(null, wal2SigPayload, auth2.privateKey).toString('hex');
+  fs.writeFileSync(txnPath, JSON.stringify(semanticMismatchWal, null, 2), 'utf8');
+
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_CORRUPTION_DETECTED/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R14-B04 - Retired key cannot authorize new HWM or newer journal records', () => {
+  const tempDir = createTempDir('r14-b04-retired-hwm-');
+  const auth1 = generateTestAuthority();
+  const auth2 = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth1.keyId,
+    trustedRootPublicKeyPem: auth1.pem,
+    trustedRootFingerprint: auth1.fp
+  };
+
+  // v1 with auth1 active
+  const v1Reg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: auth1.keyId,
+    activeKeyFingerprint: auth1.fp,
+    activePublicKeyPem: auth1.pem,
+    keyType: 'ed25519',
+    pinnedSince: new Date().toISOString(),
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{ keyId: auth1.keyId, keyFingerprint: auth1.fp, publicKeyPem: auth1.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: new Date().toISOString() }]
+  };
+  saveTrustRegistry(v1Reg, opts);
+
+  // auth1 signs entry 0
+  appendRevocationEntry(
+    { revocationType: REVOCATION_TYPES.KEY_REVOCATION, targetId: 'KEY-001' },
+    { ...opts, signerKeyId: auth1.keyId, signerPrivateKey: auth1.privateKey }
+  );
+
+  // Rotate to v2 retiring auth1
+  const curReg = loadTrustRegistry(opts).registry;
+  const v2Reg = createAuthorizedRegistryUpdate(
+    curReg,
+    {
+      activeKeyId: auth2.keyId,
+      activeKeyFingerprint: auth2.fp,
+      activePublicKeyPem: auth2.pem,
+      keys: [
+        { keyId: auth1.keyId, keyFingerprint: auth1.fp, publicKeyPem: auth1.pem, status: 'RETIRED', issuedAt: new Date().toISOString() },
+        { keyId: auth2.keyId, keyFingerprint: auth2.fp, publicKeyPem: auth2.pem, status: 'ACTIVE', issuedAt: new Date().toISOString() }
+      ]
+    },
+    auth1.keyId,
+    auth1.privateKey
+  );
+  saveTrustRegistry(v2Reg, { ...opts, priorRegistry: curReg });
+
+  // Attack A: Forged HWM signed by retired auth1
+  const forgedHwm = {
+    headIndex: 1,
+    headDigest: 'a'.repeat(64),
+    updatedAt: new Date().toISOString(),
+    authorizedBy: auth1.keyId
+  };
+  const forgedHwmSig = crypto.sign(null, Buffer.from(canonicalJsonStringify(forgedHwm), 'utf8'), auth1.privateKey).toString('hex');
+  const regWithForgedHwm = {
+    ...v2Reg,
+    revocationHighWaterMark: {
+      ...forgedHwm,
+      signature: forgedHwmSig
+    }
+  };
+  const val = validateTrustRegistry(regWithForgedHwm, { ...opts, priorRegistry: curReg });
+  assert.equal(val.valid, false);
+  assert.match(val.error, /RETIRED_KEY_AUTHORIZATION_REJECTED/);
+
+  // Attack B: Retired auth1 signs a new journal entry at index 1 (past its retirement index 0)
+  const journalPath = getRevocationJournalPath(opts);
+  const entry0Raw = fs.readFileSync(journalPath, 'utf8').trim();
+  const entry0Obj = JSON.parse(entry0Raw);
+  const entry0Digest = sha256Digest(canonicalJsonStringify(entry0Obj));
+
+  const rogueEntry1 = {
+    entryIndex: 1,
+    timestamp: new Date().toISOString(),
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'KEY-002',
+    reason: 'ROGUE',
+    prevEntryDigest: entry0Digest,
+    signedBy: auth1.keyId
+  };
+  const rogueSigPayload = Buffer.from(computeRevocationEntrySignPayload(rogueEntry1), 'utf8');
+  rogueEntry1.signature = crypto.sign(null, rogueSigPayload, auth1.privateKey).toString('hex');
+  fs.appendFileSync(journalPath, JSON.stringify(rogueEntry1) + '\n', 'utf8');
+
+  // Also update checkpoint and registry HWM (signed by active auth2) to match rogue entry index 1
+  const rogueEntry1Digest = sha256Digest(canonicalJsonStringify(rogueEntry1));
+  const checkpointPath = getRevocationCheckpointPath(opts);
+  const rogueCp = {
+    headIndex: 1,
+    headDigest: rogueEntry1Digest,
+    updatedAt: new Date().toISOString(),
+    registryVersion: 2
+  };
+  fs.writeFileSync(checkpointPath, JSON.stringify(rogueCp, null, 2), 'utf8');
+
+  const hwm1 = {
+    headIndex: 1,
+    headDigest: rogueEntry1Digest,
+    updatedAt: new Date().toISOString(),
+    authorizedBy: auth2.keyId
+  };
+  const hwm1Sig = crypto.sign(null, Buffer.from(canonicalJsonStringify(hwm1), 'utf8'), auth2.privateKey).toString('hex');
+  const regWithHwm1 = {
+    ...v2Reg,
+    revocationHighWaterMark: {
+      ...hwm1,
+      signature: hwm1Sig
+    }
+  };
+  const regPath = getTrustRegistryPath(opts);
+  fs.writeFileSync(regPath, JSON.stringify(regWithHwm1, null, 2), 'utf8');
+  const v2HistPath = path.join(tempDir, 'history', 'trust-registry.v2.json');
+  fs.writeFileSync(v2HistPath, JSON.stringify(regWithHwm1, null, 2), 'utf8');
+
+  assert.throws(
+    () => loadRevocationJournal({ ...opts, failClosed: true }),
+    /RETIRED_KEY_AUTHORIZATION_REJECTED/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R14-B06 & R14-B07 - Monotonic witness corrupted file fail-closed and divergence detection', () => {
+  const tempDir = createTempDir('r14-b06-b07-witness-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp
+  };
+
+  // Append revocation to create local witness
+  appendRevocationEntry(
+    { revocationType: REVOCATION_TYPES.KEY_REVOCATION, targetId: 'KEY-001' },
+    { ...opts, signerKeyId: auth.keyId, signerPrivateKey: auth.privateKey }
+  );
+
+  const localWitness = path.join(tempDir, '.monotonic-witness.json');
+  assert.equal(fs.existsSync(localWitness), true);
+
+  // R14-B07: Test digest divergence at same headIndex
+  assert.throws(
+    () => loadTrustRegistry({
+      ...opts,
+      externalMonotonicWitness: {
+        minRegistryVersion: 1,
+        minHwmHeadIndex: 0,
+        minHwmHeadDigest: 'f'.repeat(64) // divergent digest
+      },
+      failClosed: true
+    }),
+    /MONOTONIC_WITNESS_DIVERGENCE_DETECTED/
+  );
+
+  // R14-B06: Test corrupted witness file fails closed
+  fs.writeFileSync(localWitness, 'MALFORMED-JSON-NOT-VALID', 'utf8');
+  assert.throws(
+    () => loadTrustRegistry({ ...opts, failClosed: true }),
+    /MONOTONIC_WITNESS_CORRUPTED/
+  );
+
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
