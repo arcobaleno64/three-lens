@@ -1,0 +1,57 @@
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "inLanguage": "zh-Hant-TW",
+  "name": "three-lens 常見問題（審核與資安視角）",
+  "about": {
+    "@type": "SoftwareApplication",
+    "name": "Three-Lens (3lens)",
+    "softwareVersion": "1.11.0",
+    "applicationCategory": "SecurityApplication",
+    "operatingSystem": "Windows, Linux, macOS",
+    "license": "https://opensource.org/licenses/MIT",
+    "codeRepository": "https://github.com/arcobaleno64/three-lens"
+  },
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "three-lens 會把我的原始碼、金鑰或個資送到外部嗎？",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "three-lens 本身不含遙測或任何對外回傳程式碼；但弱點分析由 Antigravity CLI（agy）所設定的模型執行，送進模型的是去敏後的程式碼片段、檔名與提示上下文。送出前有兩道本機防護：一、prepare-review-context.mjs 在 scratch/context/ 建立去敏副本，把 AWS 金鑰、GitHub Token、Bearer Token、私鑰、密碼、JWT 換成結構化遮蔽標記並保留行號，還原對照表只存在記憶體，不寫入檔案、報告或 SARIF；二、PreInvocation hook 在提示送往模型前掃描機密，偵測到即中止。限制：規則式偵測無法涵蓋所有非結構化個資；使用雲端模型時，資料保留依宿主與模型供應商條款而定。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "支援哪些 Antigravity CLI 與系統環境？這是 Google 官方外掛嗎？",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "不是。three-lens 是社群維護的 MIT 授權開源外掛，與 Google LLC、Anthropic、OpenAI 均無隸屬、背書或贊助關係。需求：Antigravity CLI（agy）1.2.0 以上（PreInvocation 中止 hook 與原生 ACP 傳輸建議 1.5.1 以上）、Node.js 20.0.0 以上、Git 2.30.0 以上；GitHub CLI（gh）2.50.0 以上為選用，僅發行來源驗證需要。支援 Windows、Linux、macOS。安裝後在外掛目錄執行 npm run doctor 可自動檢查環境。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "「零外部依賴」是真的零嗎？我要怎麼驗證？",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "指的是 0 個 npm 套件：package.json 沒有 dependencies、devDependencies、peerDependencies、optionalDependencies，核心只用 Node.js 內建模組，以縮小供應鏈攻擊面。可自行驗證：執行 npm run check:release，發行閘門會檢查四種依賴欄位皆為空；skills/3lens/tool-integrity-manifest.json 提供關鍵腳本的 SHA-256 完整性清單；npm run test:provenance 以 gh 驗證發行來源與 SLSA 認證。「零 npm 依賴」不等於整體零依賴：執行仍需要 Node.js、agy、Git，以及 agy 所連接的模型。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "跟直接請一個 LLM 審查程式碼，差在哪裡？",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "單一 LLM 審查是「模型說有就有」；three-lens 把判定權從模型手上拿走。流程分為目錄盤點、去敏上下文、威脅建模、弱點探索、三視角驗證、確定性終審。可達性、防禦控制、實際影響三個驗證者各自獨立檢驗，任一視角提出附行號證據的反證，就不能被其他兩票推翻，不是 2 比 1 多數決。最終處置由 finalize-scan.mjs 依 Default-Deny 規則計算，不由模型自行宣告：有效票少於 2 張自動轉人工複審，覆蓋率不完整時不得宣告無弱點。限制：三個視角預設使用同一個模型，代表三種分工而非三家供應商；公開的 20/20 基準量測的是終審決策邏輯，不是真實專案的弱點發現率。"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "審查來路不明的儲存庫時，外掛會被提示詞注入劫持，或擅自改動、推送我的程式碼嗎？",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "設計上以四層縱深防禦降低這類風險：第一層 agy --sandbox 以作業系統層隔離阻斷任意指令與對外連線；第二層角色權限設定檔讓探索與驗證角色唯讀，並拒絕 git push、網路外聯與寫入 .git、.github 目錄；第三層 PreToolUse hook 把讀檔導向去敏副本並阻擋符號連結逃逸；第四層以檔案描述子原子讀取防止 TOCTOU 競爭。Git 操作一律停用目標儲存庫的 hooks、fsmonitor、外部 diff 與 textconv。修補只會在 scratch/patches/ 產生候選 patch，不會自動提交、推送或部署。限制：包住待審程式碼的分隔符只是政策層防護，不是密碼學保證；權限設定的效果取決於 agy 是否實際載入。審查不受信任的儲存庫時，請務必搭配 agy --sandbox。"
+      }
+    }
+  ]
+}
