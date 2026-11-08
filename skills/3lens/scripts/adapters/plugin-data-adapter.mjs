@@ -34,6 +34,8 @@ import crypto from 'node:crypto';
 export const ADAPTER_NAME = 'PLUGIN_DATA_DUAL_ANCHOR_ADAPTER';
 export const ADAPTER_VERSION = '1.1.0';
 
+export const INTERNAL_GOVERNANCE_TOKEN = Symbol.for('three_lens.governance.internal_lock_token');
+
 export const REVOCATION_TYPES = Object.freeze({
   KEY_REVOCATION: 'KEY_REVOCATION',
   NONCE_REVOCATION: 'NONCE_REVOCATION',
@@ -268,6 +270,17 @@ export function safeWriteFileSync(targetPath, content, options = {}) {
   }
   assertSafeStorageTarget(tmpPath, options);
   fs.renameSync(tmpPath, targetPath);
+  // R11-B05: fsync parent directory on POSIX systems to persist directory entry mutation
+  try {
+    const dirFd = fs.openSync(dir, 'r');
+    try {
+      fs.fsyncSync(dirFd);
+    } finally {
+      fs.closeSync(dirFd);
+    }
+  } catch (_) {
+    // Windows or filesystems that do not support directory fsync ignore gracefully
+  }
 }
 
 /**
@@ -357,7 +370,7 @@ export function withFileLock(targetFile, fn, options = {}) {
   let lockFd = null;
   while (Date.now() - start < timeoutMs) {
     try {
-      lockFd = fs.openSync(lockFile, 'wx');
+      lockFd = fs.openSync(lockFile, 'wx+');
       const info = JSON.stringify({ pid: process.pid, timestamp: Date.now(), lockId });
       fs.writeFileSync(lockFd, info, 'utf8');
       break;
@@ -371,7 +384,7 @@ export function withFileLock(targetFile, fn, options = {}) {
             const reclaimLockId = crypto.randomBytes(8).toString('hex');
             let reclaimFd = null;
             try {
-              reclaimFd = fs.openSync(reclaimLockFile, 'wx');
+              reclaimFd = fs.openSync(reclaimLockFile, 'wx+');
               fs.writeFileSync(reclaimFd, JSON.stringify({ pid: process.pid, timestamp: Date.now(), reclaimLockId }), 'utf8');
             } catch (recErr) {
               if (recErr.code === 'EEXIST') {
@@ -427,16 +440,25 @@ export function withFileLock(targetFile, fn, options = {}) {
                   }
                 }
               } finally {
-                // R10-B03-B: Atomic reclaim lock release verifying descriptor inode and reclaimLockId
+                // R10-B03-B & R11-B05: Atomic reclaim lock release verifying descriptor inode and reading lockId from fd
                 try {
                   if (fs.existsSync(reclaimLockFile)) {
                     const fdStat = fs.fstatSync(reclaimFd);
                     const pathStat = fs.lstatSync(reclaimLockFile);
                     if (pathStat.ino === fdStat.ino && pathStat.dev === fdStat.dev) {
-                      const content = fs.readFileSync(reclaimLockFile, 'utf8');
-                      const parsed = JSON.parse(content);
-                      if (parsed.reclaimLockId === reclaimLockId) {
-                        fs.unlinkSync(reclaimLockFile);
+                      let parsed = null;
+                      try {
+                        const buf = Buffer.alloc(fdStat.size);
+                        fs.readSync(reclaimFd, buf, 0, fdStat.size, 0);
+                        parsed = JSON.parse(buf.toString('utf8'));
+                      } catch (_) {
+                        try { parsed = JSON.parse(fs.readFileSync(reclaimLockFile, 'utf8')); } catch (_) {}
+                      }
+                      if (parsed && parsed.reclaimLockId === reclaimLockId) {
+                        const preUnlinkStat = fs.lstatSync(reclaimLockFile);
+                        if (preUnlinkStat.ino === fdStat.ino && preUnlinkStat.dev === fdStat.dev) {
+                          fs.unlinkSync(reclaimLockFile);
+                        }
                       }
                     }
                   }
@@ -465,16 +487,25 @@ export function withFileLock(targetFile, fn, options = {}) {
   try {
     return fn();
   } finally {
-    // R10-B03-B: Atomic lock release verifying descriptor inode and lockId
+    // R10-B03-B & R11-B05: Atomic lock release reading lockId from fd and double-checking inode
     try {
       if (fs.existsSync(lockFile)) {
         const fdStat = fs.fstatSync(lockFd);
         const pathStat = fs.lstatSync(lockFile);
         if (pathStat.ino === fdStat.ino && pathStat.dev === fdStat.dev) {
-          const content = fs.readFileSync(lockFile, 'utf8');
-          const parsed = JSON.parse(content);
-          if (parsed.lockId === lockId) {
-            fs.unlinkSync(lockFile);
+          let parsed = null;
+          try {
+            const buf = Buffer.alloc(fdStat.size);
+            fs.readSync(lockFd, buf, 0, fdStat.size, 0);
+            parsed = JSON.parse(buf.toString('utf8'));
+          } catch (_) {
+            try { parsed = JSON.parse(fs.readFileSync(lockFile, 'utf8')); } catch (_) {}
+          }
+          if (parsed && parsed.lockId === lockId) {
+            const preUnlinkStat = fs.lstatSync(lockFile);
+            if (preUnlinkStat.ino === fdStat.ino && preUnlinkStat.dev === fdStat.dev) {
+              fs.unlinkSync(lockFile);
+            }
           }
         }
       }
@@ -503,7 +534,23 @@ export function withGovernanceLock(options, fn) {
   const dir = resolvePluginDataDir(opts);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const lockTarget = path.join(dir, GOVERNANCE_LOCK_TARGET);
-  return withFileLock(lockTarget, callback, opts);
+  return withFileLock(lockTarget, () => {
+    const prevToken = opts[INTERNAL_GOVERNANCE_TOKEN];
+    opts[INTERNAL_GOVERNANCE_TOKEN] = true;
+    try {
+      return callback({
+        ...opts,
+        skipLock: true,
+        [INTERNAL_GOVERNANCE_TOKEN]: true
+      });
+    } finally {
+      if (prevToken === undefined) {
+        delete opts[INTERNAL_GOVERNANCE_TOKEN];
+      } else {
+        opts[INTERNAL_GOVERNANCE_TOKEN] = prevToken;
+      }
+    }
+  }, opts);
 }
 
 /**
@@ -533,19 +580,9 @@ export function recoverAbortedRevocationTransaction(options = {}) {
     throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Transaction WAL missing required fields (txnId, status)');
   }
 
-  // R10-B04: If transaction was already COMMITTED before crash/interruption,
-  // do NOT roll back; safely clean up the committed WAL marker.
-  if (txnData.status === 'COMMITTED') {
-    try {
-      assertSafeStorageTarget(txnPath, options);
-      fs.unlinkSync(txnPath);
-    } catch (_) {}
-    return { recovered: false, committed: true, txnId: txnData.txnId };
-  }
-
-  // R09-B01 & R10-B04: If a WAL file exists on disk, its status MUST be PREPARED to be recoverable.
-  // Any corrupted, unknown, or non-PREPARED status MUST fail closed under Default-Deny.
-  if (txnData.status !== 'PREPARED') {
+  // R09-B01, R10-B04, R11-B02: Both PREPARED and COMMITTED states require cryptographic authentication.
+  // Any corrupted, unknown, or non-PREPARED/COMMITTED status MUST fail closed under Default-Deny.
+  if (txnData.status !== 'PREPARED' && txnData.status !== 'COMMITTED') {
     throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Transaction WAL has invalid or unrecoverable status (${txnData.status}); refusing to proceed fail-closed`);
   }
 
@@ -577,7 +614,7 @@ export function recoverAbortedRevocationTransaction(options = {}) {
     }
   }
 
-  // R09-B01 & R10-B01: Mandatory paths, sizes, and cryptographic metadata in PREPARED WAL
+  // R09-B01, R10-B01, R11-B02: Mandatory paths, sizes, and cryptographic metadata in WAL
   if (
     !txnData.journalPath || typeof txnData.journalPath !== 'string' ||
     !txnData.checkpointPath || typeof txnData.checkpointPath !== 'string' ||
@@ -587,10 +624,10 @@ export function recoverAbortedRevocationTransaction(options = {}) {
     !txnData.signature || typeof txnData.signature !== 'string' ||
     typeof txnData.initialRegistryVersion !== 'number'
   ) {
-    throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Transaction WAL PREPARED state missing required paths or sizes (journalPath, checkpointPath, regPath, initialJournalSize, signedBy, signature, initialRegistryVersion)');
+    throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Transaction WAL missing required paths, sizes, or cryptographic metadata');
   }
 
-  // R10-B01: Resolve signer public key and verify cryptographic signature on WAL
+  // R10-B01 & R11-B01: Authenticate signer public key against trusted root or validated registry
   let signerPublicKeyPem = null;
   if (options.trustedRootKeyId === txnData.signedBy && options.trustedRootPublicKeyPem) {
     signerPublicKeyPem = options.trustedRootPublicKeyPem;
@@ -602,19 +639,31 @@ export function recoverAbortedRevocationTransaction(options = {}) {
       signerPublicKeyPem = embKey.publicKeyPem;
     } else if (fs.existsSync(expectedRegPath)) {
       try {
-        const onDiskReg = JSON.parse(fs.readFileSync(expectedRegPath, 'utf8'));
-        const regKey = onDiskReg.keys?.find(k => k.keyId === txnData.signedBy);
-        if (regKey && (regKey.status === 'ACTIVE' || regKey.status === 'ACTIVE_PINNED_ROOT')) {
-          signerPublicKeyPem = regKey.publicKeyPem;
+        const rawReg = fs.readFileSync(expectedRegPath, 'utf8');
+        const candidateReg = JSON.parse(rawReg);
+        // R11-B01: STRICTLY validate candidateReg against genesis root authority
+        // before trusting any key declared within it!
+        const validated = validateTrustRegistry(candidateReg, {
+          ...options,
+          skipLock: true,
+          [INTERNAL_GOVERNANCE_TOKEN]: true,
+          allowEmbeddedFallback: true
+        });
+        if (validated && validated.valid === true && Array.isArray(candidateReg.keys)) {
+          const regKey = candidateReg.keys.find(k => k.keyId === txnData.signedBy);
+          if (regKey && (regKey.status === 'ACTIVE' || regKey.status === 'ACTIVE_PINNED_ROOT')) {
+            signerPublicKeyPem = regKey.publicKeyPem;
+          }
         }
       } catch (_) {}
     }
   }
 
   if (!signerPublicKeyPem) {
-    throw new Error(`[TRANSACTION_WAL_SIGNER_UNTRUSTED] Signer '${txnData.signedBy}' in WAL is not recognized in trusted root or registry keys`);
+    throw new Error(`[TRANSACTION_WAL_SIGNER_UNTRUSTED] Signer '${txnData.signedBy}' in WAL is not authenticated by trusted root or validated registry`);
   }
 
+  // R10-B01 & R11-B02: Cryptographically verify signature on WAL payload (for both PREPARED and COMMITTED)
   const signPayload = Buffer.from(computeTransactionWalSignPayload(txnData), 'utf8');
   try {
     const validSig = crypto.verify(null, signPayload, signerPublicKeyPem, Buffer.from(txnData.signature, 'hex'));
@@ -626,6 +675,34 @@ export function recoverAbortedRevocationTransaction(options = {}) {
       throw sigErr;
     }
     throw new Error(`[TRANSACTION_WAL_SIGNATURE_INVALID] Cryptographic signature verification failed for WAL ${txnData.txnId}: ${sigErr.message}`);
+  }
+
+  // R11-B02: Verified COMMITTED WAL handling backed by authentic on-disk state
+  if (txnData.status === 'COMMITTED') {
+    if (!fs.existsSync(expectedRegPath) || !fs.existsSync(expectedCheckpointPath)) {
+      throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL exists but on-disk registry or checkpoint is missing');
+    }
+    try {
+      const curReg = JSON.parse(fs.readFileSync(expectedRegPath, 'utf8'));
+      const curCp = JSON.parse(fs.readFileSync(expectedCheckpointPath, 'utf8'));
+      if (
+        typeof txnData.committedHwmHeadIndex === 'number' &&
+        (curReg.revocationHighWaterMark?.headIndex !== txnData.committedHwmHeadIndex ||
+         curCp.headIndex !== txnData.committedHwmHeadIndex)
+      ) {
+        throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL headIndex does not match on-disk registry/checkpoint headIndex');
+      }
+    } catch (parseErr) {
+      if (parseErr.message && parseErr.message.includes('TRANSACTION_WAL_CORRUPTION_DETECTED')) {
+        throw parseErr;
+      }
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Failed to verify committed state for COMMITTED WAL: ${parseErr.message}`);
+    }
+    try {
+      assertSafeStorageTarget(txnPath, options);
+      fs.unlinkSync(txnPath);
+    } catch (_) {}
+    return { recovered: false, committed: true, txnId: txnData.txnId };
   }
 
   // R10-B01: Verify snapshot digests against signed hash commitments
@@ -648,21 +725,66 @@ export function recoverAbortedRevocationTransaction(options = {}) {
     }
   }
 
-  // R10-B01: Monotonicity & Anti-Rollback Check against current on-disk state
+  // R10-B01, R11-B03, R11-B04: Monotonicity, Anti-Rollback & Legitimate Completion Checks
   if (fs.existsSync(expectedRegPath)) {
+    let currentReg = null;
     try {
-      const currentReg = JSON.parse(fs.readFileSync(expectedRegPath, 'utf8'));
-      if (typeof currentReg.registryVersion === 'number' && currentReg.registryVersion > txnData.initialRegistryVersion) {
-        throw new Error(`[TRANSACTION_WAL_ROLLBACK_ATTEMPT_DETECTED] WAL attempted to roll back registryVersion (${txnData.initialRegistryVersion}) below current on-disk version (${currentReg.registryVersion})`);
+      currentReg = JSON.parse(fs.readFileSync(expectedRegPath, 'utf8'));
+    } catch (readErr) {
+      // R11-B03: Fail-Closed under Default-Deny if existing registry cannot be parsed.
+      // Never ignore corrupted registry to prevent rollback attacks!
+      throw new Error(`[TRANSACTION_WAL_ROLLBACK_CHECK_FAILED] Existing trust registry exists but cannot be verified for anti-rollback: ${readErr.message}`);
+    }
+
+    const curRegVer = currentReg.registryVersion;
+    const curHwmIdx = currentReg.revocationHighWaterMark?.headIndex;
+    const curHwmDigest = currentReg.revocationHighWaterMark?.headDigest;
+
+    // R11-B04: Check if transaction actually completed all on-disk mutations before crash
+    const isTransactionCompletedOnDisk = (
+      typeof txnData.expectedTargetHwmHeadIndex === 'number' &&
+      curHwmIdx === txnData.expectedTargetHwmHeadIndex &&
+      curHwmDigest === txnData.expectedTargetHwmHeadDigest
+    );
+
+    if (isTransactionCompletedOnDisk) {
+      // Verify checkpoint also reflects the completed transaction
+      if (fs.existsSync(expectedCheckpointPath)) {
+        try {
+          const curCp = JSON.parse(fs.readFileSync(expectedCheckpointPath, 'utf8'));
+          if (curCp.headIndex === txnData.expectedTargetHwmHeadIndex && curCp.headDigest === txnData.expectedTargetHwmHeadDigest) {
+            // The transaction was fully committed to disk before crash! Safely clean up marker.
+            try {
+              assertSafeStorageTarget(txnPath, options);
+              fs.unlinkSync(txnPath);
+            } catch (_) {}
+            return { recovered: false, committed: true, txnId: txnData.txnId };
+          }
+        } catch (_) {}
       }
-      const curHwmIdx = currentReg.revocationHighWaterMark?.headIndex;
-      if (typeof curHwmIdx === 'number' && curHwmIdx > txnData.initialHwmHeadIndex) {
-        throw new Error(`[TRANSACTION_WAL_ROLLBACK_ATTEMPT_DETECTED] WAL attempted to roll back revocationHighWaterMark headIndex (${txnData.initialHwmHeadIndex}) below committed on-disk HWM (${curHwmIdx})`);
+    }
+
+    // Monotonicity anti-rollback checks
+    if (typeof curRegVer === 'number' && curRegVer > txnData.initialRegistryVersion) {
+      throw new Error(`[TRANSACTION_WAL_ROLLBACK_ATTEMPT_DETECTED] WAL attempted to roll back registryVersion (${txnData.initialRegistryVersion}) below current on-disk version (${curRegVer})`);
+    }
+    if (typeof curHwmIdx === 'number' && curHwmIdx > txnData.initialHwmHeadIndex) {
+      throw new Error(`[TRANSACTION_WAL_ROLLBACK_ATTEMPT_DETECTED] WAL attempted to roll back revocationHighWaterMark headIndex (${txnData.initialHwmHeadIndex}) below committed on-disk HWM (${curHwmIdx})`);
+    }
+    // R11-B03: Check history divergence at same headIndex
+    if (typeof curHwmIdx === 'number' && curHwmIdx === txnData.initialHwmHeadIndex && txnData.initialHwmHeadDigest) {
+      if (curHwmDigest !== txnData.initialHwmHeadDigest) {
+        throw new Error(`[TRANSACTION_WAL_HISTORY_DIVERGENCE_DETECTED] WAL initialHwmHeadDigest does not match committed on-disk HWM headDigest at same index (${curHwmDigest} !== ${txnData.initialHwmHeadDigest})`);
       }
-    } catch (parseErr) {
-      if (parseErr.message && parseErr.message.includes('TRANSACTION_WAL_ROLLBACK_ATTEMPT_DETECTED')) {
-        throw parseErr;
-      }
+    }
+  }
+
+  // R11-B03: Verify that the journal prefix up to initialJournalSize matches initialJournalSha256 before truncation
+  if (txnData.initialJournalExisted && fs.existsSync(expectedJournalPath)) {
+    const existingJournalBuf = fs.readFileSync(expectedJournalPath).subarray(0, txnData.initialJournalSize);
+    const prefixSha256 = sha256Digest(existingJournalBuf);
+    if (prefixSha256 !== txnData.initialJournalSha256) {
+      throw new Error(`[TRANSACTION_WAL_JOURNAL_INTEGRITY_MISMATCH] Journal prefix before rollback truncation does not match signed initialJournalSha256 (${prefixSha256} !== ${txnData.initialJournalSha256})`);
     }
   }
 
@@ -1838,13 +1960,14 @@ function doLoadTrustRegistry(options = {}) {
  * @returns {{ source: 'PLUGIN_DATA'|'EMBEDDED_FALLBACK', registry: object, valid: boolean }}
  */
 export function loadTrustRegistry(options = {}) {
-  if (options.skipLock === true) {
+  const canSkipLock = options.skipLock === true && options[INTERNAL_GOVERNANCE_TOKEN] === true;
+  if (canSkipLock) {
     recoverAbortedRevocationTransaction(options);
     return doLoadTrustRegistry(options);
   }
-  return withGovernanceLock(options, () => {
-    recoverAbortedRevocationTransaction(options);
-    return doLoadTrustRegistry(options);
+  return withGovernanceLock(options, (lockedOpts) => {
+    recoverAbortedRevocationTransaction(lockedOpts);
+    return doLoadTrustRegistry(lockedOpts);
   });
 }
 
@@ -1861,9 +1984,10 @@ export function saveTrustRegistry(registry, options = {}) {
   const dir = path.dirname(regPath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  return withGovernanceLock(options, () => {
-    recoverAbortedRevocationTransaction(options);
-    assertSafeStorageTarget(regPath, options);
+  const canSkipLock = options.skipLock === true && options[INTERNAL_GOVERNANCE_TOKEN] === true;
+  const doSave = (opts) => {
+    recoverAbortedRevocationTransaction(opts);
+    assertSafeStorageTarget(regPath, opts);
     let priorRegistry = null;
     // Check against existing on-disk registry if present
     if (fs.existsSync(regPath)) {
@@ -2032,14 +2156,19 @@ export function saveTrustRegistry(registry, options = {}) {
         };
       } catch (_) {}
     }
-    safeWriteFileSync(checkpointPath, JSON.stringify(cpData, null, 2) + '\n', options);
+    safeWriteFileSync(checkpointPath, JSON.stringify(cpData, null, 2) + '\n', opts);
 
     return {
       success: true,
       path: normalizePath(regPath),
       registryVersion: registry.registryVersion
     };
-  }, options);
+  };
+
+  if (canSkipLock) {
+    return doSave(options);
+  }
+  return withGovernanceLock(options, (lockedOpts) => doSave(lockedOpts));
 }
 
 /**
@@ -2274,13 +2403,14 @@ function doLoadRevocationJournal(options = {}) {
  * @returns {{ valid: boolean, entries: Array<object>, error: string|null, count: number }}
  */
 export function loadRevocationJournal(options = {}) {
-  if (options.skipLock === true) {
+  const canSkipLock = options.skipLock === true && options[INTERNAL_GOVERNANCE_TOKEN] === true;
+  if (canSkipLock) {
     recoverAbortedRevocationTransaction(options);
     return doLoadRevocationJournal(options);
   }
-  return withGovernanceLock(options, () => {
-    recoverAbortedRevocationTransaction(options);
-    return doLoadRevocationJournal(options);
+  return withGovernanceLock(options, (lockedOpts) => {
+    recoverAbortedRevocationTransaction(lockedOpts);
+    return doLoadRevocationJournal(lockedOpts);
   });
 }
 
@@ -2418,6 +2548,7 @@ export function appendRevocationEntry(entryInput, options = {}) {
       signature
     };
 
+    const entryDigest = sha256Digest(canonicalJsonStringify(record));
     const line = JSON.stringify(record) + '\n';
 
     // R05-B03 & Round 07 F-03: Full transactional multi-file snapshot & WAL marker for crash-safe rollback
@@ -2465,6 +2596,9 @@ export function appendRevocationEntry(entryInput, options = {}) {
       initialRegistryVersion,
       initialHwmHeadIndex,
       initialHwmHeadDigest,
+      expectedTargetHwmHeadIndex: entryIndex,
+      expectedTargetHwmHeadDigest: entryDigest,
+      expectedTargetRegistryVersion: regObj ? regObj.registryVersion : 1,
       histPath: histPath ? normalizePath(histPath) : null,
       initialHistSha256,
       initialHistExisted
@@ -2495,8 +2629,6 @@ export function appendRevocationEntry(entryInput, options = {}) {
       if (options._simulateFailureStage === 'POST_JOURNAL_APPEND') {
         throw new Error('[SIMULATED_FAILURE_POST_JOURNAL_APPEND]');
       }
-
-      const entryDigest = sha256Digest(canonicalJsonStringify(record));
 
       // 2. Safe write checkpoint (R05-B04 & R08-B04)
       const checkpointData = {
@@ -2537,9 +2669,13 @@ export function appendRevocationEntry(entryInput, options = {}) {
       if (!fs.existsSync(regHistDir)) fs.mkdirSync(regHistDir, { recursive: true });
       safeWriteFileSync(path.join(regHistDir, `trust-registry.v${regObj.registryVersion}.json`), JSON.stringify(regObj, null, 2) + '\n', options);
 
-      // R10-B04: Mark transaction as COMMITTED in WAL before unlinking
+      // R10-B04 & R11-B02: Mark transaction as COMMITTED and cryptographically re-sign before unlinking
       txnData.status = 'COMMITTED';
       txnData.committedAt = new Date().toISOString();
+      txnData.committedHwmHeadIndex = entryIndex;
+      txnData.committedHwmHeadDigest = entryDigest;
+      const committedSignPayload = Buffer.from(computeTransactionWalSignPayload(txnData), 'utf8');
+      txnData.signature = crypto.sign(null, committedSignPayload, options.signerPrivateKey).toString('hex');
       safeWriteFileSync(txnPath, JSON.stringify(txnData, null, 2) + '\n', options);
 
       // Successfully committed: remove WAL marker
@@ -2620,13 +2756,14 @@ export function isRevoked(targetId, options = {}) {
     return { revoked: false, reason: null, entry: null };
   }
 
-  // R10-B05: Execute complete revocation determination under atomic governance lock
-  // to eliminate race conditions between concurrent registry updates and journal reads.
-  if (options.skipLock === true) {
+  // R10-B05 & R11-B05: Execute complete revocation determination under atomic governance lock.
+  // Enforces INTERNAL_GOVERNANCE_TOKEN so external callers cannot bypass mutual exclusion.
+  const canSkipLock = options.skipLock === true && options[INTERNAL_GOVERNANCE_TOKEN] === true;
+  if (canSkipLock) {
     return _isRevokedInner(targetId, options);
   }
-  return withGovernanceLock(options, () => {
-    return _isRevokedInner(targetId, { ...options, skipLock: true });
+  return withGovernanceLock(options, (lockedOpts) => {
+    return _isRevokedInner(targetId, lockedOpts);
   });
 }
 

@@ -1720,7 +1720,7 @@ test('PLUGIN_DATA Governance: R09-B01 - Non-PREPARED or corrupted WAL status fai
   fs.writeFileSync(txnPath, JSON.stringify({ txnId: 'T3', status: 'PREPARED' }, null, 2), 'utf8');
   assert.throws(
     () => recoverAbortedRevocationTransaction(opts),
-    /TRANSACTION_WAL_CORRUPTION_DETECTED.*missing required paths or sizes/
+    /TRANSACTION_WAL_CORRUPTION_DETECTED.*missing required paths/
   );
 
   fs.rmSync(tempDir, { recursive: true, force: true });
@@ -1929,14 +1929,37 @@ test('PLUGIN_DATA Governance: R10-B04 - WAL marked COMMITTED does not roll back 
   assert.equal(res.success, true);
 
   const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
-  // Simulate situation where transaction committed but WAL file remained with status 'COMMITTED'
-  fs.writeFileSync(txnPath, JSON.stringify({
+  // R10-B04 & R11-B02: Simulate situation where transaction committed and has legitimate signature and committed state
+  const committedWal = {
     txnId: 'COMMITTED-TXN-1234',
     status: 'COMMITTED',
-    committedAt: new Date().toISOString()
-  }, null, 2), 'utf8');
+    createdAt: new Date().toISOString(),
+    committedAt: new Date().toISOString(),
+    signedBy: auth.keyId,
+    journalPath: getRevocationJournalPath(opts),
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    checkpointPath: getRevocationCheckpointPath(opts),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    regPath: getTrustRegistryPath(opts),
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: false,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: '',
+    committedHwmHeadIndex: res.entryIndex,
+    committedHwmHeadDigest: res.entryDigest,
+    expectedTargetHwmHeadIndex: res.entryIndex,
+    expectedTargetHwmHeadDigest: res.entryDigest,
+    expectedTargetRegistryVersion: 1
+  };
+  const committedPayload = Buffer.from(computeTransactionWalSignPayload(committedWal), 'utf8');
+  committedWal.signature = crypto.sign(null, committedPayload, auth.privateKey).toString('hex');
+  fs.writeFileSync(txnPath, JSON.stringify(committedWal, null, 2), 'utf8');
 
-  // Recovery should clean up COMMITTED WAL without rolling back committed revocation
+  // Recovery should verify signature and committed proof, safely cleaning up COMMITTED WAL without rolling back committed revocation
   const recRes = recoverAbortedRevocationTransaction(opts);
   assert.equal(recRes.recovered, false);
   assert.equal(recRes.committed, true);
@@ -1976,6 +1999,265 @@ test('PLUGIN_DATA Governance: R10-B05 - isRevoked executes atomically under unif
     return isRevoked('NONCE-ATOMIC-TEST', { ...opts, skipLock: true });
   });
   assert.equal(res2.revoked, true);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R11-B01 - Injected unverified active key in on-disk registry fails to authorize WAL', () => {
+  const tempDir = createTempDir('r11-b01-unverified-key-');
+  const auth = generateTestAuthority();
+  const attackerAuth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp
+  };
+
+  const regPath = getTrustRegistryPath(opts);
+  // Attacker writes an on-disk registry containing their own key marked ACTIVE
+  const forgedReg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'FORGED_ATTACKER_AUTHORITY',
+    activeKeyId: attackerAuth.keyId,
+    activeKeyFingerprint: attackerAuth.fp,
+    activePublicKeyPem: attackerAuth.pem,
+    keyType: 'ed25519',
+    pinnedSince: new Date().toISOString(),
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{
+      keyId: attackerAuth.keyId,
+      publicKeyPem: attackerAuth.pem,
+      keyFingerprint: attackerAuth.fp,
+      keyType: 'ed25519',
+      role: 'ATTACKER_SUPERVISOR',
+      status: 'ACTIVE',
+      validFrom: new Date().toISOString(),
+      authorizedBy: attackerAuth.keyId
+    }]
+  };
+  fs.writeFileSync(regPath, JSON.stringify(forgedReg, null, 2), 'utf8');
+
+  // Attacker signs a PREPARED WAL using their attacker private key
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const forgedWal = {
+    txnId: 'FORGED-WAL-R11',
+    status: 'PREPARED',
+    createdAt: new Date().toISOString(),
+    signedBy: attackerAuth.keyId,
+    journalPath: getRevocationJournalPath(opts),
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    checkpointPath: getRevocationCheckpointPath(opts),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    regPath,
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: false,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: ''
+  };
+  const payload = Buffer.from(computeTransactionWalSignPayload(forgedWal), 'utf8');
+  forgedWal.signature = crypto.sign(null, payload, attackerAuth.privateKey).toString('hex');
+  fs.writeFileSync(txnPath, JSON.stringify(forgedWal, null, 2), 'utf8');
+
+  // Recovery MUST refuse to trust attacker key from unverified on-disk registry
+  assert.throws(() => {
+    recoverAbortedRevocationTransaction(opts);
+  }, /TRANSACTION_WAL_SIGNER_UNTRUSTED/);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R11-B02 - Unsigned or forged COMMITTED WAL fails closed', () => {
+  const tempDir = createTempDir('r11-b02-forged-committed-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp
+  };
+
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  // Fake COMMITTED WAL with bad signature
+  fs.writeFileSync(txnPath, JSON.stringify({
+    txnId: 'FAKE-COMMITTED',
+    status: 'COMMITTED',
+    journalPath: getRevocationJournalPath(opts),
+    checkpointPath: getRevocationCheckpointPath(opts),
+    regPath: getTrustRegistryPath(opts),
+    initialJournalSize: 0,
+    signedBy: auth.keyId,
+    signature: 'bad-sig',
+    initialRegistryVersion: 1
+  }), 'utf8');
+
+  // Must fail closed under signature verification
+  assert.throws(() => {
+    recoverAbortedRevocationTransaction(opts);
+  }, /TRANSACTION_WAL_SIGNATURE_INVALID/);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R11-B03 - Corrupted on-disk registry fails closed with TRANSACTION_WAL_ROLLBACK_CHECK_FAILED', () => {
+  const tempDir = createTempDir('r11-b03-corrupt-reg-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  // Write a corrupted on-disk registry
+  const regPath = getTrustRegistryPath(opts);
+  fs.writeFileSync(regPath, '{ corrupted json: not valid !!', 'utf8');
+
+  // Validly signed PREPARED WAL exists
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const wal = {
+    txnId: 'WAL-TEST-CORRUPT-REG',
+    status: 'PREPARED',
+    createdAt: new Date().toISOString(),
+    signedBy: auth.keyId,
+    journalPath: getRevocationJournalPath(opts),
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    checkpointPath: getRevocationCheckpointPath(opts),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    regPath,
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: false,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: ''
+  };
+  const payload = Buffer.from(computeTransactionWalSignPayload(wal), 'utf8');
+  wal.signature = crypto.sign(null, payload, auth.privateKey).toString('hex');
+  fs.writeFileSync(txnPath, JSON.stringify(wal, null, 2), 'utf8');
+
+  // Recovery MUST NOT ignore corrupt registry to bypass rollback check; it must fail closed!
+  assert.throws(() => {
+    recoverAbortedRevocationTransaction(opts);
+  }, /TRANSACTION_WAL_ROLLBACK_CHECK_FAILED/);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R11-B03 - Modified journal prefix before rollback fails closed with TRANSACTION_WAL_JOURNAL_INTEGRITY_MISMATCH', () => {
+  const tempDir = createTempDir('r11-b03-journal-prefix-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  const journalPath = getRevocationJournalPath(opts);
+  fs.writeFileSync(journalPath, 'tampered-prefix-bytes\n', 'utf8');
+
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const wal = {
+    txnId: 'WAL-PREFIX-CHECK',
+    status: 'PREPARED',
+    createdAt: new Date().toISOString(),
+    signedBy: auth.keyId,
+    journalPath,
+    initialJournalSize: 10,
+    initialJournalExisted: true,
+    initialJournalSha256: 'a'.repeat(64), // mismatch!
+    checkpointPath: getRevocationCheckpointPath(opts),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    regPath: getTrustRegistryPath(opts),
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: false,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: ''
+  };
+  const payload = Buffer.from(computeTransactionWalSignPayload(wal), 'utf8');
+  wal.signature = crypto.sign(null, payload, auth.privateKey).toString('hex');
+  fs.writeFileSync(txnPath, JSON.stringify(wal, null, 2), 'utf8');
+
+  // Must fail closed due to journal prefix mismatch before truncation
+  assert.throws(() => {
+    recoverAbortedRevocationTransaction(opts);
+  }, /TRANSACTION_WAL_JOURNAL_INTEGRITY_MISMATCH/);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R11-B04 - Crash after registry update is recognized as committed without rollback', () => {
+  const tempDir = createTempDir('r11-b04-crash-after-reg-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp,
+    signerKeyId: auth.keyId,
+    signerPrivateKey: auth.privateKey
+  };
+
+  // Perform normal revocation append
+  const res = appendRevocationEntry(
+    { revocationType: REVOCATION_TYPES.NONCE_REVOCATION, targetId: 'NONCE-CRASH-TEST' },
+    opts
+  );
+  assert.equal(res.success, true);
+
+  // Simulate crash that occurred after registry update succeeded, so on-disk HWM is at res.entryIndex
+  const txnPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const wal = {
+    txnId: 'WAL-CRASH-POST-REG',
+    status: 'PREPARED',
+    createdAt: new Date().toISOString(),
+    signedBy: auth.keyId,
+    journalPath: getRevocationJournalPath(opts),
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    checkpointPath: getRevocationCheckpointPath(opts),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    regPath: getTrustRegistryPath(opts),
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: false,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: '',
+    expectedTargetHwmHeadIndex: res.entryIndex,
+    expectedTargetHwmHeadDigest: res.entryDigest,
+    expectedTargetRegistryVersion: 1
+  };
+  const payload = Buffer.from(computeTransactionWalSignPayload(wal), 'utf8');
+  wal.signature = crypto.sign(null, payload, auth.privateKey).toString('hex');
+  fs.writeFileSync(txnPath, JSON.stringify(wal, null, 2), 'utf8');
+
+  // Recovery should recognize forward progression matching expectedTarget*, clean up WAL marker and mark committed
+  const recRes = recoverAbortedRevocationTransaction(opts);
+  assert.equal(recRes.recovered, false);
+  assert.equal(recRes.committed, true);
+  assert.equal(fs.existsSync(txnPath), false);
 
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
