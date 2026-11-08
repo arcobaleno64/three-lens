@@ -37,7 +37,9 @@ import {
   canonicalJsonStringify,
   isGovernanceLockHeld,
   sha256Digest,
-  getMonotonicWitness
+  getMonotonicWitness,
+  assertSafeStorageTarget,
+  updateMonotonicWitness
 } from '../scripts/adapters/plugin-data-adapter.mjs';
 
 function createTempDir(prefix = 'test-plugin-data-') {
@@ -2855,6 +2857,8 @@ test('PLUGIN_DATA Governance: R13-B05 - COMMITTED WAL strictly verifies physical
     }
   };
   fs.writeFileSync(regPath, JSON.stringify(reg, null, 2), 'utf8');
+  fs.mkdirSync(path.join(tempDir, 'history'), { recursive: true });
+  fs.writeFileSync(path.join(tempDir, 'history', 'trust-registry.v1.json'), JSON.stringify(reg, null, 2), 'utf8');
 
   const cp = {
     headIndex: 0,
@@ -3507,6 +3511,7 @@ test('PLUGIN_DATA Governance: R15-B02 - COMMITTED WAL recovery updates witness b
     }
   };
   fs.writeFileSync(regPath, JSON.stringify(regWithHwm, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(path.join(tempDir, 'history', 'trust-registry.v1.json'), JSON.stringify(regWithHwm, null, 2) + '\n', 'utf8');
 
   // Create COMMITTED WAL
   const txnData = {
@@ -4087,6 +4092,401 @@ test('PLUGIN_DATA Governance: R16-B05 - Witness file strict semantic schema vali
   assert.throws(
     () => getMonotonicWitness(tempDir, { allowInWorkspace: true }),
     /MONOTONIC_WITNESS_CORRUPTED/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R17-B01 - Public storage APIs unconditionally reject witness files against Proxy and Symbol bypasses', () => {
+  const tempDir = createTempDir('r17-b01-proxy-');
+  const witnessFile = path.join(tempDir, '.monotonic-witness.json');
+
+  // Proxy attempting to return true for all Symbol or string properties
+  const proxyOpts = new Proxy({ allowInWorkspace: true }, {
+    get(target, prop, receiver) {
+      if (typeof prop === 'symbol' || prop === '__internalWitnessWrite') return true;
+      return Reflect.get(target, prop, receiver);
+    }
+  });
+
+  assert.throws(
+    () => safeWriteFileSync(witnessFile, 'malicious payload', proxyOpts),
+    /STORAGE_CONFINEMENT_VIOLATION/
+  );
+  assert.throws(
+    () => safeOpenStorageFile(witnessFile, 'w+', 0o600, proxyOpts),
+    /STORAGE_CONFINEMENT_VIOLATION/
+  );
+  assert.throws(
+    () => assertSafeStorageTarget(witnessFile, proxyOpts),
+    /STORAGE_CONFINEMENT_VIOLATION/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R17-B01 - updateMonotonicWitness rejects caller-supplied updates without internal write token', () => {
+  const tempDir = createTempDir('r17-b01-token-');
+  const opts = { pluginDataDir: tempDir, allowInWorkspace: true };
+
+  // Call updateMonotonicWitness with astronomical version 1000000 without token
+  assert.throws(
+    () => updateMonotonicWitness(tempDir, 1000000, -1, '', 'a'.repeat(64), opts),
+    /STORAGE_CONFINEMENT_VIOLATION|UNAUTHORIZED_WITNESS_UPDATE/
+  );
+
+  // Calling with fake symbol or string option also rejected
+  assert.throws(
+    () => updateMonotonicWitness(tempDir, 1000000, -1, '', 'a'.repeat(64), { ...opts, __internalWitnessWrite: true }),
+    /STORAGE_CONFINEMENT_VIOLATION|UNAUTHORIZED_WITNESS_UPDATE/
+  );
+
+  assert.throws(
+    () => updateMonotonicWitness(tempDir, 1000000, -1, '', 'a'.repeat(64), { ...opts, [Symbol.for('INTERNAL_WITNESS_WRITE_TOKEN')]: true }),
+    /STORAGE_CONFINEMENT_VIOLATION|UNAUTHORIZED_WITNESS_UPDATE/
+  );
+
+  // Verify witness was not created or modified
+  const witness = getMonotonicWitness(tempDir, opts);
+  assert.strictEqual(witness.maxSeenRegistryVersion, 1);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R17-B02 - Historical registry corruption fails closed in loadTrustRegistry', () => {
+  const tempDir = createTempDir('r17-b02-corrupt-hist-');
+  const authA = generateTestAuthority();
+  const authB = generateTestAuthority();
+
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: authA.keyId,
+    trustedRootPublicKeyPem: authA.pem,
+    trustedRootFingerprint: authA.fp
+  };
+
+  // 1. Setup valid v1 and rotate to v2
+  const v1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: authA.keyId,
+    activeKeyFingerprint: authA.fp,
+    activePublicKeyPem: authA.pem,
+    keyType: 'ed25519',
+    pinnedSince: '2026-10-16T06:55:39.565Z',
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{ keyId: authA.keyId, keyFingerprint: authA.fp, publicKeyPem: authA.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' }]
+  };
+  saveTrustRegistry(v1, opts);
+
+  const legitV2 = createAuthorizedRegistryUpdate(
+    v1,
+    {
+      activeKeyId: authB.keyId,
+      activeKeyFingerprint: authB.fp,
+      activePublicKeyPem: authB.pem,
+      keys: [
+        { keyId: authA.keyId, keyFingerprint: authA.fp, publicKeyPem: authA.pem, status: 'RETIRED', issuedAt: '2026-10-16T06:55:39.565Z' },
+        { keyId: authB.keyId, keyFingerprint: authB.fp, publicKeyPem: authB.pem, status: 'ACTIVE', issuedAt: new Date().toISOString() }
+      ]
+    },
+    authA.keyId,
+    authA.privateKey
+  );
+  saveTrustRegistry(legitV2, opts);
+
+  // Verify baseline load succeeds
+  const baseline = loadTrustRegistry(opts);
+  assert.strictEqual(baseline.valid, true);
+
+  // 2. Corrupt history/trust-registry.v2.json with invalid JSON
+  fs.writeFileSync(path.join(tempDir, 'history', 'trust-registry.v2.json'), '{invalid-json', 'utf8');
+
+  // 3. Must fail closed immediately
+  assert.throws(
+    () => loadTrustRegistry(opts),
+    /HISTORY|CORRUPT|DIVERGENCE/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R17-B03 - Registry Identity Digest commits to all authoritative fields (authorizedBy, timestamp, signature, HWM)', () => {
+  const auth = generateTestAuthority();
+  const v1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'test-auth',
+    activeKeyId: auth.keyId,
+    activeKeyFingerprint: auth.fp,
+    activePublicKeyPem: auth.pem,
+    keys: [{
+      keyId: auth.keyId,
+      keyFingerprint: auth.fp,
+      publicKeyPem: auth.pem,
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: '2026-01-01T00:00:00.000Z'
+    }],
+    revokedKeyIds: [],
+    signature: 'original-outer-signature',
+    authorizationProof: {
+      authorizedBy: auth.keyId,
+      signature: 'original-proof-signature',
+      timestamp: '2026-01-01T00:00:00.000Z',
+      priorRegistryVersion: 0
+    },
+    revocationHighWaterMark: {
+      index: 0,
+      headDigest: 'c'.repeat(64),
+      signature: 'original-hwm-signature',
+      authorizedBy: auth.keyId
+    }
+  };
+
+  const baseDigest = computeRegistryDigest(v1);
+
+  // Mutating authorizedBy must change digest
+  const mutatedAuthorizedBy = JSON.parse(JSON.stringify(v1));
+  mutatedAuthorizedBy.authorizationProof.authorizedBy = 'another-supervisor-key';
+  assert.notStrictEqual(computeRegistryDigest(mutatedAuthorizedBy), baseDigest);
+
+  // Mutating timestamp must change digest
+  const mutatedTimestamp = JSON.parse(JSON.stringify(v1));
+  mutatedTimestamp.authorizationProof.timestamp = '2026-11-08T12:00:00.000Z';
+  assert.notStrictEqual(computeRegistryDigest(mutatedTimestamp), baseDigest);
+
+  // Mutating outer signature must change digest
+  const mutatedSig = JSON.parse(JSON.stringify(v1));
+  mutatedSig.signature = 'tampered-outer-signature';
+  assert.notStrictEqual(computeRegistryDigest(mutatedSig), baseDigest);
+});
+
+test('PLUGIN_DATA Governance: R17-E01 - Sparse witness with missing intermediate historical version is rejected fail-closed', () => {
+  const tempDir = createTempDir('r17-e01-sparse-');
+  const validSha = 'e'.repeat(64);
+  const localWitness = path.join(tempDir, '.monotonic-witness.json');
+
+  // Sparse witness has maxSeenRegistryVersion = 3, has '1' and '3', but missing '2'
+  fs.writeFileSync(localWitness, JSON.stringify({
+    schemaVersion: '1.0.0',
+    dir: path.resolve(tempDir),
+    maxSeenRegistryVersion: 3,
+    maxSeenRegistryDigest: validSha,
+    registryDigests: {
+      '1': validSha,
+      // '2' is missing!
+      '3': validSha
+    },
+    maxSeenHwmHeadIndex: -1,
+    maxSeenHwmHeadDigest: '',
+    updatedAt: new Date().toISOString()
+  }), 'utf8');
+
+  assert.throws(
+    () => getMonotonicWitness(tempDir, { allowInWorkspace: true }),
+    /sparse witness detected|missing unbroken historical digest for version 2/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R17-E02 - COMMITTED WAL with corrupted earlier journal entry fails closed on recovery', () => {
+  const tempDir = createTempDir('r17-e02-wal-chain-');
+  const auth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: auth.keyId,
+    trustedRootPublicKeyPem: auth.pem,
+    trustedRootFingerprint: auth.fp
+  };
+
+  // Setup Genesis v1
+  const reg1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'test-auth',
+    activeKeyId: auth.keyId,
+    activeKeyFingerprint: auth.fp,
+    activePublicKeyPem: auth.pem,
+    keys: [{
+      keyId: auth.keyId,
+      keyFingerprint: auth.fp,
+      publicKeyPem: auth.pem,
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: '2026-01-01T00:00:00.000Z'
+    }],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(reg1, opts);
+
+  // Append 2 revocation entries
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'bad-key-1',
+    reason: 'test compromise 1'
+  }, { ...opts, signerKeyId: auth.keyId, signerPrivateKey: auth.privateKey });
+
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'bad-key-2',
+    reason: 'test compromise 2'
+  }, { ...opts, signerKeyId: auth.keyId, signerPrivateKey: auth.privateKey });
+
+  // Read journal and checkpoint
+  const journalPath = getRevocationJournalPath(opts);
+  const cpPath = getRevocationCheckpointPath(opts);
+  const cp = JSON.parse(fs.readFileSync(cpPath, 'utf8'));
+
+  // Corrupt entry 0 in the journal while keeping entry 1 (tail) intact
+  const lines = fs.readFileSync(journalPath, 'utf8').trim().split(/\r?\n/);
+  const entry0 = JSON.parse(lines[0]);
+  entry0.reason = 'TAMPERED REASON 0'; // alters digest and breaks chain to entry 1
+  lines[0] = JSON.stringify(entry0);
+  fs.writeFileSync(journalPath, lines.join('\n') + '\n', 'utf8');
+
+  // Create COMMITTED WAL pointing to entry 1
+  const walPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const walPayload = {
+    schemaVersion: '1.0.0',
+    txnId: 'tx-test-corrupted-prefix',
+    pid: process.pid,
+    status: 'COMMITTED',
+    timestamp: new Date().toISOString(),
+    committedAt: new Date().toISOString(),
+    signedBy: auth.keyId,
+    journalPath: journalPath,
+    checkpointPath: cpPath,
+    regPath: getTrustRegistryPath(opts),
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: false,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: '',
+    committedHwmHeadIndex: cp.headIndex,
+    committedHwmHeadDigest: cp.headDigest,
+    expectedTargetHwmHeadIndex: cp.headIndex,
+    expectedTargetHwmHeadDigest: cp.headDigest,
+    expectedTargetRegistryVersion: 1
+  };
+  const walSignPayload = Buffer.from(computeTransactionWalSignPayload(walPayload), 'utf8');
+  walPayload.signature = crypto.sign(null, walSignPayload, auth.privateKey).toString('hex');
+  fs.writeFileSync(walPath, JSON.stringify(walPayload, null, 2) + '\n', 'utf8');
+
+  // Recovery must detect the corrupted journal prefix and fail closed with TRANSACTION_WAL_CORRUPTION_DETECTED
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /TRANSACTION_WAL_CORRUPTION_DETECTED/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R17-B04 - WAL signer rotated out or retired in current registry is rejected even if signed by genesis root', () => {
+  const tempDir = createTempDir('r17-b04-rotated-signer-');
+  const authA = generateTestAuthority();
+  const authB = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: authA.keyId,
+    trustedRootPublicKeyPem: authA.pem,
+    trustedRootFingerprint: authA.fp
+  };
+
+  // 1. Setup Genesis v1 with authA
+  const reg1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: authA.keyId,
+    activeKeyFingerprint: authA.fp,
+    activePublicKeyPem: authA.pem,
+    keys: [{
+      keyId: authA.keyId,
+      keyFingerprint: authA.fp,
+      publicKeyPem: authA.pem,
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: '2026-01-01T00:00:00.000Z'
+    }],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(reg1, opts);
+
+  // 2. Rotate to v2 with authB as active key, retiring authA
+  const reg2 = createAuthorizedRegistryUpdate(
+    reg1,
+    {
+      activeKeyId: authB.keyId,
+      activeKeyFingerprint: authB.fp,
+      activePublicKeyPem: authB.pem,
+      keys: [
+        {
+          keyId: authA.keyId,
+          keyFingerprint: authA.fp,
+          publicKeyPem: authA.pem,
+          status: 'RETIRED',
+          issuedAt: '2026-01-01T00:00:00.000Z'
+        },
+        {
+          keyId: authB.keyId,
+          keyFingerprint: authB.fp,
+          publicKeyPem: authB.pem,
+          status: 'ACTIVE',
+          issuedAt: new Date().toISOString()
+        }
+      ]
+    },
+    authA.keyId,
+    authA.privateKey
+  );
+  saveTrustRegistry(reg2, opts);
+
+  // 3. Create a WAL signed by retired authA
+  const walPath = path.join(tempDir, REVOCATION_TXN_FILE);
+  const walPayload = {
+    schemaVersion: '1.0.0',
+    txnId: 'tx-test-retired-signer',
+    pid: process.pid,
+    status: 'COMMITTED',
+    timestamp: new Date().toISOString(),
+    committedAt: new Date().toISOString(),
+    signedBy: authA.keyId,
+    journalPath: getRevocationJournalPath(opts),
+    checkpointPath: getRevocationCheckpointPath(opts),
+    regPath: getTrustRegistryPath(opts),
+    initialJournalSize: 0,
+    initialJournalExisted: false,
+    initialJournalSha256: '0'.repeat(64),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: false,
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: true,
+    initialRegistryVersion: 2,
+    initialHwmHeadIndex: -1,
+    initialHwmHeadDigest: '',
+    committedHwmHeadIndex: -1,
+    committedHwmHeadDigest: '',
+    expectedTargetHwmHeadIndex: -1,
+    expectedTargetHwmHeadDigest: '',
+    expectedTargetRegistryVersion: 2
+  };
+  const walSignPayload = Buffer.from(computeTransactionWalSignPayload(walPayload), 'utf8');
+  walPayload.signature = crypto.sign(null, walSignPayload, authA.privateKey).toString('hex');
+  fs.writeFileSync(walPath, JSON.stringify(walPayload, null, 2) + '\n', 'utf8');
+
+  // Must fail closed rejecting retired signer
+  assert.throws(
+    () => recoverAbortedRevocationTransaction(opts),
+    /RETIRED_KEY_AUTHORIZATION_REJECTED|TRANSACTION_WAL_SIGNER_UNTRUSTED/
   );
 
   fs.rmSync(tempDir, { recursive: true, force: true });

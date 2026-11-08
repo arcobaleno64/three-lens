@@ -88,6 +88,12 @@ In security audit contexts, no single security perimeter can protect against all
    - **Objective**: Centralizes containment algebra and uses dedicated file descriptor inspection (`fs.openSync` + `fs.fstatSync` + `fs.readSync`) to prevent filesystem race conditions (TOCTOU) and sibling-prefix path collisions (e.g. `scratch/context-evil`).
    - **Failure Modes & Defenses**: If a symlink or file swap occurs between validation and read, Layer 4 descriptor binding guarantees containment against race conditions and out-of-boundary access.
 
+### 2.9 Monotonic State & Anti-Rollback Threat Boundary (Milestone 5.4 Governance)
+- **Local Multi-Anchor Defense**: Anti-rollback for cryptographic trust registries and revocation journals relies on multi-anchor monotonic witnesses persisted across isolated filesystems (`PLUGIN_DATA` + user home directory `~/.three-lens/witness/`) combined with in-process memory tracking and unbroken historical digest commitment (`registryDigests`).
+- **Threat Model & Bounded Guarantee**:
+  - *Covered Scenarios*: Detects single-anchor rollback, uncoordinated file deletion or corruption, intermediate historical divergence, transaction crash interruption (via signed COMMITTED and PREPARED WAL), and concurrent multi-process race conditions under standard POSIX/Windows DAC permissions (0o600).
+  - *Boundary & Non-Claim*: For adversaries possessing simultaneous arbitrary write access across all independent local filesystem locations who also restart the host process (full state wipeout and snapshot restore), local filesystems alone cannot mathematically provide external wall-clock freshness. Full state rollbacks under full-host compromise require external hardware trust anchors or append-only transparency log endpoints. Absent an active external witness, local anti-rollback guarantees are bounded to multi-anchor local consistency, continuous ancestor history verification, and atomic WAL crash recovery.
+
 ---
 
 ## 3. Reporting Vulnerabilities

@@ -39,9 +39,16 @@ export const ADAPTER_VERSION = '1.1.0';
 // Guarantees capability cannot escape via object cloning, closures, or Symbol forgery.
 const _governanceLockStorage = new AsyncLocalStorage();
 
-// R16-B02: Unexported module-private Symbol token for privileged internal witness storage access.
-// Guarantees external callers cannot forge internal write privileges via plain options properties.
+// R16-B02 & R17-B01: Unexported module-private Symbol token and WeakSet for privileged internal witness storage access.
+// Guarantees external callers cannot forge internal write privileges via plain options properties or Proxy traps.
 const INTERNAL_WITNESS_WRITE_TOKEN = Symbol('INTERNAL_WITNESS_WRITE_TOKEN');
+const INTERNAL_WITNESS_PRIVILEGED_OPTIONS = new WeakSet();
+
+function createPrivilegedWitnessOptions(baseOptions = {}) {
+  const privileged = { ...(baseOptions || {}), [INTERNAL_WITNESS_WRITE_TOKEN]: true };
+  INTERNAL_WITNESS_PRIVILEGED_OPTIONS.add(privileged);
+  return privileged;
+}
 
 function canonicalizeDirPath(dir) {
   if (typeof dir !== 'string' || !dir.trim()) return '';
@@ -152,11 +159,12 @@ export function toRealNormalizedPath(p) {
  * @param {object} [options={}] - Options containing repoRoot or workspacePaths
  */
 export function assertSafeStorageTarget(targetPath, options = {}) {
-  // R15-B04 & R16-B02: Strictly confine monotonic witness files against caller tampering via public storage APIs.
-  // Privileged internal writes mandate the unexported module-private Symbol token; plain string flags are rejected.
+  // R15-B04, R16-B02 & R17-B01: Strictly confine monotonic witness files against caller tampering via public storage APIs.
+  // Privileged internal writes mandate the unexported module-private Symbol token and internal WeakSet registration;
+  // plain string flags, external Symbols, and Proxy traps are unconditionally rejected.
   const baseName = path.basename(targetPath);
   if (baseName === '.monotonic-witness.json' || baseName.endsWith('.witness.json')) {
-    if (!options || options[INTERNAL_WITNESS_WRITE_TOKEN] !== true) {
+    if (!options || typeof options !== 'object' || !INTERNAL_WITNESS_PRIVILEGED_OPTIONS.has(options) || options[INTERNAL_WITNESS_WRITE_TOKEN] !== true) {
       throw new Error(`[STORAGE_CONFINEMENT_VIOLATION] Direct access to monotonic witness file (${targetPath}) is strictly forbidden via storage API`);
     }
   }
@@ -628,6 +636,66 @@ export function recoverAbortedRevocationTransaction(options = {}) {
   return withGovernanceLock(options, (lockedOpts) => _recoverAbortedRevocationTransactionInner(lockedOpts));
 }
 
+/**
+ * R17-B03: Replays and cryptographically verifies all journal entries from index 0 to targetHeadIndex.
+ * Validates unbroken entry indices, continuous hash chaining (prevEntryDigest), and valid cryptographic signatures.
+ */
+function verifyFullJournalChain(journalLines, targetHeadIndex, targetHeadDigest, curReg, options = {}) {
+  if (!Array.isArray(journalLines) || journalLines.length < targetHeadIndex + 1) {
+    throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry count is insufficient for target index');
+  }
+  let expectedPrevDigest = '0'.repeat(64);
+  for (let i = 0; i <= targetHeadIndex; i++) {
+    let entry = null;
+    try {
+      entry = JSON.parse(journalLines[i]);
+    } catch (e) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry at index ${i} is corrupted JSON: ${e.message}`);
+    }
+    const entryIdx = typeof entry.entryIndex === 'number' ? entry.entryIndex : entry.index;
+    if (entryIdx !== i) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry at index ${i} has discontinuous index ${entryIdx}`);
+    }
+    if (entry.prevEntryDigest !== expectedPrevDigest) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry at index ${i} has broken hash chain (expected ${expectedPrevDigest}, found ${entry.prevEntryDigest})`);
+    }
+    if (!entry.signedBy || typeof entry.signedBy !== 'string' || !entry.signature || typeof entry.signature !== 'string') {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry at index ${i} missing signature or signedBy`);
+    }
+
+    let entrySignerPem = null;
+    if (curReg && Array.isArray(curReg.keys)) {
+      const kRec = curReg.keys.find(k => k.keyId === entry.signedBy);
+      if (kRec && (kRec.status === 'ACTIVE' || kRec.status === 'ACTIVE_PINNED_ROOT')) {
+        entrySignerPem = kRec.publicKeyPem;
+      } else if (kRec) {
+        throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry at index ${i} signed by inactive/retired key '${entry.signedBy}'`);
+      }
+    }
+    if (!entrySignerPem && (options.trustedRootKeyId === entry.signedBy || DEFAULT_SUPERVISOR_KEY_ID === entry.signedBy)) {
+      entrySignerPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
+    }
+    if (!entrySignerPem) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry at index ${i} signer '${entry.signedBy}' is unauthenticated`);
+    }
+    const entrySignPayload = Buffer.from(computeRevocationEntrySignPayload(entry), 'utf8');
+    const isSigValid = crypto.verify(null, entrySignPayload, entrySignerPem, Buffer.from(entry.signature, 'hex'));
+    if (!isSigValid) {
+      throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry at index ${i} signature verification failed`);
+    }
+
+    const entryDigest = sha256Digest(canonicalJsonStringify(entry));
+    expectedPrevDigest = entryDigest;
+
+    if (i === targetHeadIndex) {
+      if (entryDigest !== targetHeadDigest) {
+        throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal head entry digest does not match target head digest');
+      }
+    }
+  }
+  return true;
+}
+
 function _recoverAbortedRevocationTransactionInner(options = {}) {
   const dir = resolvePluginDataDir(options);
   const txnPath = path.join(dir, REVOCATION_TXN_FILE);
@@ -695,8 +763,7 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
     throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Transaction WAL missing required paths, sizes, or cryptographic metadata');
   }
 
-  // R10-B01 & R11-B01 & R12-B06 & R14-B03: Authenticate signer public key against trusted root or validated registry
-  // Prevent retired or revoked keys from authorizing a WAL if on-disk registry exists
+  // R10-B01, R11-B01, R12-B06 & R14-B03: Check if signer was retired or revoked in current on-disk registry
   if (fs.existsSync(expectedRegPath)) {
     try {
       const curRegRaw = JSON.parse(fs.readFileSync(expectedRegPath, 'utf8'));
@@ -801,41 +868,18 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
         throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL exists but on-disk journal is empty');
       }
       const journalLines = journalRaw.split(/\r?\n/).filter(l => l.trim().length > 0);
-      const lastLine = journalLines[journalLines.length - 1];
-      const lastEntry = JSON.parse(lastLine);
-      const tailIndex = typeof lastEntry.entryIndex === 'number' ? lastEntry.entryIndex : lastEntry.index;
-      const tailDigest = sha256Digest(canonicalJsonStringify(lastEntry));
-      if (
-        tailIndex !== txnData.committedHwmHeadIndex ||
-        tailDigest !== txnData.committedHwmHeadDigest
-      ) {
-        throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL committedHwmHeadIndex/headDigest does not match journal tail entry');
+      if (journalLines.length < txnData.committedHwmHeadIndex + 1) {
+        throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL committedHwmHeadIndex exceeds journal entry count');
       }
 
-      // R14-B08: Cryptographically verify tail entry signature against active supervisor key
-      if (!lastEntry.signedBy || typeof lastEntry.signedBy !== 'string' || !lastEntry.signature || typeof lastEntry.signature !== 'string') {
-        throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL journal tail entry missing signature or signedBy');
-      }
-      let tailSignerPem = null;
-      if (curReg && Array.isArray(curReg.keys)) {
-        const kRec = curReg.keys.find(k => k.keyId === lastEntry.signedBy);
-        if (kRec && (kRec.status === 'ACTIVE' || kRec.status === 'ACTIVE_PINNED_ROOT')) {
-          tailSignerPem = kRec.publicKeyPem;
-        } else if (kRec) {
-          throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL journal tail entry signed by inactive/retired key '${lastEntry.signedBy}'`);
-        }
-      }
-      if (!tailSignerPem && (options.trustedRootKeyId === lastEntry.signedBy || DEFAULT_SUPERVISOR_KEY_ID === lastEntry.signedBy)) {
-        tailSignerPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
-      }
-      if (!tailSignerPem) {
-        throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL journal tail signer '${lastEntry.signedBy}' is unauthenticated`);
-      }
-      const tailSignPayload = Buffer.from(computeRevocationEntrySignPayload(lastEntry), 'utf8');
-      const isTailSigValid = crypto.verify(null, tailSignPayload, tailSignerPem, Buffer.from(lastEntry.signature, 'hex'));
-      if (!isTailSigValid) {
-        throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL journal tail entry signature verification failed');
-      }
+      // R17-B03 & R17-E02: Unconditionally replay and cryptographically verify all journal entries from 0 to committedHwmHeadIndex
+      verifyFullJournalChain(
+        journalLines,
+        txnData.committedHwmHeadIndex,
+        txnData.committedHwmHeadDigest,
+        curReg,
+        options
+      );
     } catch (parseErr) {
       if (parseErr.message && parseErr.message.includes('TRANSACTION_WAL_CORRUPTION_DETECTED')) {
         throw parseErr;
@@ -866,8 +910,8 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
       const curRegDigest = computeRegistryDigest(curReg);
       assertMonotonicWitnessFreshness(dir, curReg.registryVersion, txnData.committedHwmHeadIndex, txnData.committedHwmHeadDigest, curRegDigest, options);
 
-      // R15-B02 & R16-B03: Update persistent monotonic witness AFTER complete authorization & continuity validation
-      updateMonotonicWitness(dir, curReg.registryVersion, txnData.committedHwmHeadIndex, txnData.committedHwmHeadDigest, curRegDigest, options);
+      // R15-B02, R16-B03 & R17-B01: Update persistent monotonic witness AFTER complete authorization & continuity validation
+      updateMonotonicWitness(dir, curReg.registryVersion, txnData.committedHwmHeadIndex, txnData.committedHwmHeadDigest, curRegDigest, createPrivilegedWitnessOptions(options));
 
     assertSafeStorageTarget(txnPath, options);
     try {
@@ -996,23 +1040,25 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
             const jLines = jRaw.split(/\r?\n/).filter(l => l.trim().length > 0);
             if (jLines.length > 0) {
               try {
-                const lastEntry = JSON.parse(jLines[jLines.length - 1]);
-                const tailIndex = typeof lastEntry.entryIndex === 'number' ? lastEntry.entryIndex : lastEntry.index;
-                const tailDigest = sha256Digest(canonicalJsonStringify(lastEntry));
-                journalMatches = Boolean(
-                  lastEntry &&
-                  tailIndex === txnData.expectedTargetHwmHeadIndex &&
-                  tailDigest === txnData.expectedTargetHwmHeadDigest
+                // R17-B03: Verify unbroken continuity, chaining, and signatures for entire journal
+                journalMatches = verifyFullJournalChain(
+                  jLines,
+                  txnData.expectedTargetHwmHeadIndex,
+                  txnData.expectedTargetHwmHeadDigest,
+                  currentReg,
+                  options
                 );
-              } catch (_) {}
+              } catch (_) {
+                journalMatches = false;
+              }
             }
           }
 
           if (cpMatches && journalMatches) {
             // The transaction was fully committed to disk before crash!
-            // R15-B02: Update persistent monotonic witness BEFORE unlinking marker
+            // R15-B02 & R17-B01: Update persistent monotonic witness BEFORE unlinking marker
             const committedRegDigest = computeRegistryDigest(currentReg);
-            updateMonotonicWitness(dir, curRegVer, txnData.expectedTargetHwmHeadIndex, txnData.expectedTargetHwmHeadDigest, committedRegDigest, options);
+            updateMonotonicWitness(dir, curRegVer, txnData.expectedTargetHwmHeadIndex, txnData.expectedTargetHwmHeadDigest, committedRegDigest, createPrivilegedWitnessOptions(options));
             assertSafeStorageTarget(txnPath, options);
             fs.unlinkSync(txnPath);
             return { recovered: false, committed: true, txnId: txnData.txnId };
@@ -1214,13 +1260,19 @@ export function computeRevocationEntrySignPayload(record) {
  */
 export function computeRegistryAuthorizationPayload(registry) {
   const normalizedKeys = Array.isArray(registry.keys)
-    ? registry.keys.map(k => ({
-        keyId: k.keyId,
-        keyFingerprint: k.keyFingerprint,
-        publicKeyPem: k.publicKeyPem,
-        status: k.status,
-        issuedAt: k.issuedAt || ''
-      })).sort((a, b) => a.keyId.localeCompare(b.keyId))
+    ? registry.keys.map(k => {
+        const item = {
+          keyId: k.keyId,
+          keyFingerprint: k.keyFingerprint,
+          publicKeyPem: k.publicKeyPem,
+          status: k.status,
+          issuedAt: k.issuedAt || ''
+        };
+        if (k.roles) item.roles = Array.isArray(k.roles) ? [...k.roles].sort() : [String(k.roles)];
+        if (typeof k.validFrom === 'string') item.validFrom = k.validFrom;
+        if (typeof k.validUntil === 'string') item.validUntil = k.validUntil;
+        return item;
+      }).sort((a, b) => a.keyId.localeCompare(b.keyId))
     : [];
   const payload = {
     schemaVersion: registry.schemaVersion,
@@ -1237,10 +1289,10 @@ export function computeRegistryAuthorizationPayload(registry) {
 
 /**
  * Computes canonical identity commitment payload for trust registry.
- * Resolves R15-B03 & R16-B04: Binds schemaVersion, registryVersion, authority,
- * activeKey, keys array, status, pinnedSince, rotationPolicy, keyType,
- * validFrom, validUntil, complete authorizationProof (signerKeyId, signedAt, signature, priorRegistryVersion),
- * and outer signature into a canonical domain-separated payload.
+ * Resolves R15-B03, R16-B04, R17-B02 & R17-B03: Binds schemaVersion, registryVersion, authority,
+ * activeKey, keys array (with status, roles, lifecycles), pinnedSince, rotationPolicy, keyType,
+ * validFrom, validUntil, complete authorizationProof (authorizedBy/signerKeyId, timestamp/signedAt, signature, algorithm, priorRegistryVersion),
+ * outer signature, and revocationHighWaterMark into a canonical domain-separated payload.
  *
  * @param {object} registry
  * @returns {string} Domain-separated canonical string
@@ -1248,12 +1300,20 @@ export function computeRegistryAuthorizationPayload(registry) {
 export function computeRegistryIdentityPayload(registry) {
   if (!registry || typeof registry !== 'object') return '';
   const authPayload = computeRegistryAuthorizationPayload(registry);
-  const normalizedProof = (registry.authorizationProof && typeof registry.authorizationProof === 'object')
+  const proof = (registry.authorizationProof && typeof registry.authorizationProof === 'object')
+    ? registry.authorizationProof
+    : null;
+  const normalizedProof = proof
     ? {
-        signerKeyId: typeof registry.authorizationProof.signerKeyId === 'string' ? registry.authorizationProof.signerKeyId : '',
-        signedAt: typeof registry.authorizationProof.signedAt === 'string' ? registry.authorizationProof.signedAt : '',
-        signature: typeof registry.authorizationProof.signature === 'string' ? registry.authorizationProof.signature : '',
-        priorRegistryVersion: typeof registry.authorizationProof.priorRegistryVersion === 'number' ? registry.authorizationProof.priorRegistryVersion : 0
+        authorizedBy: typeof proof.authorizedBy === 'string'
+          ? proof.authorizedBy
+          : (typeof proof.signerKeyId === 'string' ? proof.signerKeyId : ''),
+        signature: typeof proof.signature === 'string' ? proof.signature : '',
+        timestamp: typeof proof.timestamp === 'string'
+          ? proof.timestamp
+          : (typeof proof.signedAt === 'string' ? proof.signedAt : ''),
+        algorithm: typeof proof.algorithm === 'string' ? proof.algorithm : 'ed25519',
+        priorRegistryVersion: typeof proof.priorRegistryVersion === 'number' ? proof.priorRegistryVersion : 0
       }
     : null;
   const identityObj = {
@@ -1946,7 +2006,7 @@ function doLoadTrustRegistry(options = {}) {
               if (curWitness.registryDigests && curWitness.registryDigests[String(v)]) {
                 const histDigest = computeRegistryDigest(histObj);
                 if (histDigest !== curWitness.registryDigests[String(v)]) {
-                  const errorMsg = `[REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Historical registry ${hf} digest (${histDigest}) diverges from witnessed historical commitment (${curWitness.registryDigests[String(v)]})`;
+                  const errorMsg = `[REGISTRY_ROLLBACK_DETECTED] [REGISTRY_DIVERGENCE_DETECTED] [REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_ROLLBACK_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Historical registry ${hf} digest (${histDigest}) diverges from witnessed historical commitment (${curWitness.registryDigests[String(v)]})`;
                   if (options.failClosed !== false) {
                     throw new Error(errorMsg);
                   }
@@ -1973,6 +2033,19 @@ function doLoadTrustRegistry(options = {}) {
               if (histErr.message && (histErr.message.includes('REGISTRY_HISTORY_DIVERGENCE_DETECTED') || histErr.message.includes('MONOTONIC_WITNESS_DIVERGENCE_DETECTED'))) {
                 throw histErr;
               }
+              const errorMsg = `[HISTORY_CORRUPTION_DETECTED] [REGISTRY_HISTORY_DIVERGENCE_DETECTED] Historical registry ${hf} in ${histDir} is corrupted or cannot be parsed: ${histErr.message}`;
+              if (options.failClosed !== false) {
+                throw new Error(errorMsg);
+              }
+              return {
+                source: 'PLUGIN_DATA',
+                registry: null,
+                valid: false,
+                error: errorMsg,
+                cryptographicValidity: false,
+                monotonicValidity: false,
+                ancestryContinuity: false
+              };
             }
           }
         }
@@ -2107,18 +2180,19 @@ function doLoadTrustRegistry(options = {}) {
           }
         }
       } catch (hErr) {
-        if (
-          hErr.message &&
-          (
-            hErr.message.includes('REGISTRY_ROLLBACK_DETECTED') ||
-            hErr.message.includes('HIGH_WATER_MARK_ROLLBACK_DETECTED') ||
-            hErr.message.includes('HISTORY_GAP_DETECTED') ||
-            hErr.message.includes('REGISTRY_HISTORY_DESYNC_DETECTED') ||
-            hErr.message.includes('CHECKPOINT_DELETION_DETECTED')
-          )
-        ) {
+        // R17-B02: Under Default-Deny, any historical progression or corruption error must fail closed
+        if (options.failClosed !== false) {
           throw hErr;
         }
+        return {
+          source: 'PLUGIN_DATA',
+          registry: null,
+          valid: false,
+          error: hErr.message,
+          cryptographicValidity: false,
+          monotonicValidity: false,
+          ancestryContinuity: false
+        };
       }
 
       // Check for rollback against established revocations in dir (R06 hardening)
@@ -2287,7 +2361,7 @@ function doLoadTrustRegistry(options = {}) {
         : '';
       const currentRegDigest = computeRegistryDigest(parsed);
       assertMonotonicWitnessFreshness(dir, parsed.registryVersion, currentHwmIdx, currentHwmDigest, currentRegDigest, options);
-      updateMonotonicWitness(dir, parsed.registryVersion, currentHwmIdx, currentHwmDigest, currentRegDigest, options);
+      updateMonotonicWitness(dir, parsed.registryVersion, currentHwmIdx, currentHwmDigest, currentRegDigest, createPrivilegedWitnessOptions(options));
 
       return {
         source: 'PLUGIN_DATA',
@@ -2511,6 +2585,14 @@ export function getMonotonicWitness(dir, options = {}) {
         throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} registryDigests[${maxVerKey}] does not match maxSeenRegistryDigest`);
       }
 
+      // R17-E01: Sparse witness check: Ensure all versions 1..raw.maxSeenRegistryVersion are present without gaps
+      for (let v = 1; v <= raw.maxSeenRegistryVersion; v++) {
+        const vKey = String(v);
+        if (!raw.registryDigests[vKey]) {
+          throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Sparse witness detected: missing unbroken historical digest for version ${v} in ${filePath}`);
+        }
+      }
+
       // R15-B03: Check registry digest divergence at same version
       if (raw.maxSeenRegistryVersion > maxRegVer) {
         maxRegVer = raw.maxSeenRegistryVersion;
@@ -2649,6 +2731,11 @@ function normalizeWitnessCallArgs(arg4, arg5, arg6) {
 export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4, arg5, arg6) {
   const { headDigest: hwmHeadDigest, regDigest: registryDigest, options } = normalizeWitnessCallArgs(arg4, arg5, arg6);
 
+  // R17-B01: External callers cannot call updateMonotonicWitness directly to escalate witness version
+  if (!options || typeof options !== 'object' || !INTERNAL_WITNESS_PRIVILEGED_OPTIONS.has(options) || options[INTERNAL_WITNESS_WRITE_TOKEN] !== true) {
+    throw new Error('[STORAGE_CONFINEMENT_VIOLATION] [UNAUTHORIZED_WITNESS_UPDATE] Calling updateMonotonicWitness requires internal witness write token');
+  }
+
   const witness = getMonotonicWitness(dir, options);
   let changed = false;
 
@@ -2749,8 +2836,8 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
         maxSeenHwmHeadDigest: witness.maxSeenHwmHeadDigest || '',
         updatedAt: new Date().toISOString()
       }, null, 2) + '\n';
-      // R15-B04 & R16-B02: Privileged internal write token to satisfy safe storage confinement
-      safeWriteFileSync(filePath, payload, { ...options, [INTERNAL_WITNESS_WRITE_TOKEN]: true });
+      // R15-B04, R16-B02 & R17-B01: Privileged internal write token to satisfy safe storage confinement
+      safeWriteFileSync(filePath, payload, createPrivilegedWitnessOptions(options));
     } catch (writeErr) {
       throw new Error(`[STORAGE_DURABILITY_FAILURE] Failed to persist monotonic witness at ${filePath}: ${writeErr.message}`);
     }
@@ -2818,25 +2905,25 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
             );
           }
         }
-        // If version is strictly prior to candidate, verify on-disk historical artifact
-        if (v < candidateRegistryVersion) {
-          const histPath = path.join(histDir, `trust-registry.v${v}.json`);
-          if (fs.existsSync(histPath)) {
-            try {
-              const histObj = JSON.parse(fs.readFileSync(histPath, 'utf8'));
-              const actualHistDigest = computeRegistryDigest(histObj);
-              if (actualHistDigest !== expectedDigest) {
-                throw new Error(
-                  `[REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Historical registry trust-registry.v${v}.json digest (${actualHistDigest}) diverges from monotonic witness historical commitment (${expectedDigest})`
-                );
-              }
-            } catch (readErr) {
-              if (readErr.message.includes('REGISTRY_HISTORY_DIVERGENCE_DETECTED') || readErr.message.includes('REGISTRY_DIVERGENCE_DETECTED')) throw readErr;
+        // R17-B02: If on-disk historical artifact exists for this version (even if v === candidateRegistryVersion),
+        // verify its content digest matches the monotonic witness commitment and fail closed if corrupted
+        const histPath = path.join(histDir, `trust-registry.v${v}.json`);
+        if (fs.existsSync(histPath)) {
+          try {
+            const histObj = JSON.parse(fs.readFileSync(histPath, 'utf8'));
+            const actualHistDigest = computeRegistryDigest(histObj);
+            if (actualHistDigest !== expectedDigest) {
               throw new Error(
-                `[REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Failed to verify historical registry at ${histPath}: ${readErr.message}`
+                `[REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Historical registry trust-registry.v${v}.json digest (${actualHistDigest}) diverges from monotonic witness historical commitment (${expectedDigest})`
               );
             }
-          } else {
+          } catch (readErr) {
+            if (readErr.message.includes('REGISTRY_HISTORY_DIVERGENCE_DETECTED') || readErr.message.includes('REGISTRY_DIVERGENCE_DETECTED')) throw readErr;
+            throw new Error(
+              `[HISTORY_CORRUPTION_DETECTED] [REGISTRY_HISTORY_DIVERGENCE_DETECTED] Failed to verify historical registry at ${histPath}: ${readErr.message}`
+            );
+          }
+        } else if (v < candidateRegistryVersion) {
             // Check if prior version is currently residing in active trust registry (e.g. during saveTrustRegistry)
             const candidateCurrentPaths = [
               path.join(dir, 'supervisor-trust-registry.json'),
@@ -2871,7 +2958,6 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
         }
       }
     }
-  }
 
   // R14-B07 & R15-B01: Check HWM headDigest divergence at same index
   if (
@@ -3103,7 +3189,7 @@ export function saveTrustRegistry(registry, options = {}) {
     }
     safeWriteFileSync(checkpointPath, JSON.stringify(cpData, null, 2) + '\n', opts);
 
-    // R12-B02, R14-B07, R15-B01 & R15-B03: Update monotonic witness on successful save
+    // R12-B02, R14-B07, R15-B01, R15-B03 & R17-B01: Update monotonic witness on successful save
     const finalHwmIdx = typeof registry.revocationHighWaterMark?.headIndex === 'number'
       ? registry.revocationHighWaterMark.headIndex
       : -1;
@@ -3111,7 +3197,7 @@ export function saveTrustRegistry(registry, options = {}) {
       ? registry.revocationHighWaterMark.headDigest
       : '';
     const finalRegDigest = computeRegistryDigest(registry);
-    updateMonotonicWitness(dir, registry.registryVersion, finalHwmIdx, finalHwmDigest, finalRegDigest, opts);
+    updateMonotonicWitness(dir, registry.registryVersion, finalHwmIdx, finalHwmDigest, finalRegDigest, createPrivilegedWitnessOptions(opts));
 
     return {
       success: true,
@@ -3413,7 +3499,7 @@ function doLoadRevocationJournal(options = {}) {
     const journalRegDigest = trustRegistryLoad.registry ? computeRegistryDigest(trustRegistryLoad.registry) : '';
     const journalRegVer = trustRegistryLoad.registry ? trustRegistryLoad.registry.registryVersion : undefined;
     assertMonotonicWitnessFreshness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, options);
-    updateMonotonicWitness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, options);
+    updateMonotonicWitness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, createPrivilegedWitnessOptions(options));
 
     return { valid: true, entries, error: null, count: entries.length, path: journalPath };
   } catch (err) {
@@ -3710,9 +3796,9 @@ export function appendRevocationEntry(entryInput, options = {}) {
       txnData.signature = crypto.sign(null, committedSignPayload, options.signerPrivateKey).toString('hex');
       safeWriteFileSync(txnPath, JSON.stringify(txnData, null, 2) + '\n', options);
 
-      // R14-B05, R15-B01 & R15-B03: Update persistent monotonic witness BEFORE unlinking WAL marker
+      // R14-B05, R15-B01, R15-B03 & R17-B01: Update persistent monotonic witness BEFORE unlinking WAL marker
       const committedRegDigest = computeRegistryDigest(regObj);
-      updateMonotonicWitness(dir, regObj ? regObj.registryVersion : 1, entryIndex, entryDigest, committedRegDigest, options);
+      updateMonotonicWitness(dir, regObj ? regObj.registryVersion : 1, entryIndex, entryDigest, committedRegDigest, createPrivilegedWitnessOptions(options));
 
       // Successfully committed and witnessed: remove WAL marker
       try {
