@@ -44,6 +44,7 @@ const _governanceLockStorage = new AsyncLocalStorage();
 const INTERNAL_WITNESS_WRITE_TOKEN = Symbol('INTERNAL_WITNESS_WRITE_TOKEN');
 
 function canonicalizeDirPath(dir) {
+  if (typeof dir !== 'string' || !dir.trim()) return '';
   try {
     return fs.realpathSync(dir);
   } catch (_) {
@@ -52,6 +53,7 @@ function canonicalizeDirPath(dir) {
 }
 
 function pathsEqual(p1, p2) {
+  if (typeof p1 !== 'string' || typeof p2 !== 'string') return false;
   const c1 = canonicalizeDirPath(p1);
   const c2 = canonicalizeDirPath(p2);
   if (process.platform === 'win32') {
@@ -2415,7 +2417,7 @@ function doLoadTrustRegistry(options = {}) {
 const _DIR_MONOTONIC_WITNESS = new Map();
 
 function getWitnessStoragePaths(dir) {
-  const normDir = path.resolve(dir);
+  const normDir = canonicalizeDirPath(dir);
   const localWitnessFile = path.join(normDir, '.monotonic-witness.json');
   // Independent anchor stored outside PLUGIN_DATA isolated directory
   const dirHash = crypto.createHash('sha256').update(normDir, 'utf8').digest('hex').slice(0, 16);
@@ -2425,7 +2427,7 @@ function getWitnessStoragePaths(dir) {
 }
 
 export function getMonotonicWitness(dir, options = {}) {
-  const norm = path.resolve(dir);
+  const norm = canonicalizeDirPath(dir);
   if (!_DIR_MONOTONIC_WITNESS.has(norm)) {
     _DIR_MONOTONIC_WITNESS.set(norm, {
       maxSeenRegistryVersion: 1,
@@ -2462,11 +2464,9 @@ export function getMonotonicWitness(dir, options = {}) {
       if (typeof raw.dir !== 'string' || !raw.dir.trim()) {
         throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing mandatory 'dir' string`);
       }
-      // R16-B05: Directory path semantic parity check against target storage dir
-      const normalizedWitnessDir = path.resolve(raw.dir);
-      const expectedDir = path.resolve(dir);
-      if (normalizedWitnessDir !== expectedDir) {
-        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness directory '${normalizedWitnessDir}' diverges from expected storage directory '${expectedDir}'`);
+      // R16-B05: Directory path semantic parity check against target storage dir (resolves symlinks across macOS/Linux)
+      if (!pathsEqual(raw.dir, dir)) {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness directory '${raw.dir}' diverges from expected storage directory '${dir}'`);
       }
       if (typeof raw.maxSeenRegistryVersion !== 'number' || !Number.isInteger(raw.maxSeenRegistryVersion) || raw.maxSeenRegistryVersion < 1) {
         throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'maxSeenRegistryVersion'`);
@@ -2741,7 +2741,7 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4,
       if (!fs.existsSync(parent)) fs.mkdirSync(parent, { recursive: true });
       const payload = JSON.stringify({
         schemaVersion: '1.0.0',
-        dir: path.resolve(dir),
+        dir: canonicalizeDirPath(dir),
         maxSeenRegistryVersion: witness.maxSeenRegistryVersion,
         maxSeenRegistryDigest: witness.maxSeenRegistryDigest || '',
         registryDigests: witness.registryDigests || {},
@@ -2837,23 +2837,29 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
               );
             }
           } else {
-            // Check if prior version is currently residing in trust-registry.json (e.g. during saveTrustRegistry)
-            const currentRegPath = path.join(dir, 'trust-registry.json');
+            // Check if prior version is currently residing in active trust registry (e.g. during saveTrustRegistry)
+            const candidateCurrentPaths = [
+              path.join(dir, 'supervisor-trust-registry.json'),
+              path.join(dir, 'trust-registry.json')
+            ];
             let foundInCurrent = false;
-            if (fs.existsSync(currentRegPath)) {
-              try {
-                const curObj = JSON.parse(fs.readFileSync(currentRegPath, 'utf8'));
-                if (curObj.registryVersion === v) {
-                  const actualDigest = computeRegistryDigest(curObj);
-                  if (actualDigest !== expectedDigest) {
-                    throw new Error(
-                      `[REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] On-disk trust registry version ${v} digest (${actualDigest}) diverges from monotonic witness historical commitment (${expectedDigest})`
-                    );
+            for (const currentRegPath of candidateCurrentPaths) {
+              if (fs.existsSync(currentRegPath)) {
+                try {
+                  const curObj = JSON.parse(fs.readFileSync(currentRegPath, 'utf8'));
+                  if (curObj.registryVersion === v) {
+                    const actualDigest = computeRegistryDigest(curObj);
+                    if (actualDigest !== expectedDigest) {
+                      throw new Error(
+                        `[REGISTRY_HISTORY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] On-disk trust registry version ${v} digest (${actualDigest}) diverges from monotonic witness historical commitment (${expectedDigest})`
+                      );
+                    }
+                    foundInCurrent = true;
+                    break;
                   }
-                  foundInCurrent = true;
+                } catch (curErr) {
+                  if (curErr.message.includes('REGISTRY_HISTORY_DIVERGENCE_DETECTED')) throw curErr;
                 }
-              } catch (curErr) {
-                if (curErr.message.includes('REGISTRY_HISTORY_DIVERGENCE_DETECTED')) throw curErr;
               }
             }
             if (!foundInCurrent && candidateRegistryVersion > v) {
