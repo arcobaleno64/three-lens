@@ -179,6 +179,41 @@ export async function main() {
     }
   }
 
+  // Ingest pending subagent messages from .system_generated/messages/ if available
+  if (typeof payload?.transcriptPath === 'string' && payload.transcriptPath.trim()) {
+    try {
+      const logsDir = path.dirname(payload.transcriptPath);
+      const systemGenDir = path.dirname(logsDir);
+      const messagesDir = path.join(systemGenDir, 'messages');
+      if (fs.existsSync(messagesDir)) {
+        const messageFiles = fs.readdirSync(messagesDir);
+        for (const file of messageFiles) {
+          if (file.endsWith('.json') && file !== 'read.json') {
+            const msgPath = path.join(messagesDir, file);
+            const rawMsg = fs.readFileSync(msgPath, 'utf8');
+            const msgObj = JSON.parse(rawMsg);
+            if (typeof msgObj?.content === 'string') {
+              candidatesToScan.push(msgObj.content);
+            }
+          }
+        }
+      }
+    } catch {
+      // Ingestion of message queue is best-effort fallback for subagent environments
+    }
+  }
+
+  // Check whether this invocation is an autonomous continuation turn
+  // (e.g. tool execution continuation, multi-turn tool loops, or existing transcript)
+  const isContinuation =
+    (typeof payload?.invocationNum === 'number' && payload.invocationNum > 1) ||
+    (typeof payload?.initialNumSteps === 'number' && payload.initialNumSteps > 0);
+
+  // If this is a continuation turn with no new user input candidates, allow normal turn dispatch
+  if (isContinuation && !candidatesToScan.some(text => text.trim().length > 0)) {
+    return emit({});
+  }
+
   // Fail-Closed: Missing verifiable prompt or message payload fields
   if (candidatesToScan.length === 0) {
     return emit({

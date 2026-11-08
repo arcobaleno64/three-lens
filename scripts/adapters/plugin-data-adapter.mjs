@@ -146,6 +146,12 @@ export function toRealNormalizedPath(p) {
  * @param {object} [options={}] - Options containing repoRoot or workspacePaths
  */
 export function assertSafeStorageTarget(targetPath, options = {}) {
+  // R15-B04: Strictly confine monotonic witness files against caller tampering via public storage APIs
+  const baseName = path.basename(targetPath);
+  if ((baseName === '.monotonic-witness.json' || baseName.endsWith('.witness.json')) && options.__internalWitnessWrite !== true) {
+    throw new Error(`[STORAGE_CONFINEMENT_VIOLATION] Direct access to monotonic witness file (${targetPath}) is strictly forbidden via storage API`);
+  }
+
   const forbiddenRoots = [
     options.repoRoot ? toRealNormalizedPath(options.repoRoot) : null,
     toRealNormalizedPath(process.cwd()),
@@ -405,7 +411,8 @@ export function withFileLock(targetFile, fn, options = {}) {
   let lockFd = null;
   while (Date.now() - start < timeoutMs) {
     try {
-      lockFd = fs.openSync(lockFile, 'wx+');
+      // R15-B05: Explicitly enforce 0o600 DAC mode creation on exclusive lock file
+      lockFd = fs.openSync(lockFile, 'wx+', 0o600);
       const info = JSON.stringify({ pid: process.pid, timestamp: Date.now(), lockId });
       fs.writeFileSync(lockFd, info, 'utf8');
       break;
@@ -419,7 +426,8 @@ export function withFileLock(targetFile, fn, options = {}) {
             const reclaimLockId = crypto.randomBytes(8).toString('hex');
             let reclaimFd = null;
             try {
-              reclaimFd = fs.openSync(reclaimLockFile, 'wx+');
+              // R15-B05: Explicitly enforce 0o600 DAC mode creation on reclamation lock file
+              reclaimFd = fs.openSync(reclaimLockFile, 'wx+', 0o600);
               fs.writeFileSync(reclaimFd, JSON.stringify({ pid: process.pid, timestamp: Date.now(), reclaimLockId }), 'utf8');
             } catch (recErr) {
               if (recErr.code === 'EEXIST') {
@@ -758,8 +766,9 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
     ) {
       throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] COMMITTED WAL missing mandatory committedHwmHeadIndex or committedHwmHeadDigest');
     }
+    let curReg = null;
     try {
-      const curReg = JSON.parse(fs.readFileSync(expectedRegPath, 'utf8'));
+      curReg = JSON.parse(fs.readFileSync(expectedRegPath, 'utf8'));
       const curCp = JSON.parse(fs.readFileSync(expectedCheckpointPath, 'utf8'));
       if (
         !curReg || typeof curReg !== 'object' ||
@@ -824,6 +833,10 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
       }
       throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Failed to verify committed state for COMMITTED WAL: ${parseErr.message}`);
     }
+    // R15-B02: Update persistent monotonic witness BEFORE unlinking COMMITTED WAL marker
+    const curRegDigest = computeRegistryDigest(curReg);
+    updateMonotonicWitness(dir, curReg.registryVersion, txnData.committedHwmHeadIndex, txnData.committedHwmHeadDigest, curRegDigest, options);
+
     assertSafeStorageTarget(txnPath, options);
     try {
       fs.unlinkSync(txnPath);
@@ -915,12 +928,13 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
     }
 
     const curRegVer = currentReg.registryVersion;
+    const curRegDigest = computeRegistryDigest(currentReg);
     const curHwm = currentReg.revocationHighWaterMark;
     const curHwmIdx = curHwm ? curHwm.headIndex : -1;
     const curHwmDigest = curHwm ? curHwm.headDigest : '';
 
     // Enforce monotonic witness freshness before any rollback action
-    assertMonotonicWitnessFreshness(dir, curRegVer, curHwmIdx, curHwmDigest, options);
+    assertMonotonicWitnessFreshness(dir, curRegVer, curHwmIdx, curHwmDigest, curRegDigest, options);
 
     // R11-B04, R12-B05 & R13-B05: Check if transaction actually completed all on-disk mutations before crash
     const isTargetExpected = (
@@ -963,7 +977,10 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
           }
 
           if (cpMatches && journalMatches) {
-            // The transaction was fully committed to disk before crash! Safely clean up marker.
+            // The transaction was fully committed to disk before crash!
+            // R15-B02: Update persistent monotonic witness BEFORE unlinking marker
+            const committedRegDigest = computeRegistryDigest(currentReg);
+            updateMonotonicWitness(dir, curRegVer, txnData.expectedTargetHwmHeadIndex, txnData.expectedTargetHwmHeadDigest, committedRegDigest, options);
             assertSafeStorageTarget(txnPath, options);
             fs.unlinkSync(txnPath);
             return { recovered: false, committed: true, txnId: txnData.txnId };
@@ -987,7 +1004,7 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
     }
   } else {
     // If on-disk registry does not exist, verify that monotonic witness does not expect a higher state
-    assertMonotonicWitnessFreshness(dir, 1, -1, '', options);
+    assertMonotonicWitnessFreshness(dir, 1, -1, '', '', options);
   }
 
   // R11-B03: Verify that the journal prefix up to initialJournalSize matches initialJournalSha256 before truncation
@@ -1184,6 +1201,21 @@ export function computeRegistryAuthorizationPayload(registry) {
     revokedKeyIds: Array.isArray(registry.revokedKeyIds) ? [...registry.revokedKeyIds].sort() : []
   };
   return canonicalJsonStringify(payload);
+}
+
+/**
+ * Computes canonical content digest for trust registry authority commitment.
+ * Resolves R15-B03: Binds schemaVersion, registryVersion, authority, activeKey,
+ * keys array, status, and authorization signature into a deterministic SHA-256 digest.
+ *
+ * @param {object} registry
+ * @returns {string} SHA-256 hex digest
+ */
+export function computeRegistryDigest(registry) {
+  if (!registry || typeof registry !== 'object') return '';
+  const authPayload = computeRegistryAuthorizationPayload(registry);
+  const signature = typeof registry.signature === 'string' ? registry.signature : '';
+  return sha256Digest(authPayload + '|' + signature);
 }
 
 /**
@@ -2159,12 +2191,16 @@ function doLoadTrustRegistry(options = {}) {
         };
       }
 
-      // R12-B02: Enforce monotonic witness freshness
+      // R12-B02, R14-B07, R15-B01 & R15-B03: Enforce monotonic witness freshness with candidate HWM and registry digests
       const currentHwmIdx = typeof parsed.revocationHighWaterMark?.headIndex === 'number'
         ? parsed.revocationHighWaterMark.headIndex
         : -1;
-      assertMonotonicWitnessFreshness(dir, parsed.registryVersion, currentHwmIdx, options);
-      updateMonotonicWitness(dir, parsed.registryVersion, currentHwmIdx);
+      const currentHwmDigest = typeof parsed.revocationHighWaterMark?.headDigest === 'string'
+        ? parsed.revocationHighWaterMark.headDigest
+        : '';
+      const currentRegDigest = computeRegistryDigest(parsed);
+      assertMonotonicWitnessFreshness(dir, parsed.registryVersion, currentHwmIdx, currentHwmDigest, currentRegDigest, options);
+      updateMonotonicWitness(dir, parsed.registryVersion, currentHwmIdx, currentHwmDigest, currentRegDigest, options);
 
       return {
         source: 'PLUGIN_DATA',
@@ -2306,10 +2342,18 @@ function getWitnessStoragePaths(dir) {
 export function getMonotonicWitness(dir, options = {}) {
   const norm = path.resolve(dir);
   if (!_DIR_MONOTONIC_WITNESS.has(norm)) {
-    _DIR_MONOTONIC_WITNESS.set(norm, { maxSeenRegistryVersion: 1, maxSeenHwmHeadIndex: -1, maxSeenHwmHeadDigest: '' });
+    _DIR_MONOTONIC_WITNESS.set(norm, {
+      maxSeenRegistryVersion: 1,
+      maxSeenRegistryDigest: '',
+      registryDigests: {},
+      maxSeenHwmHeadIndex: -1,
+      maxSeenHwmHeadDigest: ''
+    });
   }
   const memWitness = _DIR_MONOTONIC_WITNESS.get(norm);
   let maxRegVer = memWitness.maxSeenRegistryVersion;
+  let maxRegDigest = memWitness.maxSeenRegistryDigest || '';
+  const registryDigestsMap = { ...(memWitness.registryDigests || {}) };
   let maxHwmIdx = memWitness.maxSeenHwmHeadIndex;
   let maxHwmDigest = memWitness.maxSeenHwmHeadDigest || '';
 
@@ -2323,23 +2367,66 @@ export function getMonotonicWitness(dir, options = {}) {
       } catch (err) {
         throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} is corrupted or cannot be parsed: ${err.message}`);
       }
-      if (!raw || typeof raw !== 'object') {
-        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} contains invalid JSON payload`);
+      // R15-B04: Strict Schema Validation under Default-Deny
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} contains invalid JSON payload (must be object)`);
       }
-      if (typeof raw.maxSeenRegistryVersion === 'number' && raw.maxSeenRegistryVersion > maxRegVer) {
+      if (raw.schemaVersion !== '1.0.0') {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} has invalid schemaVersion '${raw.schemaVersion}'`);
+      }
+      if (typeof raw.dir !== 'string' || !raw.dir.trim()) {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing mandatory 'dir' string`);
+      }
+      if (typeof raw.maxSeenRegistryVersion !== 'number' || !Number.isInteger(raw.maxSeenRegistryVersion) || raw.maxSeenRegistryVersion < 1) {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'maxSeenRegistryVersion'`);
+      }
+      if (typeof raw.maxSeenHwmHeadIndex !== 'number' || !Number.isInteger(raw.maxSeenHwmHeadIndex) || raw.maxSeenHwmHeadIndex < -1) {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'maxSeenHwmHeadIndex'`);
+      }
+      if (typeof raw.maxSeenHwmHeadDigest !== 'string') {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'maxSeenHwmHeadDigest'`);
+      }
+      if (typeof raw.maxSeenRegistryDigest !== 'string') {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'maxSeenRegistryDigest'`);
+      }
+      if (typeof raw.updatedAt !== 'string' || !raw.updatedAt.trim()) {
+        throw new Error(`[MONOTONIC_WITNESS_CORRUPTED] Persistent witness file at ${filePath} missing or invalid 'updatedAt'`);
+      }
+
+      // R15-B03: Check registry digest divergence at same version
+      if (raw.maxSeenRegistryVersion > maxRegVer) {
         maxRegVer = raw.maxSeenRegistryVersion;
+        maxRegDigest = raw.maxSeenRegistryDigest || '';
+      } else if (raw.maxSeenRegistryVersion === maxRegVer) {
+        if (raw.maxSeenRegistryDigest && maxRegDigest && raw.maxSeenRegistryDigest !== maxRegDigest) {
+          throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Persistent witness registry divergence at version ${maxRegVer} in ${filePath}`);
+        }
+        if (!maxRegDigest && raw.maxSeenRegistryDigest) {
+          maxRegDigest = raw.maxSeenRegistryDigest;
+        }
       }
-      if (typeof raw.maxSeenHwmHeadIndex === 'number') {
-        if (raw.maxSeenHwmHeadIndex > maxHwmIdx) {
-          maxHwmIdx = raw.maxSeenHwmHeadIndex;
-          maxHwmDigest = typeof raw.maxSeenHwmHeadDigest === 'string' ? raw.maxSeenHwmHeadDigest : '';
-        } else if (raw.maxSeenHwmHeadIndex === maxHwmIdx && maxHwmIdx >= 0) {
-          if (raw.maxSeenHwmHeadDigest && maxHwmDigest && raw.maxSeenHwmHeadDigest !== maxHwmDigest) {
-            throw new Error(`[MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Persistent witness divergence at index ${maxHwmIdx} in ${filePath}`);
+
+      if (raw.registryDigests && typeof raw.registryDigests === 'object') {
+        for (const [v, d] of Object.entries(raw.registryDigests)) {
+          if (typeof d === 'string') {
+            if (registryDigestsMap[v] && registryDigestsMap[v] !== d) {
+              throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Persistent witness historical registry divergence at version ${v} in ${filePath}`);
+            }
+            registryDigestsMap[v] = d;
           }
-          if (!maxHwmDigest && raw.maxSeenHwmHeadDigest) {
-            maxHwmDigest = raw.maxSeenHwmHeadDigest;
-          }
+        }
+      }
+
+      // Check HWM index and digest
+      if (raw.maxSeenHwmHeadIndex > maxHwmIdx) {
+        maxHwmIdx = raw.maxSeenHwmHeadIndex;
+        maxHwmDigest = raw.maxSeenHwmHeadDigest || '';
+      } else if (raw.maxSeenHwmHeadIndex === maxHwmIdx && maxHwmIdx >= 0) {
+        if (raw.maxSeenHwmHeadDigest && maxHwmDigest && raw.maxSeenHwmHeadDigest !== maxHwmDigest) {
+          throw new Error(`[MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Persistent witness divergence at index ${maxHwmIdx} in ${filePath}`);
+        }
+        if (!maxHwmDigest && raw.maxSeenHwmHeadDigest) {
+          maxHwmDigest = raw.maxSeenHwmHeadDigest;
         }
       }
     }
@@ -2351,8 +2438,27 @@ export function getMonotonicWitness(dir, options = {}) {
   // Read external witness from options
   const externalWitness = options.externalMonotonicWitness;
   if (externalWitness && typeof externalWitness === 'object') {
-    if (typeof externalWitness.minRegistryVersion === 'number' && externalWitness.minRegistryVersion > maxRegVer) {
-      maxRegVer = externalWitness.minRegistryVersion;
+    if (typeof externalWitness.minRegistryVersion === 'number') {
+      if (externalWitness.minRegistryVersion > maxRegVer) {
+        maxRegVer = externalWitness.minRegistryVersion;
+        if (typeof externalWitness.minRegistryDigest === 'string') {
+          maxRegDigest = externalWitness.minRegistryDigest;
+        }
+      } else if (externalWitness.minRegistryVersion === maxRegVer) {
+        if (externalWitness.minRegistryDigest && maxRegDigest && externalWitness.minRegistryDigest !== maxRegDigest) {
+          throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] External witness registry digest diverges at version ${maxRegVer}`);
+        }
+      }
+    }
+    if (externalWitness.registryDigests && typeof externalWitness.registryDigests === 'object') {
+      for (const [v, d] of Object.entries(externalWitness.registryDigests)) {
+        if (typeof d === 'string') {
+          if (registryDigestsMap[v] && registryDigestsMap[v] !== d) {
+            throw new Error(`[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] External witness historical registry digest diverges at version ${v}`);
+          }
+          registryDigestsMap[v] = d;
+        }
+      }
     }
     if (typeof externalWitness.minHwmHeadIndex === 'number') {
       if (externalWitness.minHwmHeadIndex > maxHwmIdx) {
@@ -2367,27 +2473,100 @@ export function getMonotonicWitness(dir, options = {}) {
   }
 
   memWitness.maxSeenRegistryVersion = maxRegVer;
+  memWitness.maxSeenRegistryDigest = maxRegDigest;
+  memWitness.registryDigests = registryDigestsMap;
   memWitness.maxSeenHwmHeadIndex = maxHwmIdx;
   memWitness.maxSeenHwmHeadDigest = maxHwmDigest;
   return memWitness;
 }
 
-export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, hwmHeadDigestOrOptions = {}, maybeOptions = {}) {
-  let hwmHeadDigest = null;
-  let options = maybeOptions;
-  if (typeof hwmHeadDigestOrOptions === 'string') {
-    hwmHeadDigest = hwmHeadDigestOrOptions;
-  } else if (hwmHeadDigestOrOptions && typeof hwmHeadDigestOrOptions === 'object') {
-    options = hwmHeadDigestOrOptions;
-    hwmHeadDigest = options.hwmHeadDigest || null;
+function normalizeWitnessCallArgs(arg4, arg5, arg6) {
+  let headDigest = '';
+  let regDigest = '';
+  let options = {};
+
+  if (typeof arg4 === 'string') {
+    headDigest = arg4;
+    if (typeof arg5 === 'string') {
+      regDigest = arg5;
+      if (arg6 && typeof arg6 === 'object') {
+        options = arg6;
+      }
+    } else if (arg5 && typeof arg5 === 'object') {
+      options = arg5;
+      if (typeof options.registryDigest === 'string') regDigest = options.registryDigest;
+      else if (typeof options.candidateRegistryDigest === 'string') regDigest = options.candidateRegistryDigest;
+    }
+  } else if (arg4 === null || arg4 === undefined) {
+    if (typeof arg5 === 'string') {
+      regDigest = arg5;
+      if (arg6 && typeof arg6 === 'object') options = arg6;
+    } else if (arg5 && typeof arg5 === 'object') {
+      options = arg5;
+      if (typeof options.registryDigest === 'string') regDigest = options.registryDigest;
+      else if (typeof options.candidateRegistryDigest === 'string') regDigest = options.candidateRegistryDigest;
+    } else if (arg6 && typeof arg6 === 'object') {
+      options = arg6;
+    }
+  } else if (typeof arg4 === 'object') {
+    options = arg4;
+    if (typeof options.hwmHeadDigest === 'string') headDigest = options.hwmHeadDigest;
+    else if (typeof options.candidateHwmHeadDigest === 'string') headDigest = options.candidateHwmHeadDigest;
+    if (typeof options.registryDigest === 'string') regDigest = options.registryDigest;
+    else if (typeof options.candidateRegistryDigest === 'string') regDigest = options.candidateRegistryDigest;
   }
+
+  if (!headDigest && options) {
+    if (typeof options.hwmHeadDigest === 'string') headDigest = options.hwmHeadDigest;
+    else if (typeof options.candidateHwmHeadDigest === 'string') headDigest = options.candidateHwmHeadDigest;
+  }
+  if (!regDigest && options) {
+    if (typeof options.registryDigest === 'string') regDigest = options.registryDigest;
+    else if (typeof options.candidateRegistryDigest === 'string') regDigest = options.candidateRegistryDigest;
+  }
+
+  return { headDigest: headDigest || '', regDigest: regDigest || '', options: options || {} };
+}
+
+export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, arg4, arg5, arg6) {
+  const { headDigest: hwmHeadDigest, regDigest: registryDigest, options } = normalizeWitnessCallArgs(arg4, arg5, arg6);
 
   const witness = getMonotonicWitness(dir, options);
   let changed = false;
-  if (typeof registryVersion === 'number' && registryVersion > witness.maxSeenRegistryVersion) {
-    witness.maxSeenRegistryVersion = registryVersion;
-    changed = true;
+
+  // R15-B03: Check and update registry version and content commitment
+  if (typeof registryVersion === 'number') {
+    if (registryVersion > witness.maxSeenRegistryVersion) {
+      witness.maxSeenRegistryVersion = registryVersion;
+      witness.maxSeenRegistryDigest = registryDigest || '';
+      changed = true;
+    } else if (registryVersion === witness.maxSeenRegistryVersion) {
+      if (registryDigest && witness.maxSeenRegistryDigest && witness.maxSeenRegistryDigest !== registryDigest) {
+        throw new Error(
+          `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Monotonic witness registry divergence at version ${registryVersion}: existing digest ${witness.maxSeenRegistryDigest} !== candidate digest ${registryDigest}`
+        );
+      }
+      if (!witness.maxSeenRegistryDigest && registryDigest) {
+        witness.maxSeenRegistryDigest = registryDigest;
+        changed = true;
+      }
+    }
+    if (registryDigest) {
+      if (!witness.registryDigests) witness.registryDigests = {};
+      const verKey = String(registryVersion);
+      if (witness.registryDigests[verKey] && witness.registryDigests[verKey] !== registryDigest) {
+        throw new Error(
+          `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Monotonic witness historical registry divergence at version ${registryVersion}: existing digest ${witness.registryDigests[verKey]} !== candidate digest ${registryDigest}`
+        );
+      }
+      if (!witness.registryDigests[verKey]) {
+        witness.registryDigests[verKey] = registryDigest;
+        changed = true;
+      }
+    }
   }
+
+  // R14-B07 & R15-B01: Check and update HWM index and digest
   if (typeof hwmHeadIndex === 'number') {
     if (hwmHeadIndex > witness.maxSeenHwmHeadIndex) {
       witness.maxSeenHwmHeadIndex = hwmHeadIndex;
@@ -2395,7 +2574,9 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, hwmHe
       changed = true;
     } else if (hwmHeadIndex === witness.maxSeenHwmHeadIndex && hwmHeadIndex >= 0) {
       if (hwmHeadDigest && witness.maxSeenHwmHeadDigest && witness.maxSeenHwmHeadDigest !== hwmHeadDigest) {
-        throw new Error(`[MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Monotonic witness divergence at headIndex ${hwmHeadIndex}: existing digest ${witness.maxSeenHwmHeadDigest} !== candidate digest ${hwmHeadDigest}`);
+        throw new Error(
+          `[MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Monotonic witness divergence at headIndex ${hwmHeadIndex}: existing digest ${witness.maxSeenHwmHeadDigest} !== candidate digest ${hwmHeadDigest}`
+        );
       }
       if (!witness.maxSeenHwmHeadDigest && hwmHeadDigest) {
         witness.maxSeenHwmHeadDigest = hwmHeadDigest;
@@ -2413,11 +2594,14 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, hwmHe
         schemaVersion: '1.0.0',
         dir: path.resolve(dir),
         maxSeenRegistryVersion: witness.maxSeenRegistryVersion,
+        maxSeenRegistryDigest: witness.maxSeenRegistryDigest || '',
+        registryDigests: witness.registryDigests || {},
         maxSeenHwmHeadIndex: witness.maxSeenHwmHeadIndex,
         maxSeenHwmHeadDigest: witness.maxSeenHwmHeadDigest || '',
         updatedAt: new Date().toISOString()
       }, null, 2) + '\n';
-      safeWriteFileSync(filePath, payload, options);
+      // R15-B04: Privileged internal write flag to satisfy safe storage confinement
+      safeWriteFileSync(filePath, payload, { ...options, __internalWitnessWrite: true });
     } catch (writeErr) {
       throw new Error(`[STORAGE_DURABILITY_FAILURE] Failed to persist monotonic witness at ${filePath}: ${writeErr.message}`);
     }
@@ -2427,15 +2611,8 @@ export function updateMonotonicWitness(dir, registryVersion, hwmHeadIndex, hwmHe
   writeWitness(systemWitnessFile);
 }
 
-export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, candidateHwmHeadIndex, candidateHwmHeadDigestOrOptions = {}, maybeOptions = {}) {
-  let candidateHwmHeadDigest = null;
-  let options = maybeOptions;
-  if (typeof candidateHwmHeadDigestOrOptions === 'string') {
-    candidateHwmHeadDigest = candidateHwmHeadDigestOrOptions;
-  } else if (candidateHwmHeadDigestOrOptions && typeof candidateHwmHeadDigestOrOptions === 'object') {
-    options = candidateHwmHeadDigestOrOptions;
-    candidateHwmHeadDigest = options.candidateHwmHeadDigest || null;
-  }
+export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, candidateHwmHeadIndex, arg4, arg5, arg6) {
+  const { headDigest: candidateHwmHeadDigest, regDigest: candidateRegistryDigest, options } = normalizeWitnessCallArgs(arg4, arg5, arg6);
 
   const externalWitness = options.externalMonotonicWitness || {};
   const witness = getMonotonicWitness(dir, options);
@@ -2460,7 +2637,31 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
       `[REGISTRY_ROLLBACK_DETECTED] [HIGH_WATER_MARK_ROLLBACK_DETECTED] [MONOTONIC_WITNESS_ROLLBACK_DETECTED] Loaded HWM headIndex (${candidateHwmHeadIndex}) is behind authenticated monotonic witness (${minHwmIdx})`
     );
   }
-  // R14-B07: Check headDigest divergence at same index
+
+  // R15-B03: Check registryDigest divergence at same version
+  if (typeof candidateRegistryVersion === 'number' && candidateRegistryDigest) {
+    if (
+      candidateRegistryVersion === witness.maxSeenRegistryVersion &&
+      witness.maxSeenRegistryDigest &&
+      candidateRegistryDigest !== witness.maxSeenRegistryDigest
+    ) {
+      throw new Error(
+        `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate registry digest (${candidateRegistryDigest}) diverges from monotonic witness registryDigest (${witness.maxSeenRegistryDigest}) at registryVersion ${candidateRegistryVersion}`
+      );
+    }
+    const verKey = String(candidateRegistryVersion);
+    if (
+      witness.registryDigests &&
+      witness.registryDigests[verKey] &&
+      candidateRegistryDigest !== witness.registryDigests[verKey]
+    ) {
+      throw new Error(
+        `[REGISTRY_DIVERGENCE_DETECTED] [MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate registry digest (${candidateRegistryDigest}) diverges from witnessed digest (${witness.registryDigests[verKey]}) for registryVersion ${candidateRegistryVersion}`
+      );
+    }
+  }
+
+  // R14-B07 & R15-B01: Check HWM headDigest divergence at same index
   if (
     typeof candidateHwmHeadIndex === 'number' &&
     candidateHwmHeadIndex === witness.maxSeenHwmHeadIndex &&
@@ -2515,7 +2716,11 @@ export function saveTrustRegistry(registry, options = {}) {
     const saveHwmIdx = typeof registry.revocationHighWaterMark?.headIndex === 'number'
       ? registry.revocationHighWaterMark.headIndex
       : -1;
-    assertMonotonicWitnessFreshness(dir, registry.registryVersion, saveHwmIdx, opts);
+    const saveHwmDigest = typeof registry.revocationHighWaterMark?.headDigest === 'string'
+      ? registry.revocationHighWaterMark.headDigest
+      : '';
+    const saveRegDigest = computeRegistryDigest(registry);
+    assertMonotonicWitnessFreshness(dir, registry.registryVersion, saveHwmIdx, saveHwmDigest, saveRegDigest, opts);
     let priorRegistry = null;
     // Check against existing on-disk registry if present
     if (fs.existsSync(regPath)) {
@@ -2686,8 +2891,15 @@ export function saveTrustRegistry(registry, options = {}) {
     }
     safeWriteFileSync(checkpointPath, JSON.stringify(cpData, null, 2) + '\n', opts);
 
-    // R12-B02: Update monotonic witness on successful save
-    updateMonotonicWitness(dir, registry.registryVersion, registry.revocationHighWaterMark?.headIndex);
+    // R12-B02, R14-B07, R15-B01 & R15-B03: Update monotonic witness on successful save
+    const finalHwmIdx = typeof registry.revocationHighWaterMark?.headIndex === 'number'
+      ? registry.revocationHighWaterMark.headIndex
+      : -1;
+    const finalHwmDigest = typeof registry.revocationHighWaterMark?.headDigest === 'string'
+      ? registry.revocationHighWaterMark.headDigest
+      : '';
+    const finalRegDigest = computeRegistryDigest(registry);
+    updateMonotonicWitness(dir, registry.registryVersion, finalHwmIdx, finalHwmDigest, finalRegDigest, opts);
 
     return {
       success: true,
@@ -2759,10 +2971,13 @@ function doLoadRevocationJournal(options = {}) {
       if (options.failClosed !== false) throw new Error(msg);
       return { valid: false, entries: [], error: msg, count: 0, path: journalPath };
     }
-    // R13-B03: Enforce freshness check even when journal file does not exist
+    // R13-B03, R15-B01 & R15-B03: Enforce freshness check even when journal file does not exist
     const activeHeadIndex = checkpoint ? checkpoint.headIndex : (registryHwm ? registryHwm.headIndex : -1);
+    const activeHeadDigest = checkpoint ? checkpoint.headDigest : (registryHwm ? registryHwm.headDigest : '');
+    const journalRegDigest = trustRegistryLoad.registry ? computeRegistryDigest(trustRegistryLoad.registry) : '';
+    const journalRegVer = trustRegistryLoad.registry ? trustRegistryLoad.registry.registryVersion : undefined;
     try {
-      assertMonotonicWitnessFreshness(dir, undefined, activeHeadIndex, options);
+      assertMonotonicWitnessFreshness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, options);
     } catch (witnessErr) {
       if (options.failClosed !== false) throw witnessErr;
       return { valid: false, entries: [], error: witnessErr.message, count: 0, path: journalPath };
@@ -2776,13 +2991,16 @@ function doLoadRevocationJournal(options = {}) {
 
     if (lines.length === 0) {
       const activeHeadIndex = checkpoint ? checkpoint.headIndex : (registryHwm ? registryHwm.headIndex : -1);
+      const activeHeadDigest = checkpoint ? checkpoint.headDigest : (registryHwm ? registryHwm.headDigest : '');
+      const journalRegDigest = trustRegistryLoad.registry ? computeRegistryDigest(trustRegistryLoad.registry) : '';
+      const journalRegVer = trustRegistryLoad.registry ? trustRegistryLoad.registry.registryVersion : undefined;
       if (activeHeadIndex >= 0) {
         const msg = `[JOURNAL_TRUNCATION_DETECTED] Journal is empty but records exist at headIndex ${activeHeadIndex}`;
         if (options.failClosed !== false) throw new Error(msg);
         return { valid: false, entries: [], error: msg, count: 0, path: journalPath };
       }
       try {
-        assertMonotonicWitnessFreshness(dir, undefined, activeHeadIndex, options);
+        assertMonotonicWitnessFreshness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, options);
       } catch (witnessErr) {
         if (options.failClosed !== false) throw witnessErr;
         return { valid: false, entries: [], error: witnessErr.message, count: 0, path: journalPath };
@@ -2977,10 +3195,13 @@ function doLoadRevocationJournal(options = {}) {
       }
     }
 
-    // R12-B02: Enforce monotonic witness freshness
+    // R12-B02, R14-B07, R15-B01 & R15-B03: Enforce monotonic witness freshness
     const activeHeadIndex = checkpoint ? checkpoint.headIndex : (registryHwm ? registryHwm.headIndex : -1);
-    assertMonotonicWitnessFreshness(dir, undefined, activeHeadIndex, options);
-    updateMonotonicWitness(dir, undefined, activeHeadIndex);
+    const activeHeadDigest = checkpoint ? checkpoint.headDigest : (registryHwm ? registryHwm.headDigest : (entries.length > 0 && activeHeadIndex >= 0 && entries[activeHeadIndex] ? sha256Digest(canonicalJsonStringify(entries[activeHeadIndex])) : ''));
+    const journalRegDigest = trustRegistryLoad.registry ? computeRegistryDigest(trustRegistryLoad.registry) : '';
+    const journalRegVer = trustRegistryLoad.registry ? trustRegistryLoad.registry.registryVersion : undefined;
+    assertMonotonicWitnessFreshness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, options);
+    updateMonotonicWitness(dir, journalRegVer, activeHeadIndex, activeHeadDigest, journalRegDigest, options);
 
     return { valid: true, entries, error: null, count: entries.length, path: journalPath };
   } catch (err) {
@@ -3277,8 +3498,9 @@ export function appendRevocationEntry(entryInput, options = {}) {
       txnData.signature = crypto.sign(null, committedSignPayload, options.signerPrivateKey).toString('hex');
       safeWriteFileSync(txnPath, JSON.stringify(txnData, null, 2) + '\n', options);
 
-      // R14-B05: Update persistent monotonic witness BEFORE unlinking WAL marker
-      updateMonotonicWitness(dir, regObj ? regObj.registryVersion : 1, entryIndex, entryDigest, options);
+      // R14-B05, R15-B01 & R15-B03: Update persistent monotonic witness BEFORE unlinking WAL marker
+      const committedRegDigest = computeRegistryDigest(regObj);
+      updateMonotonicWitness(dir, regObj ? regObj.registryVersion : 1, entryIndex, entryDigest, committedRegDigest, options);
 
       // Successfully committed and witnessed: remove WAL marker
       try {

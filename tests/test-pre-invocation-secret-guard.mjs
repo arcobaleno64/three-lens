@@ -168,3 +168,75 @@ test('PreInvocation Secret Guard - Installation path with spaces executes direct
     fs.rmSync(tempSpaceDir, { recursive: true, force: true });
   }
 });
+
+test('PreInvocation Secret Guard - Tool Continuation Turn (invocationNum > 1 with empty input)', () => {
+  const payload = {
+    conversationId: 'test-continuation',
+    invocationNum: 2,
+    lastUserInput: ''
+  };
+  const response = runHook(JSON.stringify(payload));
+  assert.deepEqual(response, {}, 'Continuation turn with empty lastUserInput must be allowed');
+});
+
+test('PreInvocation Secret Guard - Tool Continuation Turn (initialNumSteps > 0 with empty input)', () => {
+  const payload = {
+    conversationId: 'test-continuation-steps',
+    initialNumSteps: 5,
+    lastUserInput: '   '
+  };
+  const response = runHook(JSON.stringify(payload));
+  assert.deepEqual(response, {}, 'Continuation turn with initialNumSteps > 0 must be allowed');
+});
+
+test('PreInvocation Secret Guard - Subagent Message Ingestion from .system_generated/messages/', async () => {
+  const os = await import('node:os');
+  const fs = await import('node:fs');
+  const tempBase = path.join(os.tmpdir(), `subagent-guard-test-${Date.now()}`);
+  const logsDir = path.join(tempBase, '.system_generated', 'logs');
+  const messagesDir = path.join(tempBase, '.system_generated', 'messages');
+  fs.mkdirSync(logsDir, { recursive: true });
+  fs.mkdirSync(messagesDir, { recursive: true });
+
+  const transcriptPath = path.join(logsDir, 'transcript.jsonl');
+  fs.writeFileSync(transcriptPath, '');
+
+  try {
+    // 1. Clean subagent message: should allow turn
+    const cleanMsg = {
+      id: 'clean-msg-1',
+      recipient: 'subagent-1',
+      sender: 'parent-agent',
+      content: 'You are the REACHABILITY Lens verifier operating under 3lens.'
+    };
+    fs.writeFileSync(path.join(messagesDir, 'clean-msg-1.json'), JSON.stringify(cleanMsg));
+
+    const cleanPayload = {
+      conversationId: 'subagent-1',
+      transcriptPath,
+      lastUserInput: ''
+    };
+    const cleanResponse = runHook(JSON.stringify(cleanPayload));
+    assert.deepEqual(cleanResponse, {}, 'Clean subagent message must be allowed');
+
+    // 2. Secret-bearing subagent message: should detect secret and terminate
+    const secretMsg = {
+      id: 'secret-msg-2',
+      recipient: 'subagent-1',
+      sender: 'parent-agent',
+      content: 'Here is the credential for AWS: AKIAIOSFODNN7EXAMPLE'
+    };
+    fs.writeFileSync(path.join(messagesDir, 'secret-msg-2.json'), JSON.stringify(secretMsg));
+
+    const secretPayload = {
+      conversationId: 'subagent-1',
+      transcriptPath,
+      lastUserInput: ''
+    };
+    const secretResponse = runHook(JSON.stringify(secretPayload));
+    assert.equal(secretResponse.terminationBehavior, 'terminate');
+    assert.ok(secretResponse.injectSteps[0].errorMessage.userMessage.includes('AWS_ACCESS_KEY'));
+  } finally {
+    fs.rmSync(tempBase, { recursive: true, force: true });
+  }
+});
