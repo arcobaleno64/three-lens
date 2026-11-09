@@ -1,15 +1,9 @@
 --- a/evals/oss-corpus/03-json-pointer-prototype-pollution.js
 +++ b/evals/oss-corpus/03-json-pointer-prototype-pollution.js
-@@ -8,2 +8,5 @@
+@@ -9,4 +9,7 @@
    for (let i = 0; i < parts.length - 1; i++) {
      const part = parts[i];
 +    if (part === '__proto__' || part === 'constructor' || part === 'prototype') {
-+      continue; // CVE-2020-7709 official fix
++      continue; // CVE-2020-7709 official fix (PR #34)
 +    }
      if (current[part] === undefined) {
-@@ -14,2 +19,4 @@
-   const last = parts[parts.length - 1];
-+  if (last !== '__proto__' && last !== 'constructor' && last !== 'prototype') {
-   current[last] = value;
-+  }
-   return obj;

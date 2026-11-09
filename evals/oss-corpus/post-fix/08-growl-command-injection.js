@@ -1,6 +1,6 @@
 /**
  * Remediated slice of node-growl (CVE-2017-16042)
- * Fixed in growl 1.10.2 (commit d71177d) by using spawn() with argument array.
+ * Fixed in growl 1.9.3 (commit d71177d5331c9de4658aca62e0ac921f178b0669) by using spawn() with argument array.
  */
 import { spawn } from 'node:child_process';
 
