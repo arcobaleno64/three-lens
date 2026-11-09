@@ -5506,7 +5506,7 @@ test('R20-B01: Journal prefix replacement with higher HWM and valid signatures i
   }), 'utf8');
   curReg.revocationHighWaterMark.signature = crypto.sign(null, hwmSignPayload, rootAuth.privateKey).toString('hex');
   fs.writeFileSync(regPath, JSON.stringify(curReg, null, 2) + '\n', 'utf8');
-  fs.writeFileSync(path.join(tempDir, 'history', 'trust-registry.v1.json'), JSON.stringify(curReg, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(path.join(path.dirname(regPath), 'history', 'trust-registry.v1.json'), JSON.stringify(curReg, null, 2) + '\n', 'utf8');
 
   // Must fail closed with JOURNAL_PREFIX_DIVERGENCE_DETECTED because entry 0 diverges from witnessed digest
   assert.throws(
@@ -5656,7 +5656,7 @@ test('R20-B02: KEY_REVOCATION in journal terminates signer authorization window 
     rootAuth.privateKey
   ).toString('hex');
   fs.writeFileSync(regPath, JSON.stringify(curReg, null, 2) + '\n', 'utf8');
-  fs.writeFileSync(path.join(tempDir, 'history', 'trust-registry.v2.json'), JSON.stringify(curReg, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(path.join(path.dirname(regPath), 'history', 'trust-registry.v2.json'), JSON.stringify(curReg, null, 2) + '\n', 'utf8');
 
   assert.throws(
     () => loadRevocationJournal(opts),
@@ -5749,8 +5749,9 @@ test('R20-B03: COMMITTED transaction cannot be rolled back if witness secondary 
     }), 'utf8'),
     rootAuth.privateKey
   ).toString('hex');
+  const histV1Path = path.join(path.dirname(regPath), 'history', 'trust-registry.v1.json');
   fs.writeFileSync(regPath, JSON.stringify(curReg, null, 2) + '\n', 'utf8');
-  fs.writeFileSync(path.join(tempDir, 'history', 'trust-registry.v1.json'), JSON.stringify(curReg, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(histV1Path, JSON.stringify(curReg, null, 2) + '\n', 'utf8');
 
   const committedWal = {
     txnId: 'tx-r20-b03-committed-witness-failure',
@@ -5761,7 +5762,7 @@ test('R20-B03: COMMITTED transaction cannot be rolled back if witness secondary 
     journalPath,
     checkpointPath: cpPath,
     regPath,
-    histPath: path.join(tempDir, 'history', 'trust-registry.v1.json'),
+    histPath: histV1Path,
     initialJournalSize: lines[0].length + 1,
     initialJournalExisted: true,
     initialJournalSha256: sha256Digest(Buffer.from(lines[0] + '\n')),
