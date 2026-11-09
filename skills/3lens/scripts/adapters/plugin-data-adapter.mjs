@@ -853,13 +853,16 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           continue;
         }
 
-        // R33-B01: If historical update is signed by a delegated key, root status must remain ACTIVE_PINNED_ROOT
+        // R33-B01 & R34-B01: If historical update is signed by a delegated key, root must remain present and ACTIVE_PINNED_ROOT
         if (proof.authorizedBy !== rootId) {
           const rootInPrior = priorVerifiedReg.keys?.find(k => k.keyId === rootId);
           const rootInHist = hReg.keys?.find(k => k.keyId === rootId);
-          if (rootInPrior && rootInPrior.status === 'ACTIVE_PINNED_ROOT' && rootInHist && rootInHist.status !== 'ACTIVE_PINNED_ROOT') {
-            if (options.failClosed !== false) {
-              throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] [DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${proof.authorizedBy}' cannot set sovereign root '${rootId}' to non-active status '${rootInHist.status}'`);
+          if (rootInPrior && rootInPrior.status === 'ACTIVE_PINNED_ROOT') {
+            if (!rootInHist || rootInHist.status !== 'ACTIVE_PINNED_ROOT') {
+              if (options.failClosed !== false) {
+                const cause = !rootInHist ? 'omit sovereign root' : `set sovereign root to non-active status '${rootInHist.status}'`;
+                throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] [DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${proof.authorizedBy}' cannot ${cause} '${rootId}'`);
+              }
             }
           }
         }
@@ -980,13 +983,16 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
 
         const proof = currentRegistry.authorizationProof;
         if (proof && typeof proof.signature === 'string' && typeof proof.authorizedBy === 'string') {
-          // R33-B01: If signer is delegated, root must remain ACTIVE_PINNED_ROOT
+          // R33-B01 & R34-B01: If signer is delegated, root must remain present and ACTIVE_PINNED_ROOT
           if (proof.authorizedBy !== rootId) {
             const rootInPrior = priorVerifiedReg.keys?.find(k => k.keyId === rootId);
             const rootInCur = currentRegistry.keys?.find(k => k.keyId === rootId);
-            if (rootInPrior && rootInPrior.status === 'ACTIVE_PINNED_ROOT' && rootInCur && rootInCur.status !== 'ACTIVE_PINNED_ROOT') {
-              if (options.failClosed !== false) {
-                throw new Error(`[UNTRUSTED_CURRENT_REGISTRY] [DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${proof.authorizedBy}' cannot set sovereign root '${rootId}' to non-active status '${rootInCur.status}'`);
+            if (rootInPrior && rootInPrior.status === 'ACTIVE_PINNED_ROOT') {
+              if (!rootInCur || rootInCur.status !== 'ACTIVE_PINNED_ROOT') {
+                if (options.failClosed !== false) {
+                  const cause = !rootInCur ? 'omit sovereign root' : `set sovereign root to non-active status '${rootInCur.status}'`;
+                  throw new Error(`[UNTRUSTED_CURRENT_REGISTRY] [DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${proof.authorizedBy}' cannot ${cause} '${rootId}'`);
+                }
               }
             }
           }
@@ -2396,40 +2402,52 @@ export function validateTrustRegistry(registry, options = {}) {
     };
   }
 
-  // R31-B01 & R33-B01: Root keyId, PEM, and status binding invariant
-  const rootInPrior = options.priorRegistry?.keys?.find(k => k.keyId === rootId);
-  const isDelegatedUpdate = registry.authorizationProof && registry.authorizationProof.authorizedBy && registry.authorizationProof.authorizedBy !== rootId;
+  // R31-B01 & R32-B01: Root presence and pinning invariant
+  const rootKeyMatches = (registry.keys || []).filter(k => k && k.keyId === rootId);
+  if (registry.registryVersion === 1 && rootKeyMatches.length !== 1) {
+    return {
+      valid: false,
+      error: `[ROOT_KEY_SUBSTITUTION_REJECTED] Genesis root key '${rootId}' must be present exactly once in keys[] (found ${rootKeyMatches.length})`,
+      cryptographicValidity: false,
+      monotonicValidity: true,
+      ancestryContinuity: true
+    };
+  }
+  if (rootKeyMatches.length > 1) {
+    return {
+      valid: false,
+      error: `[ROOT_KEY_SUBSTITUTION_REJECTED] Pinned root key '${rootId}' cannot appear multiple times in keys[] (found ${rootKeyMatches.length})`,
+      cryptographicValidity: false,
+      monotonicValidity: true,
+      ancestryContinuity: true
+    };
+  }
+
+  if (rootKeyMatches.length === 1) {
+    const rootKey = rootKeyMatches[0];
+    if (rootKey.publicKeyPem !== rootPem || rootKey.status === 'REVOKED') {
+      return {
+        valid: false,
+        error: `[ROOT_KEY_SUBSTITUTION_REJECTED] Pinned root key '${rootId}' cannot have modified public key PEM or revoked status in keys[]`,
+        cryptographicValidity: false,
+        monotonicValidity: true,
+        ancestryContinuity: true
+      };
+    }
+
+    if (registry.registryVersion === 1 && rootKey.status !== 'ACTIVE_PINNED_ROOT') {
+      return {
+        valid: false,
+        error: `[ROOT_KEY_SUBSTITUTION_REJECTED] Genesis root key '${rootId}' must have status ACTIVE_PINNED_ROOT`,
+        cryptographicValidity: false,
+        monotonicValidity: true,
+        ancestryContinuity: true
+      };
+    }
+  }
 
   for (const k of registry.keys) {
-    if (k && k.keyId === rootId) {
-      if (k.publicKeyPem !== rootPem || k.status === 'REVOKED') {
-        return {
-          valid: false,
-          error: `[ROOT_KEY_SUBSTITUTION_REJECTED] Pinned root key '${rootId}' cannot have modified public key PEM or revoked status in keys[]`,
-          cryptographicValidity: false,
-          monotonicValidity: true,
-          ancestryContinuity: true
-        };
-      }
-      if (registry.registryVersion === 1 && k.status !== 'ACTIVE_PINNED_ROOT') {
-        return {
-          valid: false,
-          error: `[ROOT_KEY_SUBSTITUTION_REJECTED] Genesis root key '${rootId}' must have status ACTIVE_PINNED_ROOT`,
-          cryptographicValidity: false,
-          monotonicValidity: true,
-          ancestryContinuity: true
-        };
-      }
-      if (isDelegatedUpdate && rootInPrior && rootInPrior.status === 'ACTIVE_PINNED_ROOT' && k.status !== 'ACTIVE_PINNED_ROOT') {
-        return {
-          valid: false,
-          error: `[DELEGATED_ROOT_MUTATION_REJECTED] Delegated authorization by '${registry.authorizationProof.authorizedBy}' cannot set sovereign root '${rootId}' to '${k.status}'; root status must remain ACTIVE_PINNED_ROOT`,
-          cryptographicValidity: false,
-          monotonicValidity: true,
-          ancestryContinuity: true
-        };
-      }
-    } else if (k && k.keyId !== rootId) {
+    if (k && k.keyId !== rootId) {
       if (k.status === 'ACTIVE_PINNED_ROOT' || k.publicKeyPem === rootPem) {
         return {
           valid: false,
@@ -2935,6 +2953,24 @@ export function validateTrustRegistry(registry, options = {}) {
         };
       }
       signerPem = priorKey.publicKeyPem;
+
+      // R33-B01 & R34-B01: Delegated key cannot omit sovereign Root or mutate Root away from ACTIVE_PINNED_ROOT
+      if (proof.authorizedBy !== rootId) {
+        const rootInPrior = priorReg.keys?.find(k => k.keyId === rootId);
+        if (rootInPrior && rootInPrior.status === 'ACTIVE_PINNED_ROOT') {
+          const rootInCur = registry.keys?.find(k => k.keyId === rootId);
+          if (!rootInCur || rootInCur.status !== 'ACTIVE_PINNED_ROOT') {
+            const cause = !rootInCur ? 'omit sovereign root' : `set sovereign root to non-active status '${rootInCur.status}'`;
+            return {
+              valid: false,
+              error: `[DELEGATED_ROOT_MUTATION_REJECTED] Delegated authorization by '${proof.authorizedBy}' cannot ${cause} '${rootId}'; root status must remain ACTIVE_PINNED_ROOT`,
+              cryptographicValidity: false,
+              monotonicValidity: true,
+              ancestryContinuity: true
+            };
+          }
+        }
+      }
     } else if (registry.registryVersion === 2 && proof.authorizedBy === expectedRootId) {
       signerPem = expectedRootPem;
     }
@@ -4478,7 +4514,7 @@ export function saveTrustRegistry(registry, options = {}) {
       }
     }
 
-    let priorRegistry = null;
+    let priorRegistry = options.priorRegistry || null;
     // Check against existing on-disk registry if present
     if (fs.existsSync(regPath)) {
       try {

@@ -7227,7 +7227,47 @@ test('PLUGIN_DATA Governance: R33-B01 - Delegated signer cannot mutate or retire
   assert.strictEqual(valResult.valid, false);
   assert.match(valResult.error, /\[DELEGATED_ROOT_MUTATION_REJECTED\]/);
 
-  // Scenario 4: Sovereign Root can still issue emergency revocations even when delegated key is active
+  // Scenario 4 (R34-B01): External forged v3 with valid Ed25519 signature by delegated key K omitting Root entirely
+  const forgedV3OmitRoot = {
+    ...v2,
+    registryVersion: 3,
+    keys: v2.keys.filter(k => k.keyId !== rootAuth.keyId)
+  };
+  forgedV3OmitRoot.authorizationProof = {
+    authorizedBy: delegatedK.keyId,
+    signature: crypto.sign(
+      null,
+      Buffer.from(computeRegistryAuthorizationPayload(forgedV3OmitRoot), 'utf8'),
+      delegatedK.privateKey
+    ).toString('hex'),
+    timestamp: new Date().toISOString()
+  };
+
+  // 1. validateTrustRegistry rejects with DELEGATED_ROOT_MUTATION_REJECTED
+  const valResultOmit = validateTrustRegistry(forgedV3OmitRoot, {
+    ...opts,
+    priorRegistry: v2
+  });
+  assert.strictEqual(valResultOmit.valid, false);
+  assert.match(valResultOmit.error, /\[DELEGATED_ROOT_MUTATION_REJECTED\]/);
+
+  // 2. saveTrustRegistry rejects with DELEGATED_ROOT_MUTATION_REJECTED
+  assert.throws(
+    () => saveTrustRegistry(forgedV3OmitRoot, { ...opts, priorRegistry: v2 }),
+    /\[DELEGATED_ROOT_MUTATION_REJECTED\]/
+  );
+
+  // 3. loadTrustRegistry rejects if malicious file is placed directly
+  const forgedV3Path = getTrustRegistryPath(opts);
+  fs.writeFileSync(forgedV3Path, JSON.stringify(forgedV3OmitRoot, null, 2), 'utf8');
+  assert.throws(
+    () => loadTrustRegistry({ ...opts, failClosed: true }),
+    /\[DELEGATED_ROOT_MUTATION_REJECTED\]/
+  );
+  // Restore v2 on disk
+  fs.writeFileSync(forgedV3Path, JSON.stringify(v2, null, 2) + '\n', 'utf8');
+
+  // Scenario 5: Sovereign Root can still issue emergency revocations even when delegated key is active
   const revRes = appendRevocationEntry(
     { revocationType: REVOCATION_TYPES.KEY_REVOCATION, targetId: delegatedK.keyId, reason: 'EMERGENCY_DELEGATE_REVOCATION' },
     { ...opts, signerKeyId: rootAuth.keyId, signerPrivateKey: rootAuth.privateKey }
