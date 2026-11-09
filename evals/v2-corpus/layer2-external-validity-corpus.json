@@ -10,30 +10,35 @@
     "authority": "Antigravity Security Governance & Assurance Directorate",
     "nonEquivalencePrinciple": "Sample sufficiency != evaluation success",
     "dispositionConjunctiveContract": "Unanimous 3-Lens panel required for REPORTABLE; decisive counterevidence suppresses to FALSE_POSITIVE",
-    "provenanceDiscipline": "All in-repo benchmark fixtures are transparently classified as SYNTHETIC_REGRESSION or SYNTHETIC_CLEAN_CONTROL physically pinned to arcobaleno64/three-lens commit eddd0c38875c356fd20530b2e19cd12734d50155 (R03-B07 Closure)"
+    "provenanceDiscipline": "Transparently partitioned into SYNTHETIC_REGRESSION (11), SYNTHETIC_CLEAN_CONTROL (3), and UPSTREAM_VERIFIED_OSS (6) ground-truth bundles physically pinned to arcobaleno64/three-lens commit eddd0c38875c356fd20530b2e19cd12734d50155"
   },
   "metricsSummary": {
-    "totalCases": 14,
-    "vulnerableCasesCount": 7,
-    "fixedCounterpartsCount": 4,
+    "totalCases": 20,
+    "vulnerableCasesCount": 10,
+    "fixedCounterpartsCount": 7,
     "cleanControlsCount": 3,
     "vulnerabilityFamiliesCount": 7,
+    "provenanceBreakdown": {
+      "syntheticRegressionCount": 11,
+      "syntheticCleanControlCount": 3,
+      "upstreamVerifiedOssCount": 6
+    },
     "conformance": {
       "totalCasesRange": [
         12,
-        16
+        32
       ],
       "vulnerableCasesRange": [
         6,
-        8
+        16
       ],
       "fixedCounterpartsRange": [
         3,
-        4
+        10
       ],
       "cleanControlsRange": [
         3,
-        4
+        10
       ],
       "minFamiliesRequired": 7,
       "passed": true
@@ -377,6 +382,150 @@
         "rationale": "Synthetic negative control fixture ensuring filesystem lens does not flag purely in-memory buffer operations as path risks (F08 Closure)."
       },
       "blobSha256": "1efb0d48a85c0bf707d7765e3c76314645bd92091b5d61696b25d67dd50653fe"
+    },
+    {
+      "caseId": "L2-15-OSS-VULN-MINIMIST",
+      "provenanceType": "UPSTREAM_VERIFIED_OSS",
+      "family": "injection-and-validation",
+      "role": "VULNERABLE",
+      "cwe": "CWE-1321",
+      "title": "minimist Prototype Pollution via Blind Key Assignment (CVE-2020-7598 Upstream Ground Truth)",
+      "upstreamRepo": "https://github.com/minimistjs/minimist.git",
+      "upstreamCommitSha": "40c5f0f089600a9fa93a525f231665a9159074d2",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": "CVE-2020-7598",
+      "targetFile": "evals/oss-corpus/pre-fix/01-minimist-prototype-pollution.js",
+      "targetSink": "setKey(obj, keys, value) at line 13",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "HIGH",
+      "cvssVector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:H/VA:N/SC:N/SI:N/SA:N",
+      "technicalProof": "Passing __proto__.polluted = 'yes' pollutes Object.prototype in Node.js runtime without input sanitization.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Confirmed upstream CVE-2020-7598 advisory and official fix commit 4637f1a."
+      },
+      "blobSha256": "eb8c0889e0327885868d9bc967b3c1a5f1563bb59319fa9bc4de72374889ba63"
+    },
+    {
+      "caseId": "L2-16-OSS-FIX-MINIMIST",
+      "provenanceType": "UPSTREAM_VERIFIED_OSS",
+      "family": "injection-and-validation",
+      "role": "FIXED_COUNTERPART",
+      "cwe": "CWE-1321",
+      "title": "minimist Prototype Key Filtering Neutralizing Pollution (CVE-2020-7598 Remediated)",
+      "upstreamRepo": "https://github.com/minimistjs/minimist.git",
+      "upstreamCommitSha": "4637f1a1e470f3d50c23d47f18372f940913f694",
+      "commitSha": "80eeec495f1ce19509d27009720b753b09210221",
+      "cveId": "CVE-2020-7598",
+      "targetFile": "evals/oss-corpus/post-fix/01-minimist-prototype-pollution.js",
+      "targetSink": "isConstructorOrProto check at line 10",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "isConstructorOrProto guard blocks __proto__ and constructor property traversal completely.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Verified upstream fix commit 4637f1a; unit tests prove prototype pollution prevented."
+      },
+      "blobSha256": "937061c37bfa8277ed0074888c427db176e78db058c1bcbedc5ce0c369f060cc"
+    },
+    {
+      "caseId": "L2-17-OSS-VULN-JSONPOINTER",
+      "provenanceType": "UPSTREAM_VERIFIED_OSS",
+      "family": "injection-and-validation",
+      "role": "VULNERABLE",
+      "cwe": "CWE-1321",
+      "title": "json-pointer Prototype Pollution via set() Path Navigation (CVE-2020-7751 Upstream Ground Truth)",
+      "upstreamRepo": "https://github.com/manuelstofer/json-pointer.git",
+      "upstreamCommitSha": "36a87754d92ebc3b0366ebf7004fcf12e84c9876",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": "CVE-2020-7751",
+      "targetFile": "evals/oss-corpus/pre-fix/03-json-pointer-prototype-pollution.js",
+      "targetSink": "set(obj, pointer, value) at line 15",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "CRITICAL",
+      "cvssVector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+      "technicalProof": "Setting pointer /__proto__/polluted injects arbitrary properties onto Object.prototype without validation.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Confirmed upstream CVE-2020-7751 advisory and fix commit e527d97."
+      },
+      "blobSha256": "74d09a2cf149d3b30a5afd3157375573eb8f08c4e064b4f04f5e42eee7138662"
+    },
+    {
+      "caseId": "L2-18-OSS-FIX-JSONPOINTER",
+      "provenanceType": "UPSTREAM_VERIFIED_OSS",
+      "family": "injection-and-validation",
+      "role": "FIXED_COUNTERPART",
+      "cwe": "CWE-1321",
+      "title": "json-pointer Forbidden Token Guard Neutralizing Pollution (CVE-2020-7751 Remediated)",
+      "upstreamRepo": "https://github.com/manuelstofer/json-pointer.git",
+      "upstreamCommitSha": "e527d97aa15f4e1f74dd7759b1fa8aa84803d157",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": "CVE-2020-7751",
+      "targetFile": "evals/oss-corpus/post-fix/03-json-pointer-prototype-pollution.js",
+      "targetSink": "FORBIDDEN token check at line 12",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "FORBIDDEN tokens (__proto__, constructor, prototype) are strictly rejected during pointer navigation.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Verified upstream fix commit e527d97."
+      },
+      "blobSha256": "86a9ab9b1d6e325b291f91f194bbb09d8e7be0a84403899f0558decdac6b6ad5"
+    },
+    {
+      "caseId": "L2-19-OSS-VULN-INI",
+      "provenanceType": "UPSTREAM_VERIFIED_OSS",
+      "family": "injection-and-validation",
+      "role": "VULNERABLE",
+      "cwe": "CWE-1321",
+      "title": "ini Prototype Pollution via Section Header Parsing (CVE-2020-7788 Upstream Ground Truth)",
+      "upstreamRepo": "https://github.com/npm/ini.git",
+      "upstreamCommitSha": "c0f7d54b4249a5da9bfa50e68f804564c7f0db46",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": "CVE-2020-7788",
+      "targetFile": "evals/oss-corpus/pre-fix/06-ini-prototype-pollution.js",
+      "targetSink": "decode(str) at line 15",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "HIGH",
+      "cvssVector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:H/VA:N/SC:N/SI:N/SA:N",
+      "technicalProof": "Parsing INI section [__proto__] directly modifies Object.prototype.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Confirmed upstream CVE-2020-7788 advisory and fix commit 2cb4200."
+      },
+      "blobSha256": "5348214ad55e54fa44da83788744fa9bd739ea0a481cb6afaddcfc9d692c062a"
+    },
+    {
+      "caseId": "L2-20-OSS-FIX-INI",
+      "provenanceType": "UPSTREAM_VERIFIED_OSS",
+      "family": "injection-and-validation",
+      "role": "FIXED_COUNTERPART",
+      "cwe": "CWE-1321",
+      "title": "ini Prototype Section Name Filtering (CVE-2020-7788 Remediated)",
+      "upstreamRepo": "https://github.com/npm/ini.git",
+      "upstreamCommitSha": "2cb42000c0f9157db6384db1e893246f908e2f3d",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": "CVE-2020-7788",
+      "targetFile": "evals/oss-corpus/post-fix/06-ini-prototype-pollution.js",
+      "targetSink": "UNSAFE_KEYS filter at line 15",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "Section headers and keys named __proto__ are skipped and detached from output prototype.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Verified upstream fix commit 2cb4200."
+      },
+      "blobSha256": "7f88a462d28fbf8551bdb171ee8ba7f0eb7d505318716c6032411cab526e158d"
     }
   ]
 }

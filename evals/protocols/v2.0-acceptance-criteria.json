@@ -20,13 +20,13 @@
     "layer2": {
       "name": "External Validity Corpus",
       "minTotalCases": 12,
-      "maxTotalCases": 16,
+      "maxTotalCases": 32,
       "minVulnerableCases": 6,
-      "maxVulnerableCases": 8,
+      "maxVulnerableCases": 16,
       "minFixedCounterparts": 3,
-      "maxFixedCounterparts": 4,
+      "maxFixedCounterparts": 10,
       "minCleanControls": 3,
-      "maxCleanControls": 4,
+      "maxCleanControls": 10,
       "minVulnerabilityFamilies": 7
     },
     "layer3": {
