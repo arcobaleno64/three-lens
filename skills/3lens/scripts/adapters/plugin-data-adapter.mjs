@@ -661,27 +661,15 @@ export function recoverAbortedRevocationTransaction(options = {}) {
 function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
   const trustedKeys = new Map();
   const maxActiveIndexPerKey = new Map();
-  const curRevokedSet = new Set(
-    Array.isArray(currentRegistry?.revokedKeyIds) ? currentRegistry.revokedKeyIds : []
-  );
 
-  if (currentRegistry && Array.isArray(currentRegistry.keys)) {
-    for (const k of currentRegistry.keys) {
-      if (k && k.keyId && k.publicKeyPem) {
-        const isRevokedInCur = curRevokedSet.has(k.keyId) || k.status === 'REVOKED';
-        if (!isRevokedInCur && (k.status === 'ACTIVE_PINNED_ROOT' || k.status === 'ACTIVE')) {
-          trustedKeys.set(k.keyId, k.publicKeyPem);
-          maxActiveIndexPerKey.set(k.keyId, Infinity);
-        } else if (isRevokedInCur || k.status === 'RETIRED') {
-          trustedKeys.set(k.keyId, k.publicKeyPem);
-          maxActiveIndexPerKey.set(k.keyId, -1);
-        }
-      }
-    }
-  }
+  let rootId = options.trustedRootKeyId || null;
+  let rootPem = options.trustedRootPublicKeyPem || null;
 
   let hasHistoryFiles = false;
+  let priorVerifiedReg = null;
   const histDir = path.join(dir, 'history');
+
+  // Step 1: Process and authenticate historical registry files in history/
   if (fs.existsSync(histDir)) {
     const histFiles = fs.readdirSync(histDir).filter(f => /^trust-registry\.v(\d+)\.json$/.test(f));
     histFiles.sort((a, b) => {
@@ -690,12 +678,10 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
       return vA - vB;
     });
 
-    let priorVerifiedReg = null;
-    const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
-    const rootPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
-
     for (const hf of histFiles) {
       hasHistoryFiles = true;
+      const fileVersion = parseInt(hf.match(/^trust-registry\.v(\d+)\.json$/)[1], 10);
+
       let hReg = null;
       try {
         hReg = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
@@ -706,17 +692,53 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
         continue;
       }
 
-      // R25-B02: Authenticate historical registry against Root / priorRegistry before trusting its keys
-      if (hReg.registryVersion === 1) {
-        const rootKey = hReg.keys?.find(k => k.keyId === rootId && k.status === 'ACTIVE_PINNED_ROOT');
-        if (!rootKey || rootKey.publicKeyPem !== rootPem) {
+      // R26-B01 (Gap B): Enforce exact file version binding
+      if (hReg.registryVersion !== fileVersion) {
+        if (options.failClosed !== false) {
+          throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] Historical registry filename version (${fileVersion}) diverges from payload registryVersion (${hReg.registryVersion})`);
+        }
+        continue;
+      }
+
+      // R26-B01 (Gap A & C): Enforce strict Genesis and monotonic version progression
+      if (priorVerifiedReg === null) {
+        // Must be strictly version 1 Genesis
+        if (hReg.registryVersion !== 1) {
+          if (options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] First historical registry must be Genesis v1 (found v${hReg.registryVersion} in ${hf})`);
+          }
+          continue;
+        }
+
+        // R26-B01 (Gap A): Strict Genesis validation matching validateTrustRegistry:
+        // keys array must contain strictly 1 key with status ACTIVE_PINNED_ROOT.
+        if (!Array.isArray(hReg.keys) || hReg.keys.length !== 1 || hReg.keys[0].status !== 'ACTIVE_PINNED_ROOT') {
+          if (options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] [GENESIS_ROGUE_KEY_DETECTED] Historical genesis v1 in ${hf} must contain strictly 1 key with status ACTIVE_PINNED_ROOT`);
+          }
+          continue;
+        }
+        const rootKey = hReg.keys[0];
+        if (rootId && (rootKey.keyId !== rootId || rootKey.publicKeyPem !== rootPem)) {
           if (options.failClosed !== false) {
             throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] Historical genesis v1 in ${hf} is not authorized by trusted root key`);
           }
           continue;
         }
+        if (!rootId) {
+          rootId = rootKey.keyId;
+          rootPem = rootKey.publicKeyPem;
+        }
         priorVerifiedReg = hReg;
-      } else if (priorVerifiedReg && hReg.registryVersion === priorVerifiedReg.registryVersion + 1) {
+      } else {
+        // Subsequent version must strictly increment by 1
+        if (hReg.registryVersion !== priorVerifiedReg.registryVersion + 1) {
+          if (options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] Historical registry ${hf} has broken version ancestry (expected v${priorVerifiedReg.registryVersion + 1}, found v${hReg.registryVersion})`);
+          }
+          continue;
+        }
+
         const proof = hReg.authorizationProof;
         if (!proof || typeof proof.signature !== 'string' || typeof proof.authorizedBy !== 'string') {
           if (options.failClosed !== false) {
@@ -742,13 +764,9 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           continue;
         }
         priorVerifiedReg = hReg;
-      } else {
-        if (options.failClosed !== false) {
-          throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] Historical registry ${hf} has broken version ancestry (expected ${priorVerifiedReg ? priorVerifiedReg.registryVersion + 1 : 1})`);
-        }
-        continue;
       }
 
+      // Accumulate trusted keys from authenticated historical registry
       const hHwmIdx = typeof hReg?.revocationHighWaterMark?.headIndex === 'number'
         ? hReg.revocationHighWaterMark.headIndex
         : -1;
@@ -771,14 +789,114 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
     }
   }
 
-  // R18-B01 & R18-B04: Genesis root fallback is permitted ONLY in pure Genesis Bootstrap
-  // (no current on-disk registry and no historical registry progression).
+  // Step 2: R26-B02 - Authenticate currentRegistry before trusting its keys
+  if (currentRegistry && Array.isArray(currentRegistry.keys)) {
+    let currentRegAuthenticated = false;
+
+    if (priorVerifiedReg) {
+      // If historical progression exists:
+      if (currentRegistry.registryVersion <= priorVerifiedReg.registryVersion) {
+        // Version exists in historical progression: check against that version's historical registry
+        let histTarget = null;
+        if (currentRegistry.registryVersion === priorVerifiedReg.registryVersion) {
+          histTarget = priorVerifiedReg;
+        } else {
+          const targetHistPath = path.join(histDir, `trust-registry.v${currentRegistry.registryVersion}.json`);
+          if (fs.existsSync(targetHistPath)) {
+            try {
+              histTarget = JSON.parse(fs.readFileSync(targetHistPath, 'utf8'));
+            } catch (_) {}
+          }
+        }
+        if (histTarget) {
+          const curDigest = computeRegistryNonHwmDigest(currentRegistry);
+          const histDigest = computeRegistryNonHwmDigest(histTarget);
+          if (curDigest === histDigest) {
+            currentRegAuthenticated = true;
+          }
+        }
+      } else if (currentRegistry.registryVersion === priorVerifiedReg.registryVersion + 1) {
+        // Next version after history: must have valid authorizationProof from priorVerifiedReg
+        const proof = currentRegistry.authorizationProof;
+        if (proof && typeof proof.signature === 'string' && typeof proof.authorizedBy === 'string') {
+          const signerInPrior = priorVerifiedReg.keys?.find(
+            k => k.keyId === proof.authorizedBy && ['ACTIVE_PINNED_ROOT', 'ACTIVE'].includes(k.status)
+          );
+          if (signerInPrior) {
+            const payload = Buffer.from(computeRegistryAuthorizationPayload(currentRegistry), 'utf8');
+            if (crypto.verify(null, payload, signerInPrior.publicKeyPem, Buffer.from(proof.signature, 'hex'))) {
+              currentRegAuthenticated = true;
+            }
+          }
+        }
+      }
+    } else if (!hasHistoryFiles) {
+      const journalPath = path.join(dir, '.irv-revocation-journal.jsonl');
+      const hasJournalOnDisk = fs.existsSync(journalPath);
+
+      if (!hasJournalOnDisk) {
+        currentRegAuthenticated = true;
+      } else {
+        const effectiveRootId = rootId || options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
+        const effectiveRootPem = rootPem || options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
+
+        if (currentRegistry.registryVersion === 1) {
+          // Must be strict Genesis: keys.length === 1 and status ACTIVE_PINNED_ROOT
+          if (Array.isArray(currentRegistry.keys) && currentRegistry.keys.length === 1 && currentRegistry.keys[0].status === 'ACTIVE_PINNED_ROOT') {
+            const rootKey = currentRegistry.keys[0];
+            if (!rootId || (rootKey.keyId === effectiveRootId && rootKey.publicKeyPem === effectiveRootPem)) {
+              currentRegAuthenticated = true;
+            }
+          }
+          if (!currentRegAuthenticated && options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_CURRENT_REGISTRY] [GENESIS_ROGUE_KEY_DETECTED] Clean-slate current Genesis registry contains unauthenticated or rogue keys`);
+          }
+        } else if (currentRegistry.registryVersion === 2 && options.allowEmbeddedFallback !== false) {
+          // v2 with embedded root fallback:
+          const proof = currentRegistry.authorizationProof;
+          if (proof && proof.authorizedBy === effectiveRootId && typeof proof.signature === 'string') {
+            const payload = Buffer.from(computeRegistryAuthorizationPayload(currentRegistry), 'utf8');
+            if (crypto.verify(null, payload, effectiveRootPem, Buffer.from(proof.signature, 'hex'))) {
+              currentRegAuthenticated = true;
+            }
+          }
+          if (!currentRegAuthenticated && options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_CURRENT_REGISTRY] Clean-slate v2 current registry lacks valid authorization from trusted root`);
+          }
+        } else if (options.failClosed !== false) {
+          throw new Error(`[UNTRUSTED_CURRENT_REGISTRY] Current registry version ${currentRegistry.registryVersion} has no historical ancestry and cannot be authenticated`);
+        }
+      }
+    }
+
+    if (currentRegAuthenticated) {
+      const curRevokedSet = new Set(
+        Array.isArray(currentRegistry.revokedKeyIds) ? currentRegistry.revokedKeyIds : []
+      );
+      for (const k of currentRegistry.keys) {
+        if (k && k.keyId && k.publicKeyPem) {
+          const isRevokedInCur = curRevokedSet.has(k.keyId) || k.status === 'REVOKED';
+          if (!isRevokedInCur && (k.status === 'ACTIVE_PINNED_ROOT' || k.status === 'ACTIVE')) {
+            trustedKeys.set(k.keyId, k.publicKeyPem);
+            maxActiveIndexPerKey.set(k.keyId, Infinity);
+          } else if (isRevokedInCur || k.status === 'RETIRED') {
+            trustedKeys.set(k.keyId, k.publicKeyPem);
+            if (!maxActiveIndexPerKey.has(k.keyId) || maxActiveIndexPerKey.get(k.keyId) === Infinity) {
+              maxActiveIndexPerKey.set(k.keyId, -1);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Step 3: Pure Genesis Bootstrap fallback when neither current nor history exists
   if (!currentRegistry && !hasHistoryFiles) {
-    const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
-    const rootPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
-    if (!trustedKeys.has(rootId)) {
-      trustedKeys.set(rootId, rootPem);
-      maxActiveIndexPerKey.set(rootId, Infinity);
+    const effectiveRootId = rootId || options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
+    const effectiveRootPem = rootPem || options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
+    if (!trustedKeys.has(effectiveRootId)) {
+      trustedKeys.set(effectiveRootId, effectiveRootPem);
+      maxActiveIndexPerKey.set(effectiveRootId, Infinity);
     }
   }
 
@@ -1551,13 +1669,14 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
     throw new Error(`[WITNESS_READ_FAILURE] Failed to read monotonic witness for '${dir}': ${wErr.message}`);
   }
 
-  // 3b. Caller-supplied candidate HWM (R25-B01: enforces candidate boundary)
+  // 3b. Caller-supplied candidate HWM (R25-B01 & R26: enforces candidate boundary under Default-Deny)
   if (options.candidateHwm && typeof options.candidateHwm === 'object') {
     if (typeof options.candidateHwm.headIndex === 'number' && options.candidateHwm.headIndex >= 0) {
-      expectedMinHeadIndex = Math.max(expectedMinHeadIndex, options.candidateHwm.headIndex);
-      if (typeof options.candidateHwm.headDigest === 'string' && options.candidateHwm.headDigest) {
-        physicalAnchors.push({ headIndex: options.candidateHwm.headIndex, headDigest: options.candidateHwm.headDigest, source: 'candidateHwm' });
+      if (typeof options.candidateHwm.headDigest !== 'string' || !/^[0-9a-f]{64}$/i.test(options.candidateHwm.headDigest)) {
+        throw new Error(`[MALFORMED_CANDIDATE_HWM] candidateHwm specifies headIndex ${options.candidateHwm.headIndex} but lacks valid 64-hex headDigest`);
       }
+      expectedMinHeadIndex = Math.max(expectedMinHeadIndex, options.candidateHwm.headIndex);
+      physicalAnchors.push({ headIndex: options.candidateHwm.headIndex, headDigest: options.candidateHwm.headDigest, source: 'candidateHwm' });
     }
   }
 
@@ -1586,6 +1705,10 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
     }
   }
 
+  // R24-B01 & R26-B01/B02: Resolve trusted keys and active signing windows for cryptographic signature verification
+  const activeRegForKeys = options.registry || onDiskRegForKeys;
+  const { trustedKeys, maxActiveIndexPerKey } = resolveJournalTrustedKeyWindows(dir, activeRegForKeys, options);
+
   // Now inspect the journal file
   if (!fs.existsSync(journalPath)) {
     if (expectedMinHeadIndex >= 0) {
@@ -1610,10 +1733,6 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
     }
     return revokedMap;
   }
-
-  // R24-B01: Resolve trusted keys and active signing windows for cryptographic signature verification
-  const activeRegForKeys = options.registry || onDiskRegForKeys;
-  const { trustedKeys, maxActiveIndexPerKey } = resolveJournalTrustedKeyWindows(dir, activeRegForKeys, options);
 
   let expectedPrevDigest = '0'.repeat(64);
   const computedDigests = [];
@@ -2036,11 +2155,11 @@ export function validateTrustRegistry(registry, options = {}) {
   }
 
   let journalRevoked = new Map();
-  if (registryDir && options.skipJournalRevocationCheck !== true) {
+  if (registryDir && options.skipJournalRevocationCheck !== true && options.isHistorical !== true) {
     try {
       journalRevoked = getJournalRevokedKeyMap(registryDir, {
         ...options,
-        registry,
+        registry: null,
         candidateHwm: registry.revocationHighWaterMark
       });
     } catch (jErr) {
@@ -2367,7 +2486,16 @@ export function validateTrustRegistry(registry, options = {}) {
       // R13-B06: Resolve prior of prior for multi-generation chains
       let priorOfPrior = null;
       if (priorReg.registryVersion === 2) {
-        priorOfPrior = {
+        let diskV1 = null;
+        try {
+          const dir = resolvePluginDataDir(options);
+          const v1Path = path.join(dir, 'history', 'trust-registry.v1.json');
+          if (fs.existsSync(v1Path)) {
+            diskV1 = JSON.parse(fs.readFileSync(v1Path, 'utf8'));
+          }
+        } catch (_) {}
+
+        priorOfPrior = diskV1 || {
           schemaVersion: '1.0.0',
           registryVersion: 1,
           authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',

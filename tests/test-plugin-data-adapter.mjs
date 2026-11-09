@@ -6612,3 +6612,147 @@ test('R25-B01 & R25-B02: Monotonic witness storage path alignment and unauthenti
 
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
+
+test('R26-B01 & R26-B02: Strict Genesis key confinement, filename version binding, current registry unauthenticated signer rejection, and cold-start rollback recovery', () => {
+  const tempDir = createTempDir('r26-security-gates-');
+  const rootAuth = generateTestAuthority();
+  const rogueAuth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: rootAuth.keyId,
+    trustedRootPublicKeyPem: rootAuth.pem,
+    trustedRootFingerprint: rootAuth.fp,
+    signerPrivateKey: rootAuth.privateKey,
+    signerKeyId: rootAuth.keyId
+  };
+
+  const histDir = path.join(tempDir, 'history');
+  fs.mkdirSync(histDir, { recursive: true });
+
+  // 1. Negative Test A (R26-B01 Gap A): Forged Genesis v1 containing rogue key in addition to Root
+  const forgedGenesisV1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: new Date().toISOString() },
+      { keyId: rogueAuth.keyId, keyFingerprint: rogueAuth.fp, publicKeyPem: rogueAuth.pem, status: 'ACTIVE', issuedAt: new Date().toISOString() }
+    ],
+    revokedKeyIds: [],
+    revocationHighWaterMark: { headIndex: -1 }
+  };
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v1.json'), JSON.stringify(forgedGenesisV1), 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[UNTRUSTED_HISTORICAL_REGISTRY\]|\[GENESIS_ROGUE_KEY_DETECTED\]/
+  );
+
+  // 2. Negative Test B (R26-B01 Gap B): Filename trust-registry.v99.json declaring internal registryVersion 1
+  fs.rmSync(path.join(histDir, 'trust-registry.v1.json'), { force: true });
+  const mismatchedV99 = {
+    ...forgedGenesisV1,
+    keys: [{ keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: new Date().toISOString() }]
+  };
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v99.json'), JSON.stringify(mismatchedV99), 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[UNTRUSTED_HISTORICAL_REGISTRY\]/
+  );
+  fs.rmSync(path.join(histDir, 'trust-registry.v99.json'), { force: true });
+
+  // 3. Negative Test C (R26-B02): Current on-disk registry injected with unauthenticated rogue key without Root authorization chain
+  // Write valid Genesis v1 to history
+  const validGenesisV1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: new Date().toISOString() }
+    ],
+    revokedKeyIds: [],
+    revocationHighWaterMark: { headIndex: 0, headDigest: '0'.repeat(64), updatedAt: new Date().toISOString(), authorizedBy: rootAuth.keyId, signature: '00' }
+  };
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v1.json'), JSON.stringify(validGenesisV1), 'utf8');
+
+  // Attacker tampers with current on-disk supervisor-trust-registry.json to inject rogue key
+  const rogueCurrentReg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 2,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rogueAuth.keyId,
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: new Date().toISOString() },
+      { keyId: rogueAuth.keyId, keyFingerprint: rogueAuth.fp, publicKeyPem: rogueAuth.pem, status: 'ACTIVE', issuedAt: new Date().toISOString() }
+    ],
+    revokedKeyIds: [],
+    authorizationProof: {
+      authorizedBy: rogueAuth.keyId, // Self-signed by rogue key, NOT by Root!
+      signature: 'deadbeef'
+    }
+  };
+  fs.writeFileSync(path.join(tempDir, 'supervisor-trust-registry.json'), JSON.stringify(rogueCurrentReg), 'utf8');
+
+  // Attacker signs a Journal entry with rogue private key
+  const rogueJournalEntry = {
+    entryIndex: 0,
+    prevEntryDigest: '0'.repeat(64),
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'TARGET-KEY-VICTIM',
+    signedBy: rogueAuth.keyId,
+    reason: 'ATTACKER_INJECTED_REVOCATION',
+    timestamp: new Date().toISOString()
+  };
+  const roguePayload = Buffer.from(computeRevocationEntrySignPayload(rogueJournalEntry), 'utf8');
+  rogueJournalEntry.signature = crypto.sign(null, roguePayload, rogueAuth.privateKey).toString('hex');
+  fs.writeFileSync(path.join(tempDir, '.irv-revocation-journal.jsonl'), JSON.stringify(rogueJournalEntry) + '\n', 'utf8');
+
+  // getJournalRevokedKeyMap must fail closed and reject unauthenticated current registry / untrusted signer!
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[UNTRUSTED_CURRENT_REGISTRY\]|\[UNTRUSTED_SIGNER\]/
+  );
+
+  // 4. Cold-Start Rollback Test with External System Witness
+  // Clean up disk state
+  fs.rmSync(tempDir, { recursive: true, force: true });
+  fs.mkdirSync(tempDir, { recursive: true });
+
+  // Update system witness to record established HWM headIndex: 0 for tempDir
+  const systemWitnessDir = path.join(tempDir, '.system-witness-store');
+  fs.mkdirSync(systemWitnessDir, { recursive: true });
+  process.env.THREE_LENS_SYSTEM_WITNESS_DIR = systemWitnessDir;
+
+  const normTarget = fs.existsSync(tempDir) ? fs.realpathSync(tempDir) : path.resolve(tempDir);
+  const dirHash = crypto.createHash('sha256').update(normTarget, 'utf8').digest('hex').slice(0, 16);
+  const sysWitnessFile = path.join(systemWitnessDir, `${dirHash}.witness.json`);
+  const witnessPayload = {
+    schemaVersion: '1.0.0',
+    dir: normTarget,
+    maxSeenRegistryVersion: 1,
+    maxSeenRegistryDigest: '0'.repeat(64),
+    maxSeenHwmHeadIndex: 0,
+    maxSeenHwmHeadDigest: 'a'.repeat(64),
+    updatedAt: new Date().toISOString(),
+    registryDigests: { '1': '0'.repeat(64) },
+    registryNonHwmDigests: { '1': '0'.repeat(64) }
+  };
+  fs.writeFileSync(sysWitnessFile, JSON.stringify(witnessPayload, null, 2), 'utf8');
+
+  // Disk has NO journal file, but external system witness records maxSeenHwmHeadIndex: 0
+  const testWitnessOpts = { ...opts, allowInWorkspace: true };
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, testWitnessOpts),
+    /\[JOURNAL_ROLLBACK_DETECTED\]/
+  );
+
+  // Cleanup
+  delete process.env.THREE_LENS_SYSTEM_WITNESS_DIR;
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
