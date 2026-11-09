@@ -852,6 +852,17 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           }
           continue;
         }
+
+        // R33-B01: If historical update is signed by a delegated key, root status must remain ACTIVE_PINNED_ROOT
+        if (proof.authorizedBy !== rootId) {
+          const rootInPrior = priorVerifiedReg.keys?.find(k => k.keyId === rootId);
+          const rootInHist = hReg.keys?.find(k => k.keyId === rootId);
+          if (rootInPrior && rootInPrior.status === 'ACTIVE_PINNED_ROOT' && rootInHist && rootInHist.status !== 'ACTIVE_PINNED_ROOT') {
+            if (options.failClosed !== false) {
+              throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] [DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${proof.authorizedBy}' cannot set sovereign root '${rootId}' to non-active status '${rootInHist.status}'`);
+            }
+          }
+        }
         const payload = Buffer.from(computeRegistryAuthorizationPayload(hReg), 'utf8');
         const isSigValid = crypto.verify(null, payload, signerInPrior.publicKeyPem, Buffer.from(proof.signature, 'hex'));
         if (!isSigValid) {
@@ -969,6 +980,17 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
 
         const proof = currentRegistry.authorizationProof;
         if (proof && typeof proof.signature === 'string' && typeof proof.authorizedBy === 'string') {
+          // R33-B01: If signer is delegated, root must remain ACTIVE_PINNED_ROOT
+          if (proof.authorizedBy !== rootId) {
+            const rootInPrior = priorVerifiedReg.keys?.find(k => k.keyId === rootId);
+            const rootInCur = currentRegistry.keys?.find(k => k.keyId === rootId);
+            if (rootInPrior && rootInPrior.status === 'ACTIVE_PINNED_ROOT' && rootInCur && rootInCur.status !== 'ACTIVE_PINNED_ROOT') {
+              if (options.failClosed !== false) {
+                throw new Error(`[UNTRUSTED_CURRENT_REGISTRY] [DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${proof.authorizedBy}' cannot set sovereign root '${rootId}' to non-active status '${rootInCur.status}'`);
+              }
+            }
+          }
+
           // R27-B02 & R29-B01: Signer must not be revoked in prior registry or in verified journal records
           const isSignerRevokedInPrior = Array.isArray(priorVerifiedReg.revokedKeyIds) && priorVerifiedReg.revokedKeyIds.includes(proof.authorizedBy);
           const isSignerRevokedInJournal = journalRevokedKeyIds.has(proof.authorizedBy);
@@ -2374,13 +2396,34 @@ export function validateTrustRegistry(registry, options = {}) {
     };
   }
 
-  // R31-B01: Root keyId, PEM, and status binding invariant
+  // R31-B01 & R33-B01: Root keyId, PEM, and status binding invariant
+  const rootInPrior = options.priorRegistry?.keys?.find(k => k.keyId === rootId);
+  const isDelegatedUpdate = registry.authorizationProof && registry.authorizationProof.authorizedBy && registry.authorizationProof.authorizedBy !== rootId;
+
   for (const k of registry.keys) {
     if (k && k.keyId === rootId) {
       if (k.publicKeyPem !== rootPem || k.status === 'REVOKED') {
         return {
           valid: false,
           error: `[ROOT_KEY_SUBSTITUTION_REJECTED] Pinned root key '${rootId}' cannot have modified public key PEM or revoked status in keys[]`,
+          cryptographicValidity: false,
+          monotonicValidity: true,
+          ancestryContinuity: true
+        };
+      }
+      if (registry.registryVersion === 1 && k.status !== 'ACTIVE_PINNED_ROOT') {
+        return {
+          valid: false,
+          error: `[ROOT_KEY_SUBSTITUTION_REJECTED] Genesis root key '${rootId}' must have status ACTIVE_PINNED_ROOT`,
+          cryptographicValidity: false,
+          monotonicValidity: true,
+          ancestryContinuity: true
+        };
+      }
+      if (isDelegatedUpdate && rootInPrior && rootInPrior.status === 'ACTIVE_PINNED_ROOT' && k.status !== 'ACTIVE_PINNED_ROOT') {
+        return {
+          valid: false,
+          error: `[DELEGATED_ROOT_MUTATION_REJECTED] Delegated authorization by '${registry.authorizationProof.authorizedBy}' cannot set sovereign root '${rootId}' to '${k.status}'; root status must remain ACTIVE_PINNED_ROOT`,
           cryptographicValidity: false,
           monotonicValidity: true,
           ancestryContinuity: true
@@ -2947,6 +2990,24 @@ export function createAuthorizedRegistryUpdate(currentRegistry, updates, signerK
   // R21-B01 & R22-B01: Revoked keys in revocation journal cannot authorize updates.
   // Fail-Closed: if revocation status cannot be verified due to journal read/corruption errors, reject.
   const effectiveOpts = options && typeof options === 'object' ? options : {};
+
+  // R33-B01: Delegated keys cannot mutate, retire, or revoke sovereign root anchor
+  const effectiveRootId = effectiveOpts.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
+  if (signerKeyId !== effectiveRootId) {
+    if (Array.isArray(updates.keys)) {
+      const rootInCur = Array.isArray(currentRegistry.keys) ? currentRegistry.keys.find(k => k.keyId === effectiveRootId) : null;
+      const rootInUpdates = updates.keys.find(k => k.keyId === effectiveRootId);
+      if (rootInUpdates && rootInUpdates.status !== 'ACTIVE_PINNED_ROOT') {
+        throw new Error(`[DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${signerKeyId}' cannot modify or retire sovereign root key '${effectiveRootId}' (attempted status '${rootInUpdates.status}')`);
+      }
+      if (!rootInUpdates && rootInCur) {
+        throw new Error(`[DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${signerKeyId}' cannot omit sovereign root key '${effectiveRootId}' from keys[]`);
+      }
+    }
+    if (Array.isArray(updates.revokedKeyIds) && updates.revokedKeyIds.includes(effectiveRootId)) {
+      throw new Error(`[DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${signerKeyId}' cannot revoke sovereign root key '${effectiveRootId}'`);
+    }
+  }
   let effectiveDir = null;
   try {
     effectiveDir = resolvePluginDataDir(effectiveOpts);
@@ -5015,16 +5076,19 @@ export function appendRevocationEntry(entryInput, options = {}) {
         throw new Error(`[REVOKED_SIGNER_REJECTED] Signer '${signedBy}' has been revoked in trust registry`);
       }
       const signerKey = regObj.keys.find(k => k.keyId === signedBy);
-      if (!signerKey) {
+      if (!signerKey && signedBy !== rootId) {
         throw new Error(`[UNKNOWN_SIGNER_REJECTED] Signer '${signedBy}' is not recognized in trust registry keys`);
       }
-      if (signerKey.status !== 'ACTIVE_PINNED_ROOT' && signerKey.status !== 'ACTIVE') {
+      if (signedBy === rootId) {
+        // R33-B01: Sovereign root retains inherent revocation authority regardless of delegated status changes
+      } else if (signerKey.status !== 'ACTIVE_PINNED_ROOT' && signerKey.status !== 'ACTIVE') {
         throw new Error(`[INACTIVE_SIGNER_REJECTED] Signer '${signedBy}' has status '${signerKey.status}'; only ACTIVE or ACTIVE_PINNED_ROOT keys may issue new revocations`);
       }
+      const signerPem = signerKey ? signerKey.publicKeyPem : rootPem;
       try {
         const testPayload = Buffer.from('three-lens-signer-verification', 'utf8');
         const testSig = crypto.sign(null, testPayload, options.signerPrivateKey);
-        const matches = crypto.verify(null, testPayload, signerKey.publicKeyPem, testSig);
+        const matches = crypto.verify(null, testPayload, signerPem, testSig);
         if (!matches) {
           throw new Error('Key mismatch');
         }

@@ -7013,8 +7013,30 @@ test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01 & R29-B01 & R30-B01: Stric
   assert.strictEqual(inconResult.valid, false);
   assert.match(inconResult.error, /\[ACTIVE_KEY_INCONSISTENCY_REJECTED\]/);
 
-  // Scenario 3: External Journal injection of KEY_REVOCATION on Root anchor causes getJournalRevokedKeyMap to fail closed
+  // Scenario 3 & 4: External Journal injection of KEY_REVOCATION on Root anchor causes getJournalRevokedKeyMap and loadRevocationJournal to fail closed
   const maliciousJournalDir = createTempDir('malicious-journal-root-rev-');
+  const malOpts = {
+    pluginDataDir: maliciousJournalDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: rootAuth.keyId,
+    trustedRootPublicKeyPem: rootAuth.pem,
+    trustedRootFingerprint: rootAuth.fp
+  };
+  const malReg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keyType: 'ed25519',
+    pinnedSince: '2026-01-01T00:00:00.000Z',
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{ keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-01-01T00:00:00.000Z' }]
+  };
+  saveTrustRegistry(malReg, malOpts);
+
   const malJournalPath = path.join(maliciousJournalDir, '.irv-revocation-journal.jsonl');
   const malEntry = {
     entryIndex: 0,
@@ -7029,12 +7051,33 @@ test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01 & R29-B01 & R30-B01: Stric
   malEntry.signature = crypto.sign(null, malPayload, rootAuth.privateKey).toString('hex');
   fs.writeFileSync(malJournalPath, JSON.stringify(malEntry) + '\n', 'utf8');
 
+  const malDigest = sha256Digest(canonicalJsonStringify(malEntry));
+  const hwmPayload = Buffer.from(canonicalJsonStringify({
+    headIndex: 0,
+    headDigest: malDigest,
+    updatedAt: malEntry.timestamp,
+    authorizedBy: rootAuth.keyId
+  }), 'utf8');
+  malReg.revocationHighWaterMark = {
+    headIndex: 0,
+    headDigest: malDigest,
+    updatedAt: malEntry.timestamp,
+    authorizedBy: rootAuth.keyId,
+    signature: crypto.sign(null, hwmPayload, rootAuth.privateKey).toString('hex')
+  };
+  fs.mkdirSync(path.join(maliciousJournalDir, 'history'), { recursive: true });
+  fs.writeFileSync(path.join(maliciousJournalDir, 'supervisor-trust-registry.json'), JSON.stringify(malReg, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(path.join(maliciousJournalDir, 'history', 'trust-registry.v1.json'), JSON.stringify(malReg, null, 2) + '\n', 'utf8');
+
   assert.throws(() => {
-    getJournalRevokedKeyMap(maliciousJournalDir, {
-      trustedRootKeyId: rootAuth.keyId,
-      trustedRootPublicKeyPem: rootAuth.pem
-    });
+    getJournalRevokedKeyMap(maliciousJournalDir, malOpts);
   }, /\[ROOT_REVOCATION_REJECTED\]/);
+
+  // Scenario 4: End-to-end loadRevocationJournal() fail-closed on injected Root revocation entry
+  assert.throws(() => {
+    loadRevocationJournal({ ...malOpts, failClosed: true });
+  }, /\[ROOT_REVOCATION_REJECTED\]/);
+
   fs.rmSync(maliciousJournalDir, { recursive: true, force: true });
 
   // 4. Truly Independent Cold-Start Rollback Test with External System Witness
@@ -7071,5 +7114,140 @@ test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01 & R29-B01 & R30-B01: Stric
   // Cleanup
   delete process.env.THREE_LENS_SYSTEM_WITNESS_DIR;
   fs.rmSync(independentSystemWitnessDir, { recursive: true, force: true });
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('PLUGIN_DATA Governance: R33-B01 - Delegated signer cannot mutate or retire sovereign Root and Root retains inherent revocation rights', () => {
+  const tempDir = createTempDir('r33-b01-delegated-root-');
+  const rootAuth = generateTestAuthority();
+  const delegatedK = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: rootAuth.keyId,
+    trustedRootPublicKeyPem: rootAuth.pem,
+    trustedRootFingerprint: rootAuth.fp
+  };
+
+  // 1. Genesis v1 with Root
+  const v1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keyType: 'ed25519',
+    pinnedSince: '2026-01-01T00:00:00.000Z',
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{
+      keyId: rootAuth.keyId,
+      keyFingerprint: rootAuth.fp,
+      publicKeyPem: rootAuth.pem,
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: '2026-01-01T00:00:00.000Z'
+    }]
+  };
+  saveTrustRegistry(v1, opts);
+
+  // 2. Legitimate v2 authorized by Root adding delegated key K
+  const v2 = createAuthorizedRegistryUpdate(
+    v1,
+    {
+      activeKeyId: delegatedK.keyId,
+      activeKeyFingerprint: delegatedK.fp,
+      activePublicKeyPem: delegatedK.pem,
+      keys: [
+        { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-01-01T00:00:00.000Z' },
+        { keyId: delegatedK.keyId, keyFingerprint: delegatedK.fp, publicKeyPem: delegatedK.pem, status: 'ACTIVE', issuedAt: '2026-01-02T00:00:00.000Z' }
+      ]
+    },
+    rootAuth.keyId,
+    rootAuth.privateKey,
+    opts
+  );
+  saveTrustRegistry(v2, opts);
+
+  // Scenario 1: Delegated key K attempts to sign v3 retiring Root -> createAuthorizedRegistryUpdate rejects
+  assert.throws(() => {
+    createAuthorizedRegistryUpdate(
+      v2,
+      {
+        activeKeyId: delegatedK.keyId,
+        activeKeyFingerprint: delegatedK.fp,
+        activePublicKeyPem: delegatedK.pem,
+        keys: [
+          { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'RETIRED', issuedAt: '2026-01-01T00:00:00.000Z' },
+          { keyId: delegatedK.keyId, keyFingerprint: delegatedK.fp, publicKeyPem: delegatedK.pem, status: 'ACTIVE', issuedAt: '2026-01-02T00:00:00.000Z' }
+        ]
+      },
+      delegatedK.keyId,
+      delegatedK.privateKey,
+      opts
+    );
+  }, /\[DELEGATED_ROOT_MUTATION_REJECTED\]/);
+
+  // Scenario 2: Delegated key K attempts to sign v3 omitting Root -> createAuthorizedRegistryUpdate rejects
+  assert.throws(() => {
+    createAuthorizedRegistryUpdate(
+      v2,
+      {
+        activeKeyId: delegatedK.keyId,
+        activeKeyFingerprint: delegatedK.fp,
+        activePublicKeyPem: delegatedK.pem,
+        keys: [
+          { keyId: delegatedK.keyId, keyFingerprint: delegatedK.fp, publicKeyPem: delegatedK.pem, status: 'ACTIVE', issuedAt: '2026-01-02T00:00:00.000Z' }
+        ]
+      },
+      delegatedK.keyId,
+      delegatedK.privateKey,
+      opts
+    );
+  }, /\[DELEGATED_ROOT_MUTATION_REJECTED\]/);
+
+  // Scenario 3: Forged v3 signed by K with Root marked RETIRED -> validateTrustRegistry rejects
+  const forgedV3 = {
+    ...v2,
+    registryVersion: 3,
+    activeKeyId: delegatedK.keyId,
+    activeKeyFingerprint: delegatedK.fp,
+    activePublicKeyPem: delegatedK.pem,
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'RETIRED', issuedAt: '2026-01-01T00:00:00.000Z' },
+      { keyId: delegatedK.keyId, keyFingerprint: delegatedK.fp, publicKeyPem: delegatedK.pem, status: 'ACTIVE', issuedAt: '2026-01-02T00:00:00.000Z' }
+    ],
+    authorizationProof: {
+      authorizedBy: delegatedK.keyId,
+      signature: '0'.repeat(128),
+      timestamp: new Date().toISOString()
+    }
+  };
+  const valResult = validateTrustRegistry(forgedV3, { ...opts, priorRegistry: v2 });
+  assert.strictEqual(valResult.valid, false);
+  assert.match(valResult.error, /\[DELEGATED_ROOT_MUTATION_REJECTED\]/);
+
+  // Scenario 4: Sovereign Root can still issue emergency revocations even when delegated key is active
+  const revRes = appendRevocationEntry(
+    { revocationType: REVOCATION_TYPES.KEY_REVOCATION, targetId: delegatedK.keyId, reason: 'EMERGENCY_DELEGATE_REVOCATION' },
+    { ...opts, signerKeyId: rootAuth.keyId, signerPrivateKey: rootAuth.privateKey }
+  );
+  assert.strictEqual(revRes.success, true);
+
+  // Delegated key K is now revoked in journal and cannot authorize any further updates
+  assert.throws(() => {
+    createAuthorizedRegistryUpdate(
+      v2,
+      {
+        activeKeyId: delegatedK.keyId,
+        activeKeyFingerprint: delegatedK.fp,
+        activePublicKeyPem: delegatedK.pem
+      },
+      delegatedK.keyId,
+      delegatedK.privateKey,
+      opts
+    );
+  }, /\[REVOKED_KEY_AUTHORIZATION_REJECTED\]/);
+
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
