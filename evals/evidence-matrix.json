@@ -28,8 +28,8 @@
       "artifacts": [
         {
           "path": "skills/3lens/scripts/render-sarif.mjs",
-          "sha256": "3b1c42cbe75cab0a86766ea688b0b5ae11e317f1ae1c9a6460d3e61891abaa00",
-          "description": "Canonical SARIF renderer and 121 automated release invariants test suite"
+          "sha256": "75096ae91df3591a6d80af73e9fbbd232005c664d65af802282412cbe4ecf890",
+          "description": "Canonical SARIF renderer and automated test runner delegation"
         },
         {
           "path": "skills/3lens/scripts/check-release-invariants.mjs",
@@ -38,7 +38,7 @@
         },
         {
           "path": "skills/3lens/tool-integrity-manifest.json",
-          "sha256": "f1c0dcf1c1b6332951d9486e4344dcc6f97571dd63e7a9b2d94b6d8a6f792734",
+          "sha256": "488c834928f332aadd8db5319b2e707a505207a9ffe92f54203130f29add5192",
           "description": "Cryptographic TCB integrity manifest pinning critical script hashes"
         },
         {
