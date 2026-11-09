@@ -6613,10 +6613,11 @@ test('R25-B01 & R25-B02: Monotonic witness storage path alignment and unauthenti
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
-test('R26-B01 & R26-B02: Strict Genesis key confinement, filename version binding, current registry unauthenticated signer rejection, and cold-start rollback recovery', () => {
-  const tempDir = createTempDir('r26-security-gates-');
+test('R26-B01 & R26-B02 & R27-B01 & R27-B02: Strict Genesis root anchor confinement, filename version binding, revoked-signer rejection, and cold-start rollback recovery', () => {
+  const tempDir = createTempDir('r26-r27-security-gates-');
   const rootAuth = generateTestAuthority();
   const rogueAuth = generateTestAuthority();
+  const delegatedAuthK = generateTestAuthority();
   const opts = {
     pluginDataDir: tempDir,
     allowInWorkspace: true,
@@ -6649,6 +6650,27 @@ test('R26-B01 & R26-B02: Strict Genesis key confinement, filename version bindin
   assert.throws(
     () => getJournalRevokedKeyMap(tempDir, opts),
     /\[UNTRUSTED_HISTORICAL_REGISTRY\]|\[GENESIS_ROGUE_KEY_DETECTED\]/
+  );
+
+  // 1b. Negative Test A2 (R27-B01): Without caller-supplied trustedRoot* options (default public entrypoint),
+  // historical Genesis self-proclaiming an attacker key as ACTIVE_PINNED_ROOT must be strictly rejected fail-closed against embedded Root!
+  const selfProclaimedRootGenesisV1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rogueAuth.keyId,
+    activeKeyFingerprint: rogueAuth.fp,
+    activePublicKeyPem: rogueAuth.pem,
+    keys: [
+      { keyId: rogueAuth.keyId, keyFingerprint: rogueAuth.fp, publicKeyPem: rogueAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: new Date().toISOString() }
+    ],
+    revokedKeyIds: [],
+    revocationHighWaterMark: { headIndex: -1 }
+  };
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v1.json'), JSON.stringify(selfProclaimedRootGenesisV1), 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, { allowInWorkspace: true }),
+    /\[UNTRUSTED_HISTORICAL_REGISTRY\]/
   );
 
   // 2. Negative Test B (R26-B01 Gap B): Filename trust-registry.v99.json declaring internal registryVersion 1
@@ -6719,19 +6741,96 @@ test('R26-B01 & R26-B02: Strict Genesis key confinement, filename version bindin
     /\[UNTRUSTED_CURRENT_REGISTRY\]|\[UNTRUSTED_SIGNER\]/
   );
 
-  // 4. Cold-Start Rollback Test with External System Witness
-  // Clean up disk state
-  fs.rmSync(tempDir, { recursive: true, force: true });
-  fs.mkdirSync(tempDir, { recursive: true });
+  // 3b. Negative Test D (R27-B02 Auditor Counterexample): Key K is ACTIVE in history v2, but revoked in Journal entry 0.
+  // Attacker uses revoked K to sign v3 authorizing rogue key A.
+  // Parser MUST NOT grant A trusted status or allow A to sign Journal entry 1!
+  fs.rmSync(path.join(tempDir, '.irv-revocation-journal.jsonl'), { force: true });
+  fs.rmSync(path.join(tempDir, 'supervisor-trust-registry.json'), { force: true });
 
-  // Update system witness to record established HWM headIndex: 0 for tempDir
-  const systemWitnessDir = path.join(tempDir, '.system-witness-store');
-  fs.mkdirSync(systemWitnessDir, { recursive: true });
-  process.env.THREE_LENS_SYSTEM_WITNESS_DIR = systemWitnessDir;
+  // Create valid v2 in history signed by Root, adding delegatedAuthK as ACTIVE
+  const validV2Hist = {
+    schemaVersion: '1.0.0',
+    registryVersion: 2,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: delegatedAuthK.keyId,
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: new Date().toISOString() },
+      { keyId: delegatedAuthK.keyId, keyFingerprint: delegatedAuthK.fp, publicKeyPem: delegatedAuthK.pem, status: 'ACTIVE', issuedAt: new Date().toISOString() }
+    ],
+    revokedKeyIds: [],
+    revocationHighWaterMark: { headIndex: 0, headDigest: '0'.repeat(64), updatedAt: new Date().toISOString(), authorizedBy: rootAuth.keyId, signature: '00' }
+  };
+  const v2AuthPayload = Buffer.from(computeRegistryAuthorizationPayload(validV2Hist), 'utf8');
+  validV2Hist.authorizationProof = {
+    authorizedBy: rootAuth.keyId,
+    signature: crypto.sign(null, v2AuthPayload, rootAuth.privateKey).toString('hex')
+  };
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v2.json'), JSON.stringify(validV2Hist), 'utf8');
+
+  // Journal entry 0: Root REVOKES delegatedAuthK via KEY_REVOCATION!
+  const entry0RevokeK = {
+    entryIndex: 0,
+    prevEntryDigest: '0'.repeat(64),
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: delegatedAuthK.keyId,
+    signedBy: rootAuth.keyId,
+    reason: 'COMPROMISED_KEY_K_REVOKED',
+    timestamp: new Date().toISOString()
+  };
+  const entry0Payload = Buffer.from(computeRevocationEntrySignPayload(entry0RevokeK), 'utf8');
+  entry0RevokeK.signature = crypto.sign(null, entry0Payload, rootAuth.privateKey).toString('hex');
+  const entry0Line = JSON.stringify(entry0RevokeK);
+  const entry0Digest = sha256Digest(canonicalJsonStringify(entry0RevokeK));
+
+  // Attacker creates v3 signed by now-REVOKED K, introducing rogueAuth
+  const attackerV3Reg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 3,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rogueAuth.keyId,
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: new Date().toISOString() },
+      { keyId: delegatedAuthK.keyId, keyFingerprint: delegatedAuthK.fp, publicKeyPem: delegatedAuthK.pem, status: 'ACTIVE', issuedAt: new Date().toISOString() },
+      { keyId: rogueAuth.keyId, keyFingerprint: rogueAuth.fp, publicKeyPem: rogueAuth.pem, status: 'ACTIVE', issuedAt: new Date().toISOString() }
+    ],
+    revokedKeyIds: []
+  };
+  const v3AuthPayload = Buffer.from(computeRegistryAuthorizationPayload(attackerV3Reg), 'utf8');
+  attackerV3Reg.authorizationProof = {
+    authorizedBy: delegatedAuthK.keyId, // Signed by revoked key K!
+    signature: crypto.sign(null, v3AuthPayload, delegatedAuthK.privateKey).toString('hex')
+  };
+  fs.writeFileSync(path.join(tempDir, 'supervisor-trust-registry.json'), JSON.stringify(attackerV3Reg), 'utf8');
+
+  // Attacker signs Journal entry 1 with rogueAuth
+  const entry1Rogue = {
+    entryIndex: 1,
+    prevEntryDigest: entry0Digest,
+    revocationType: REVOCATION_TYPES.NONCE_REVOCATION,
+    targetId: 'TARGET-NONCE-ATTACK',
+    signedBy: rogueAuth.keyId,
+    reason: 'ATTACKER_SIGN_AFTER_REVOKED_AUTHORIZATION',
+    timestamp: new Date().toISOString()
+  };
+  const entry1Payload = Buffer.from(computeRevocationEntrySignPayload(entry1Rogue), 'utf8');
+  entry1Rogue.signature = crypto.sign(null, entry1Payload, rogueAuth.privateKey).toString('hex');
+  const entry1Line = JSON.stringify(entry1Rogue);
+
+  fs.writeFileSync(path.join(tempDir, '.irv-revocation-journal.jsonl'), entry0Line + '\n' + entry1Line + '\n', 'utf8');
+
+  // Calling getJournalRevokedKeyMap MUST fail closed and reject rogueAuth signature as UNTRUSTED_SIGNER!
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[UNTRUSTED_SIGNER\]/
+  );
+
+  // 4. Truly Independent Cold-Start Rollback Test with External System Witness
+  const independentSystemWitnessDir = createTempDir('independent-sys-witness-');
+  process.env.THREE_LENS_SYSTEM_WITNESS_DIR = independentSystemWitnessDir;
 
   const normTarget = fs.existsSync(tempDir) ? fs.realpathSync(tempDir) : path.resolve(tempDir);
   const dirHash = crypto.createHash('sha256').update(normTarget, 'utf8').digest('hex').slice(0, 16);
-  const sysWitnessFile = path.join(systemWitnessDir, `${dirHash}.witness.json`);
+  const sysWitnessFile = path.join(independentSystemWitnessDir, `${dirHash}.witness.json`);
   const witnessPayload = {
     schemaVersion: '1.0.0',
     dir: normTarget,
@@ -6745,7 +6844,11 @@ test('R26-B01 & R26-B02: Strict Genesis key confinement, filename version bindin
   };
   fs.writeFileSync(sysWitnessFile, JSON.stringify(witnessPayload, null, 2), 'utf8');
 
-  // Disk has NO journal file, but external system witness records maxSeenHwmHeadIndex: 0
+  // Attacker completely wipes / rolls back tempDir
+  fs.rmSync(tempDir, { recursive: true, force: true });
+  fs.mkdirSync(tempDir, { recursive: true });
+
+  // External system witness in independent directory still exists; getJournalRevokedKeyMap must fail closed!
   const testWitnessOpts = { ...opts, allowInWorkspace: true };
   assert.throws(
     () => getJournalRevokedKeyMap(tempDir, testWitnessOpts),
@@ -6754,5 +6857,6 @@ test('R26-B01 & R26-B02: Strict Genesis key confinement, filename version bindin
 
   // Cleanup
   delete process.env.THREE_LENS_SYSTEM_WITNESS_DIR;
+  fs.rmSync(independentSystemWitnessDir, { recursive: true, force: true });
   fs.rmSync(tempDir, { recursive: true, force: true });
 });

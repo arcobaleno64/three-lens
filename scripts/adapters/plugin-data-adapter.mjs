@@ -662,8 +662,8 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
   const trustedKeys = new Map();
   const maxActiveIndexPerKey = new Map();
 
-  let rootId = options.trustedRootKeyId || null;
-  let rootPem = options.trustedRootPublicKeyPem || null;
+  const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
+  const rootPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
 
   let hasHistoryFiles = false;
   let priorVerifiedReg = null;
@@ -700,7 +700,7 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
         continue;
       }
 
-      // R26-B01 (Gap A & C): Enforce strict Genesis and monotonic version progression
+      // R26-B01 (Gap A & C) & R27-B01: Enforce strict Genesis root anchor binding and monotonic version progression
       if (priorVerifiedReg === null) {
         // Must be strictly version 1 Genesis
         if (hReg.registryVersion !== 1) {
@@ -719,15 +719,12 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           continue;
         }
         const rootKey = hReg.keys[0];
-        if (rootId && (rootKey.keyId !== rootId || rootKey.publicKeyPem !== rootPem)) {
+        // R27-B01: Bound strictly to trusted root key (custom option or default embedded root); self-proclaimed root rejected
+        if (rootKey.keyId !== rootId || rootKey.publicKeyPem !== rootPem) {
           if (options.failClosed !== false) {
-            throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] Historical genesis v1 in ${hf} is not authorized by trusted root key`);
+            throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] Historical genesis v1 in ${hf} is not authorized by trusted root key (expected '${rootId}', found '${rootKey.keyId}')`);
           }
           continue;
-        }
-        if (!rootId) {
-          rootId = rootKey.keyId;
-          rootPem = rootKey.publicKeyPem;
         }
         priorVerifiedReg = hReg;
       } else {
@@ -789,7 +786,44 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
     }
   }
 
-  // Step 2: R26-B02 - Authenticate currentRegistry before trusting its keys
+  // Step 1.5: R27-B02 - Collect confirmed key revocations from verified journal entries signed by historical trusted keys
+  const journalRevokedKeyIds = new Set();
+  const journalPath = path.join(dir, '.irv-revocation-journal.jsonl');
+  if (fs.existsSync(journalPath)) {
+    try {
+      const rawLines = fs.readFileSync(journalPath, 'utf8').split('\n').filter(l => l.trim().length > 0);
+      let expectedPrevDigest = '0'.repeat(64);
+      for (let i = 0; i < rawLines.length; i++) {
+        let entry = null;
+        try { entry = JSON.parse(rawLines[i]); } catch (_) { break; }
+        if (!entry || typeof entry !== 'object') break;
+        if (entry.entryIndex !== i || entry.prevEntryDigest !== expectedPrevDigest) break;
+        if (!entry.signature || !entry.signedBy) break;
+
+        const signerPem = trustedKeys.get(entry.signedBy);
+        if (!signerPem) break;
+
+        const maxIdx = maxActiveIndexPerKey.get(entry.signedBy);
+        if (typeof maxIdx === 'number' && maxIdx !== Infinity && entry.entryIndex > maxIdx) break;
+
+        const payload = Buffer.from(computeRevocationEntrySignPayload(entry), 'utf8');
+        let validSig = false;
+        try {
+          validSig = crypto.verify(null, payload, signerPem, Buffer.from(entry.signature, 'hex'));
+        } catch (_) {}
+        if (!validSig) break;
+
+        if (entry.revocationType === REVOCATION_TYPES.KEY_REVOCATION || entry.revocationType === 'KEY_REVOCATION') {
+          if (typeof entry.targetId === 'string' && entry.targetId) {
+            journalRevokedKeyIds.add(entry.targetId);
+          }
+        }
+        expectedPrevDigest = sha256Digest(canonicalJsonStringify(entry));
+      }
+    } catch (_) {}
+  }
+
+  // Step 2: R26-B02 & R27-B02 - Authenticate currentRegistry before trusting its keys
   if (currentRegistry && Array.isArray(currentRegistry.keys)) {
     let currentRegAuthenticated = false;
 
@@ -819,32 +853,42 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
         // Next version after history: must have valid authorizationProof from priorVerifiedReg
         const proof = currentRegistry.authorizationProof;
         if (proof && typeof proof.signature === 'string' && typeof proof.authorizedBy === 'string') {
-          const signerInPrior = priorVerifiedReg.keys?.find(
-            k => k.keyId === proof.authorizedBy && ['ACTIVE_PINNED_ROOT', 'ACTIVE'].includes(k.status)
-          );
-          if (signerInPrior) {
-            const payload = Buffer.from(computeRegistryAuthorizationPayload(currentRegistry), 'utf8');
-            if (crypto.verify(null, payload, signerInPrior.publicKeyPem, Buffer.from(proof.signature, 'hex'))) {
-              currentRegAuthenticated = true;
+          // R27-B02: Signer must not be revoked in prior registry or in verified journal records
+          const isSignerRevokedInPrior = Array.isArray(priorVerifiedReg.revokedKeyIds) && priorVerifiedReg.revokedKeyIds.includes(proof.authorizedBy);
+          const isSignerRevokedInJournal = journalRevokedKeyIds.has(proof.authorizedBy);
+
+          if (!isSignerRevokedInPrior && !isSignerRevokedInJournal) {
+            const signerInPrior = priorVerifiedReg.keys?.find(
+              k => k.keyId === proof.authorizedBy && ['ACTIVE_PINNED_ROOT', 'ACTIVE'].includes(k.status)
+            );
+            if (signerInPrior) {
+              const payload = Buffer.from(computeRegistryAuthorizationPayload(currentRegistry), 'utf8');
+              if (crypto.verify(null, payload, signerInPrior.publicKeyPem, Buffer.from(proof.signature, 'hex'))) {
+                currentRegAuthenticated = true;
+              }
             }
           }
         }
       }
     } else if (!hasHistoryFiles) {
-      const journalPath = path.join(dir, '.irv-revocation-journal.jsonl');
       const hasJournalOnDisk = fs.existsSync(journalPath);
 
       if (!hasJournalOnDisk) {
-        currentRegAuthenticated = true;
-      } else {
-        const effectiveRootId = rootId || options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
-        const effectiveRootPem = rootPem || options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
-
+        // Only accept if strictly matching rootId & rootPem
         if (currentRegistry.registryVersion === 1) {
-          // Must be strict Genesis: keys.length === 1 and status ACTIVE_PINNED_ROOT
           if (Array.isArray(currentRegistry.keys) && currentRegistry.keys.length === 1 && currentRegistry.keys[0].status === 'ACTIVE_PINNED_ROOT') {
             const rootKey = currentRegistry.keys[0];
-            if (!rootId || (rootKey.keyId === effectiveRootId && rootKey.publicKeyPem === effectiveRootPem)) {
+            if (rootKey.keyId === rootId && rootKey.publicKeyPem === rootPem) {
+              currentRegAuthenticated = true;
+            }
+          }
+        }
+      } else {
+        if (currentRegistry.registryVersion === 1) {
+          // Must be strict Genesis: keys.length === 1 and status ACTIVE_PINNED_ROOT matching trusted rootId & rootPem
+          if (Array.isArray(currentRegistry.keys) && currentRegistry.keys.length === 1 && currentRegistry.keys[0].status === 'ACTIVE_PINNED_ROOT') {
+            const rootKey = currentRegistry.keys[0];
+            if (rootKey.keyId === rootId && rootKey.publicKeyPem === rootPem) {
               currentRegAuthenticated = true;
             }
           }
@@ -854,10 +898,13 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
         } else if (currentRegistry.registryVersion === 2 && options.allowEmbeddedFallback !== false) {
           // v2 with embedded root fallback:
           const proof = currentRegistry.authorizationProof;
-          if (proof && proof.authorizedBy === effectiveRootId && typeof proof.signature === 'string') {
-            const payload = Buffer.from(computeRegistryAuthorizationPayload(currentRegistry), 'utf8');
-            if (crypto.verify(null, payload, effectiveRootPem, Buffer.from(proof.signature, 'hex'))) {
-              currentRegAuthenticated = true;
+          if (proof && proof.authorizedBy === rootId && typeof proof.signature === 'string') {
+            const isSignerRevokedInJournal = journalRevokedKeyIds.has(proof.authorizedBy);
+            if (!isSignerRevokedInJournal) {
+              const payload = Buffer.from(computeRegistryAuthorizationPayload(currentRegistry), 'utf8');
+              if (crypto.verify(null, payload, rootPem, Buffer.from(proof.signature, 'hex'))) {
+                currentRegAuthenticated = true;
+              }
             }
           }
           if (!currentRegAuthenticated && options.failClosed !== false) {
