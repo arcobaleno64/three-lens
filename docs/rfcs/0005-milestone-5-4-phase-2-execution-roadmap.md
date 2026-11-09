@@ -27,6 +27,17 @@ flowchart TD
     Axis4 --> Value4["Deterministic Context Integrity in Monorepo Scans"]
 ```
 
+### 1.1 Tripartite Governance Invariant
+To maintain epistemic humility and prevent over-claiming as the architecture approaches future milestones:
+
+```text
+V2_RELEASE_AUTHORIZED ≠ BLOCKING_AUTHORITY_PROMOTED ≠ CLEAN_ATTESTED
+```
+
+- **`V2_RELEASE_AUTHORIZED`**: Refers strictly to SemVer major version releases with public contract changes (e.g. CLI options, output schema, dynamic agent scheduling under SemVer 2.0.0).
+- **`BLOCKING_AUTHORITY_PROMOTED`**: Refers to independent Tier 4 promotion ([RFC 0003](0003-empirical-validation-and-authority-promotion-protocol.md)) for CI merge/release blocking; cannot be inferred merely from Layer 1–3 sample counts.
+- **`CLEAN_ATTESTED`**: Refers strictly to bounded assurance within verified rules, declared scope, and verified code paths, never an unconstrained certification of zero vulnerabilities.
+
 ---
 
 ## 2. Four Technical Workstreams for Phase 2
