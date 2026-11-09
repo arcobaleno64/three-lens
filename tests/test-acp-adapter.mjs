@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   ACP_DIAGNOSTIC_SEVERITY,
   assertFindingDispositionAuthority,
@@ -12,9 +15,12 @@ import {
   handleInitialize,
   parseJsonRpcMessage,
   createAcpDiagnosticEmitter,
-  signFindingAuthorityProof
+  signFindingAuthorityProof,
+  withTestSupervisorRootKey
 } from '../scripts/adapters/acp-adapter.mjs';
 import { validateAcpHandshake } from '../scripts/adapters/acp-transport-adapter.mjs';
+import { parseGitRemoteOriginUrl, getCanonicalRealPath } from '../scripts/fetch-upstream-oss-fixture.mjs';
+import { extractEntry } from '../evals/oss-corpus/post-fix/07-adm-zip-path-traversal.js';
 
 test('ACP Adapter: mapSeverityToAcpDiagnostic severity mapping and Default-Deny clamping', () => {
   // Confirmed reportable findings map to appropriate severity
@@ -64,20 +70,22 @@ test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata'
   };
   finding.authorityProof = signFindingAuthorityProof(finding, keyPair.privateKey, 'SUPERVISOR_ROOT', pubPem);
 
-  const diag = formatAcpDiagnostic(finding, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem });
+  withTestSupervisorRootKey(pubPem, () => {
+    const diag = formatAcpDiagnostic(finding);
 
-  assert.equal(diag.code, 'CWE-89');
-  assert.equal(diag.source, 'Three-Lens');
-  assert.equal(diag.severity, 1);
-  assert.equal(diag.message, 'SQL Injection via query concatenation');
-  assert.deepEqual(diag.range, {
-    start: { line: 41, character: 4 },
-    end: { line: 44, character: 29 }
+    assert.equal(diag.code, 'CWE-89');
+    assert.equal(diag.source, 'Three-Lens');
+    assert.equal(diag.severity, 1);
+    assert.equal(diag.message, 'SQL Injection via query concatenation');
+    assert.deepEqual(diag.range, {
+      start: { line: 41, character: 4 },
+      end: { line: 44, character: 29 }
+    });
+    assert.equal(diag.data.id, 'FIND-001');
+    assert.equal(diag.data.lineageId, 'lin-abc-123');
+    assert.equal(diag.data.authorityConfirmed, true);
+    assert.equal(diag.data.remediation, 'Use parameterized queries');
   });
-  assert.equal(diag.data.id, 'FIND-001');
-  assert.equal(diag.data.lineageId, 'lin-abc-123');
-  assert.equal(diag.data.authorityConfirmed, true);
-  assert.equal(diag.data.remediation, 'Use parameterized queries');
 });
 
 test('ACP Adapter: R04-F01 / R05-F01 / R06-F01 Spoofed authority claims strictly fail closed to HINT', () => {
@@ -210,15 +218,21 @@ test('ACP Adapter: R04-F01 / R05-F01 / R06-F01 Spoofed authority claims strictly
   assert.equal(formatAcpDiagnostic(forgedSigCandidate).data.authorityConfirmed, false);
   assert.equal(formatAcpDiagnostic(forgedSigCandidate).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
 
-  // 9. Positive counterpart: Authentic cryptographic Ed25519 signature verified
+  // 9. Positive counterpart: Authentic cryptographic Ed25519 signature verified inside withTestSupervisorRootKey scope
   const keyPair = crypto.generateKeyPairSync('ed25519');
   const pubPem = keyPair.publicKey.export({ type: 'spki', format: 'pem' });
   const validCryptoCandidate = {
     id: 'VALID-CRYPTO-001',
     ruleId: 'CWE-89',
+    cwe: 'CWE-89',
     title: 'Authenticated finding with cryptographic attestation',
+    description: 'Detailed description of SQL injection',
     severity: 'CRITICAL',
     disposition: 'REPORTABLE',
+    securityProperty: 'INTEGRITY',
+    findingType: 'VULNERABILITY',
+    proofKind: 'STATIC_TRACE',
+    remediation: 'Use parameterized queries',
     location: { startLine: 10 }
   };
   validCryptoCandidate.authorityProof = signFindingAuthorityProof(
@@ -227,56 +241,46 @@ test('ACP Adapter: R04-F01 / R05-F01 / R06-F01 Spoofed authority claims strictly
     'SUPERVISOR_ROOT',
     pubPem
   );
-  const diagCrypto = formatAcpDiagnostic(validCryptoCandidate, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem });
-  assert.equal(diagCrypto.data.authorityConfirmed, true);
-  assert.equal(diagCrypto.severity, ACP_DIAGNOSTIC_SEVERITY.ERROR);
 
-  // 10. R07-F01 Defense: Tampering with ANY field breaks cryptographic signature binding
-  const tamperedSeverity = {
-    ...validCryptoCandidate,
-    severity: 'LOW' // Modified field breaks signature!
-  };
-  assert.equal(
-    formatAcpDiagnostic(tamperedSeverity, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
-    false,
-    'Tampered severity must fail signature verification'
-  );
+  // R08-F02: Inside scoped test supervisor root key context, verification succeeds
+  withTestSupervisorRootKey(pubPem, () => {
+    const diagCrypto = formatAcpDiagnostic(validCryptoCandidate);
+    assert.equal(diagCrypto.data.authorityConfirmed, true);
+    assert.equal(diagCrypto.severity, ACP_DIAGNOSTIC_SEVERITY.ERROR);
 
-  const tamperedTitle = {
-    ...validCryptoCandidate,
-    title: 'Tampered malicious SQL injection title'
-  };
-  assert.equal(
-    formatAcpDiagnostic(tamperedTitle, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
-    false,
-    'Tampered title must fail signature verification'
-  );
+    // 10. R07-F01 & R08-F01 Defense: Tampering with ANY field breaks cryptographic signature binding
+    const fieldsToTamper = [
+      { field: 'severity', value: 'LOW' },
+      { field: 'title', value: 'Tampered title' },
+      { field: 'description', value: 'Tampered description' },
+      { field: 'cwe', value: 'CWE-79' },
+      { field: 'location', value: { startLine: 999 } },
+      { field: 'securityProperty', value: 'CONFIDENTIALITY' },
+      { field: 'findingType', value: 'DEFECT' },
+      { field: 'proofKind', value: 'FUZZING' },
+      { field: 'remediation', value: 'Malicious attacker suggestion' },
+      { field: 'ballots', value: [{ lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: ['tampered'] }] }
+    ];
 
-  const tamperedLocation = {
-    ...validCryptoCandidate,
-    location: { startLine: 999 }
-  };
-  assert.equal(
-    formatAcpDiagnostic(tamperedLocation, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
-    false,
-    'Tampered location must fail signature verification'
-  );
+    for (const { field, value } of fieldsToTamper) {
+      const tamperedCandidate = {
+        ...validCryptoCandidate,
+        [field]: value
+      };
+      assert.equal(
+        formatAcpDiagnostic(tamperedCandidate).data.authorityConfirmed,
+        false,
+        `Tampered field '${field}' MUST fail signature verification (R08-F01)`
+      );
+    }
+  });
 
-  const tamperedBallots = {
-    ...validCryptoCandidate,
-    ballots: [{ lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: ['tampered'] }]
-  };
+  // 11. R08-F02 Defense: Caller options CANNOT override trusted root.
+  // Passing allowConfiguredRoot or trustedRootPublicKeyPem is completely ignored outside test scope
   assert.equal(
-    formatAcpDiagnostic(tamperedBallots, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
+    formatAcpDiagnostic(validCryptoCandidate, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
     false,
-    'Tampered ballots must fail signature verification'
-  );
-
-  // 11. R07-F02 Defense: Caller cannot override trusted root without allowConfiguredRoot: true
-  assert.equal(
-    formatAcpDiagnostic(validCryptoCandidate, { trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
-    false,
-    'Untrusted caller root override without allowConfiguredRoot must be rejected'
+    'Untrusted caller root override via options MUST be ignored and rejected under Default-Deny (R08-F02)'
   );
 });
 
@@ -392,15 +396,17 @@ test('ACP Adapter: formatPublishDiagnosticsNotification formats full notificatio
   ];
   findings[0].authorityProof = signFindingAuthorityProof(findings[0], keyPair.privateKey, 'SUPERVISOR_ROOT', pubPem);
 
-  const raw = formatPublishDiagnosticsNotification('file:///path/to/app.js', findings, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem });
-  const parsed = JSON.parse(raw.trim());
+  withTestSupervisorRootKey(pubPem, () => {
+    const raw = formatPublishDiagnosticsNotification('file:///path/to/app.js', findings);
+    const parsed = JSON.parse(raw.trim());
 
-  assert.equal(parsed.jsonrpc, '2.0');
-  assert.equal(parsed.method, 'textDocument/publishDiagnostics');
-  assert.equal(parsed.params.uri, 'file:///path/to/app.js');
-  assert.equal(parsed.params.diagnostics.length, 1);
-  assert.equal(parsed.params.diagnostics[0].code, 'CWE-79');
-  assert.equal(parsed.params.diagnostics[0].severity, 2);
+    assert.equal(parsed.jsonrpc, '2.0');
+    assert.equal(parsed.method, 'textDocument/publishDiagnostics');
+    assert.equal(parsed.params.uri, 'file:///path/to/app.js');
+    assert.equal(parsed.params.diagnostics.length, 1);
+    assert.equal(parsed.params.diagnostics[0].code, 'CWE-79');
+    assert.equal(parsed.params.diagnostics[0].severity, 2);
+  });
 });
 
 test('ACP Adapter: R01-F03 formatBallotProgressNotification emits window/logMessage', () => {
@@ -444,13 +450,13 @@ test('ACP Adapter: R03-F04 / R04-F02 / R05-F02 / R06-F02 / R06-F03 session cance
   };
 
   const emitter = createAcpDiagnosticEmitter(mockStream);
+  emitter.createSession('sess-1');
+  emitter.createSession('sess-2');
 
   // 1. Session-scoped cancellation: cancel sess-1 turn 1
   const notifCancel = emitter.handleMessage('{"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "sess-1", "turnId": 1}}\n');
   assert.equal(notifCancel.cancelled, true);
   assert.equal(notifCancel.sessionId, 'sess-1');
-  assert.equal(notifCancel.turnId, 1);
-  assert.equal(notifCancel.stopReason, 'cancelled');
   assert.equal(chunks.length, 0, 'Notification without id must not write a response to stream');
   assert.equal(emitter.isCancelled('sess-1'), true);
   assert.equal(emitter.isCancelled('sess-2'), false, 'sess-2 must remain uncancelled');
@@ -463,7 +469,7 @@ test('ACP Adapter: R03-F04 / R04-F02 / R05-F02 / R06-F02 / R06-F03 session cance
   assert.equal(chunks.length, 0, 'Cancelled session must not write any diagnostic or update');
 
   // 3. Uncancelled session sess-2 continues to emit and conforms to ACP v1 { sessionId, update: { sessionUpdate, content } }
-  const liveUpdate = emitter.emitSessionUpdate('sess-2', { message: 'analyzing workspace' });
+  const liveUpdate = emitter.emitSessionUpdate('sess-2', { message: 'analyzing workspace' }, { turnId: 1 });
   assert.ok(liveUpdate !== null);
   assert.equal(chunks.length, 1);
   const updateObj = JSON.parse(chunks[0].trim());
@@ -480,50 +486,49 @@ test('ACP Adapter: R03-F04 / R04-F02 / R05-F02 / R06-F02 / R06-F03 session cance
   assert.equal(promptResp.result.turnId, 2, 'New prompt must advance to turn generation 2');
   assert.equal(emitter.isCancelled('sess-1'), false, 'session/prompt must clear prior session cancellation');
 
-  // R06-F03 Invariant: Stale emission from old generation turn 1 is rejected, while current turn 2 is allowed
+  // R06-F03 & R08-F04 Invariant: Stale emission from old generation turn 1 is rejected, while current turn 2 is allowed
   const staleTurnEmission = emitter.emitSessionUpdate('sess-1', { progress: 0.1 }, { turnId: 1 });
   assert.equal(staleTurnEmission, null, 'Stale turn 1 emission must be rejected under Generation Token invariant');
   const restoredUpdate = emitter.emitSessionUpdate('sess-1', { progress: 0.2 }, { turnId: 2 });
   assert.ok(restoredUpdate !== null, 'Current generation turn 2 emission must be allowed');
 
+  // R08-F04 Invariant: Mandatory Generation Handle - omitting turnId MUST fail closed
+  const missingTurnEmission = emitter.emitSessionUpdate('sess-1', { progress: 0.25 });
+  assert.equal(missingTurnEmission, null, 'Emissions omitting turnId MUST be rejected fail-closed (R08-F04)');
+
   // R07-F04 Invariant: Fabricated future turnId (e.g. 999) must be rejected fail-closed
   const futureTurnEmission = emitter.emitSessionUpdate('sess-1', { progress: 0.3 }, { turnId: 999 });
   assert.equal(futureTurnEmission, null, 'Fabricated future turnId must be strictly rejected');
 
-  // R07-F03 Invariant: session/new initializes session with turn 1 and returns sessionId
+  // R07-F03 & R08-F03 Invariant: session/new initializes session with turn 1 and returns sessionId
   const sessionNewResp = emitter.handleMessage('{"jsonrpc": "2.0", "id": 301, "method": "session/new", "params": {"sessionId": "sess-new-1"}}\n');
   assert.equal(sessionNewResp.id, 301);
   assert.equal(sessionNewResp.result.sessionId, 'sess-new-1');
   assert.equal(emitter.getCurrentTurnId('sess-new-1'), 1);
 
+  // R08-F03 Invariant: session/new with duplicate sessionId MUST be rejected
+  const duplicateNewResp = emitter.handleMessage('{"jsonrpc": "2.0", "id": 302, "method": "session/new", "params": {"sessionId": "sess-new-1"}}\n');
+  assert.equal(duplicateNewResp.error.code, -32600);
+
   // R07-F03 Invariant: Caller attempting to overwrite content structure with invalid object
-  const spoofedContentUpdate = emitter.emitSessionUpdate('sess-new-1', { content: { type: 'malicious', rawHtml: '<script>' } });
+  const spoofedContentUpdate = emitter.emitSessionUpdate('sess-new-1', { content: { type: 'malicious', rawHtml: '<script>' } }, { turnId: 1 });
   assert.ok(spoofedContentUpdate !== null);
   const spoofedParsed = JSON.parse(spoofedContentUpdate.trim());
   assert.equal(spoofedParsed.params.update.sessionUpdate, 'agent_message_chunk');
   assert.deepEqual(spoofedParsed.params.update.content, { type: 'text', text: '' });
 
-  // 5. Request (with id) writes standard JSON-RPC response with stopReason: 'cancelled'
+  // 5. In ACP v1, session/cancel is a notification and must not write response to stream
   const freshChunks = [];
   const freshStream = { write(c) { freshChunks.push(c); } };
   const freshEmitter = createAcpDiagnosticEmitter(freshStream);
-  const cancelResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 101, "method": "session/cancel", "params": {"sessionId": "sess-101", "turnId": 1}}\n');
-  assert.equal(cancelResp.id, 101);
-  assert.equal(cancelResp.result.cancelled, true);
-  assert.equal(cancelResp.result.stopReason, 'cancelled');
-  assert.equal(freshChunks.length, 1);
-  const respObj = JSON.parse(freshChunks[0].trim());
-  assert.equal(respObj.id, 101);
-  assert.equal(respObj.result.cancelled, true);
-  assert.equal(respObj.result.stopReason, 'cancelled');
+  freshEmitter.createSession('sess-101');
+  const cancelResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "sess-101", "turnId": 1}}\n');
+  assert.equal(cancelResp.cancelled, true);
+  assert.equal(freshChunks.length, 0, 'Notification session/cancel must not write response to stream (R08-F03)');
 
-  // 6. $/cancel_request notification and request handling with requestId and stopReason
+  // 6. $/cancel_request notification handling
   freshEmitter.handleMessage('{"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": "req-99"}}\n');
-  assert.equal(freshChunks.length, 1, 'Notification $/cancel_request must not write to stream');
-  const cancelReqResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 103, "method": "$/cancel_request", "params": {"requestId": "req-103"}}\n');
-  assert.equal(cancelReqResp.id, 103);
-  assert.equal(cancelReqResp.result.cancelled, true);
-  assert.equal(cancelReqResp.result.stopReason, 'cancelled');
+  assert.equal(freshChunks.length, 0, 'Notification $/cancel_request must not write to stream');
 
   // 7. Shutdown request handling
   const shutdownResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 102, "method": "shutdown", "params": {}}\n');
@@ -562,6 +567,8 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting
   };
 
   const emitter = createAcpDiagnosticEmitter(mockStream);
+  const sid = emitter.createSession('sess-stream-test');
+
   const finding = {
     id: 'F-1',
     ruleId: 'CWE-22',
@@ -577,8 +584,15 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting
   };
   finding.authorityProof = signFindingAuthorityProof(finding, keyPair.privateKey, 'SUPERVISOR_ROOT', pubPem);
 
-  emitter.emitDiagnostic('src/index.js', finding, { trustedRootPublicKeyPem: pubPem, allowConfiguredRoot: true });
-  emitter.emitBallotProgress('CAND-01', 'DEFENSES', 'REFUTES', 'Sanitizer active');
+  // R08-F04: Emitting without turnId or with unknown session must fail closed
+  assert.equal(emitter.emitDiagnostic('src/index.js', finding, { sessionId: sid }), null);
+  assert.equal(emitter.emitDiagnostic('src/index.js', finding, { sessionId: 'unknown-sess', turnId: 1 }), null);
+
+  // Inside withTestSupervisorRootKey, verified finding emits with valid turnId
+  withTestSupervisorRootKey(pubPem, () => {
+    emitter.emitDiagnostic('src/index.js', finding, { sessionId: sid, turnId: 1 });
+    emitter.emitBallotProgress('CAND-01', 'DEFENSES', 'REFUTES', 'Sanitizer active', { sessionId: sid, turnId: 1 });
+  });
 
   assert.equal(chunks.length, 2);
   const diagParsed = JSON.parse(chunks[0].trim());
@@ -589,4 +603,76 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting
   const ballotParsed = JSON.parse(chunks[1].trim());
   assert.equal(ballotParsed.method, 'window/logMessage');
   assert.ok(ballotParsed.params.message.includes('DEFENSES: REFUTES'));
+});
+
+test('Harness Governance (R08-F07): parseGitRemoteOriginUrl strictly ignores comments and extracts active remote URL', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-config-test-'));
+  try {
+    const configPath = path.join(tmpDir, 'config');
+
+    // 1. Config with misleading comments containing expected remote
+    const spoofedConfig = `
+[core]
+  repositoryformatversion = 0
+  filemode = true
+# [remote "origin"]
+#   url = https://github.com/cthackers/adm-zip.git
+; url = https://github.com/cthackers/adm-zip.git
+[remote "actual"]
+  url = https://github.com/malicious/repo.git
+`;
+    fs.writeFileSync(configPath, spoofedConfig, 'utf8');
+    const parsedUrl = parseGitRemoteOriginUrl(configPath);
+    assert.equal(parsedUrl, 'https://github.com/malicious/repo.git');
+
+    // 2. Legitimate remote origin config
+    const legitConfig = `
+[core]
+  repositoryformatversion = 0
+[remote "origin"]
+  url = https://github.com/cthackers/adm-zip.git
+  fetch = +refs/heads/*:refs/remotes/origin/*
+`;
+    fs.writeFileSync(configPath, legitConfig, 'utf8');
+    assert.equal(parseGitRemoteOriginUrl(configPath), 'https://github.com/cthackers/adm-zip.git');
+
+    // 3. Nonexistent config returns null
+    assert.equal(parseGitRemoteOriginUrl(path.join(tmpDir, 'nonexistent')), null);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Harness Governance (R08-F05 & R08-F06): getCanonicalRealPath and adm-zip path containment defense', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'admzip-test-'));
+  try {
+    const sandboxDir = path.join(tmpDir, 'target');
+    fs.mkdirSync(sandboxDir, { recursive: true });
+
+    // 1. Traversal attempt out of sandbox throws INVALID_FILENAME
+    assert.throws(
+      () => extractEntry(sandboxDir, '../escape.txt', 'malicious'),
+      /INVALID_FILENAME/
+    );
+
+    // 2. Normal extraction creates file safely
+    const created = extractEntry(sandboxDir, 'subdir/normal.txt', 'hello world');
+    assert.ok(fs.existsSync(created));
+    assert.equal(fs.readFileSync(created, 'utf8'), 'hello world');
+
+    // 3. Dangling symlink inside sandbox is detected and rejected
+    const danglingSymlink = path.join(sandboxDir, 'dangling-link');
+    try {
+      fs.symlinkSync(path.join(tmpDir, 'nonexistent-target'), danglingSymlink, 'file');
+      assert.throws(
+        () => extractEntry(sandboxDir, 'dangling-link/traversal.txt', 'payload'),
+        /SECURITY_ERROR/
+      );
+    } catch (symlinkErr) {
+      // If OS / permissions do not permit symlinks in unprivileged mode, skip symlink creation
+      if (symlinkErr.code !== 'EPERM') throw symlinkErr;
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

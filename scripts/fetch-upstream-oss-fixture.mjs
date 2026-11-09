@@ -39,14 +39,53 @@ export function getCanonicalRealPath(p) {
     existing = parent;
   }
 
-  let realExisting = existing;
+  // R08-F05 Defense: Strict Fail-Closed realpath resolution.
+  // Must NOT fall back to lexical path.resolve on failure.
+  let realExisting;
   try {
     realExisting = fs.realpathSync.native ? fs.realpathSync.native(existing) : fs.realpathSync(existing);
-  } catch {
-    realExisting = path.resolve(existing);
+  } catch (err) {
+    throw new Error(`Security Exception (R08-F05): Failed to resolve physical realpath for '${existing}': ${err.message}`);
   }
 
   return segments.length > 0 ? path.join(realExisting, ...segments) : realExisting;
+}
+
+/**
+ * Extracts and parses the active git remote URL from .git/config (R08-F07).
+ * Strictly parses INI remote sections and ignores comments or non-remote entries.
+ * @param {string} gitConfigPath
+ * @returns {string|null}
+ */
+export function parseGitRemoteOriginUrl(gitConfigPath) {
+  if (!fs.existsSync(gitConfigPath)) return null;
+  try {
+    const content = fs.readFileSync(gitConfigPath, 'utf8');
+    const lines = content.split('\n');
+    let inRemoteSection = false;
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#') || line.startsWith(';')) continue;
+      const remoteMatch = line.match(/^\[remote\s+"([^"]+)"\]/i);
+      if (remoteMatch) {
+        inRemoteSection = true;
+        continue;
+      }
+      if (line.startsWith('[')) {
+        inRemoteSection = false;
+        continue;
+      }
+      if (inRemoteSection) {
+        const urlMatch = line.match(/^url\s*=\s*(.+)$/i);
+        if (urlMatch) {
+          return urlMatch[1].trim();
+        }
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 const DEFAULT_CORPUS_PATH = path.join(REPO_ROOT, 'evals', 'v2-corpus', 'layer2-external-validity-corpus.json');
@@ -165,8 +204,16 @@ export async function runHarness(options = {}) {
   const canonicalRepoRoot = getCanonicalRealPath(REPO_ROOT);
   const canonicalResolvedOutDir = getCanonicalRealPath(resolvedOutDir);
 
-  // R05-F05 & R06-F04: Confine outDir strictly to dedicated repository harness sandbox paths
-  // Validates both string lexical path and physical canonical realpath across symlinks/junctions
+  // R08-F05 Defense: Strict Repository Root boundary enforcement.
+  // outDir must physically reside strictly within canonicalRepoRoot
+  if (canonicalResolvedOutDir !== canonicalRepoRoot && !canonicalResolvedOutDir.startsWith(canonicalRepoRoot + path.sep)) {
+    throw new Error(
+      `Security Exception (R08-F05): outDir '${resolvedOutDir}' physically escapes repository root '${canonicalRepoRoot}'`
+    );
+  }
+
+  // R05-F05, R06-F04 & R08-F05: Confine outDir strictly to dedicated repository harness sandbox paths.
+  // Each allowed base directory MUST physically reside within canonicalRepoRoot.
   const allowedBaseDirs = [
     path.join(REPO_ROOT, 'evals', 'oss-checkouts'),
     path.join(REPO_ROOT, 'evals', 'live-runs'),
@@ -175,14 +222,22 @@ export async function runHarness(options = {}) {
   const isStringAllowed = allowedBaseDirs.some(base =>
     resolvedOutDir === base || resolvedOutDir.startsWith(base + path.sep)
   );
-  const canonicalAllowedBases = allowedBaseDirs.map(getCanonicalRealPath);
+  const canonicalAllowedBases = allowedBaseDirs.map(base => {
+    const canonicalBase = getCanonicalRealPath(base);
+    if (canonicalBase !== canonicalRepoRoot && !canonicalBase.startsWith(canonicalRepoRoot + path.sep)) {
+      throw new Error(
+        `Security Exception (R08-F05): Allowed base dir '${base}' resolves to '${canonicalBase}' escaping repoRoot '${canonicalRepoRoot}'`
+      );
+    }
+    return canonicalBase;
+  });
   const isPhysicalAllowed = canonicalAllowedBases.some(base =>
     canonicalResolvedOutDir === base || canonicalResolvedOutDir.startsWith(base + path.sep)
   );
 
   if (!isStringAllowed || !isPhysicalAllowed) {
     throw new Error(
-      `Security Exception (R06-F04): outDir '${resolvedOutDir}' physically escapes allowed sandbox roots (${allowedBaseDirs.map(d => path.relative(REPO_ROOT, d)).join(', ')})`
+      `Security Exception (R08-F05): outDir '${resolvedOutDir}' physically escapes allowed sandbox roots (${allowedBaseDirs.map(d => path.relative(REPO_ROOT, d)).join(', ')})`
     );
   }
 
@@ -261,13 +316,17 @@ export async function runHarness(options = {}) {
           } catch {}
         }
 
-        const gitRemoteValid = fs.existsSync(gitConfig) && fs.readFileSync(gitConfig, 'utf8').includes(expectedRemote);
+        // R08-F07: Precise Git remote URL extraction from [remote "..."] INI section
+        const parsedRemoteUrl = parseGitRemoteOriginUrl(gitConfig);
+        const normExpected = expectedRemote ? expectedRemote.trim().replace(/\.git$/, '') : '';
+        const normActual = parsedRemoteUrl ? parsedRemoteUrl.trim().replace(/\.git$/, '') : '';
+        const gitRemoteValid = Boolean(normExpected && normActual && normExpected === normActual);
 
         // Require both marker and git remote (or empty directory) to purge safely
         const isVerifiedHarnessTarget = (markerValid && gitRemoteValid) || fs.readdirSync(dir).length === 0;
         if (!isVerifiedHarnessTarget) {
           throw new Error(
-            `Safety Exception (R07-F07): Refusing to delete directory '${dir}' without mandatory dual-attestation (markerValid: ${markerValid}, gitRemoteValid: ${gitRemoteValid})`
+            `Safety Exception (R08-F07): Refusing to delete directory '${dir}' without mandatory dual-attestation (markerValid: ${markerValid}, gitRemoteValid: ${gitRemoteValid})`
           );
         }
 
