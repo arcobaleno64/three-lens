@@ -52,6 +52,7 @@
     "test:lifecycle": "node --test tests/test-finished-reason-governance.mjs",
     "test:authority": "node --test tests/test-effort-authority-promotion-invariants.mjs",
     "test:acp": "node --test tests/test-acp-transport-governance.mjs",
+    "test:acp-adapter": "node --test tests/test-acp-adapter.mjs",
     "test:plugin-data": "node --test tests/test-plugin-data-adapter.mjs",
     "test:compact": "node --test tests/test-compact-context-governance.mjs",
     "benchmark:confinement": "node scripts/run-confinement-matrix.mjs --report reports/runtime-confinement-report-2026-09-22.md",
