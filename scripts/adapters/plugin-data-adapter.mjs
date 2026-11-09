@@ -1423,6 +1423,34 @@ export function getRevocationCheckpointPath(options = {}) {
 }
 
 /**
+ * R21-B01: Extracts all KEY_REVOCATION entries directly from the on-disk journal without
+ * triggering recursive loadTrustRegistry() / loadRevocationJournal() calls.
+ * Returns Map<targetKeyId, earliestRevocationIndex>.
+ */
+export function getJournalRevokedKeyMap(dir, options = {}) {
+  const revokedMap = new Map();
+  if (!dir || typeof dir !== 'string') return revokedMap;
+  const journalPath = path.join(dir, '.irv-revocation-journal.jsonl');
+  if (!fs.existsSync(journalPath)) return revokedMap;
+  try {
+    const content = fs.readFileSync(journalPath, 'utf8');
+    const lines = content.split(/\r?\n/).filter(l => l.trim().length > 0);
+    for (let i = 0; i < lines.length; i++) {
+      try {
+        const parsed = JSON.parse(lines[i]);
+        if (parsed && parsed.targetId && (parsed.revocationType === REVOCATION_TYPES.KEY_REVOCATION || parsed.revocationType === 'KEY_REVOCATION')) {
+          if (!revokedMap.has(parsed.targetId)) {
+            const idx = typeof parsed.entryIndex === 'number' ? parsed.entryIndex : i;
+            revokedMap.set(parsed.targetId, idx);
+          }
+        }
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return revokedMap;
+}
+
+/**
  * Computes canonical payload for revocation record signature.
  * Resolves M54-P2-F01: Signs all canonical fields to prevent field tampering.
  */
@@ -1715,6 +1743,12 @@ export function validateTrustRegistry(registry, options = {}) {
     }
   }
 
+  let registryDir = null;
+  try {
+    registryDir = resolvePluginDataDir(options);
+  } catch (_) {}
+  const journalRevoked = registryDir ? getJournalRevokedKeyMap(registryDir, options) : new Map();
+
   // Resolve prior registry from options or historical chain
   let priorReg = options.priorRegistry || null;
   if (!priorReg && registry.registryVersion > 1) {
@@ -1809,10 +1843,11 @@ export function validateTrustRegistry(registry, options = {}) {
       };
     }
 
-    // R14-B04 & R19-B01: Key Lifecycle Boundary: A RETIRED or REVOKED key (whether via keys[].status or revokedKeyIds)
+    // R14-B04, R19-B01 & R21-B01: Key Lifecycle Boundary: A RETIRED or REVOKED key (whether via keys[].status, revokedKeyIds, or revocation journal)
     // can NEVER authorize a new or modified HWM. It is only accepted if it is an exact historical carry-over from priorRegistry where the key was active.
     const isHwmSignerRevokedInCurrent = Array.isArray(registry.revokedKeyIds) && registry.revokedKeyIds.includes(hwm.authorizedBy);
-    if (hwmSignerKey.status === 'RETIRED' || hwmSignerKey.status === 'REVOKED' || isHwmSignerRevokedInCurrent) {
+    const isHwmSignerRevokedInJournal = journalRevoked.has(hwm.authorizedBy);
+    if (hwmSignerKey.status === 'RETIRED' || hwmSignerKey.status === 'REVOKED' || isHwmSignerRevokedInCurrent || isHwmSignerRevokedInJournal) {
       const priorHwm = priorReg?.revocationHighWaterMark;
       const isExactPriorMatch = Boolean(
         priorHwm &&
@@ -2022,6 +2057,31 @@ export function validateTrustRegistry(registry, options = {}) {
       }
     }
 
+    // R21-B01: Journal KEY_REVOCATION check against authorizationProof signer
+    if (journalRevoked.has(proof.authorizedBy)) {
+      const revIdx = journalRevoked.get(proof.authorizedBy);
+      // If this registry explicitly commits to an HWM that includes or follows this revocation
+      if (registry.revocationHighWaterMark && typeof registry.revocationHighWaterMark.headIndex === 'number' && registry.revocationHighWaterMark.headIndex >= revIdx) {
+        return {
+          valid: false,
+          error: `[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key '${proof.authorizedBy}' was revoked in revocation journal at index ${revIdx} and cannot authorize registry with HWM headIndex ${registry.revocationHighWaterMark.headIndex}`,
+          cryptographicValidity: false,
+          monotonicValidity: true,
+          ancestryContinuity: ancestryContinuity
+        };
+      }
+      // If validating active candidate update (options.isHistorical !== true)
+      if (options.isHistorical !== true) {
+        return {
+          valid: false,
+          error: `[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key '${proof.authorizedBy}' was revoked in revocation journal at index ${revIdx}; cannot authorize active registry update`,
+          cryptographicValidity: false,
+          monotonicValidity: true,
+          ancestryContinuity: ancestryContinuity
+        };
+      }
+    }
+
     let signerPem = null;
     if (priorReg && typeof priorReg === 'object' && Array.isArray(priorReg.keys)) {
       // R13-B06: Resolve prior of prior for multi-generation chains
@@ -2058,7 +2118,8 @@ export function validateTrustRegistry(registry, options = {}) {
       const priorValidation = validateTrustRegistry(priorReg, {
         ...options,
         priorRegistry: priorOfPrior,
-        minRegistryVersion: 1
+        minRegistryVersion: 1,
+        isHistorical: true
       });
       if (!priorValidation.valid) {
         return {
@@ -2137,10 +2198,23 @@ export function validateTrustRegistry(registry, options = {}) {
  * @param {KeyObject|string} signerPrivateKey
  * @returns {object} Updated registry with authorizationProof
  */
-export function createAuthorizedRegistryUpdate(currentRegistry, updates, signerKeyId, signerPrivateKey) {
+export function createAuthorizedRegistryUpdate(currentRegistry, updates, signerKeyId, signerPrivateKey, options = {}) {
   // R08-B05: Revoked keys cannot authorize updates
   if (Array.isArray(currentRegistry.revokedKeyIds) && currentRegistry.revokedKeyIds.includes(signerKeyId)) {
     throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key '${signerKeyId}' has already been revoked in current registry`);
+  }
+
+  // R21-B01: Revoked keys in revocation journal cannot authorize updates
+  const effectiveOpts = options && typeof options === 'object' ? options : {};
+  let effectiveDir = null;
+  try {
+    effectiveDir = resolvePluginDataDir(effectiveOpts);
+  } catch (_) {}
+  if (effectiveDir) {
+    const journalRevoked = getJournalRevokedKeyMap(effectiveDir, effectiveOpts);
+    if (journalRevoked.has(signerKeyId)) {
+      throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key '${signerKeyId}' was revoked in revocation journal at index ${journalRevoked.get(signerKeyId)}; cannot authorize registry update`);
+    }
   }
   // R13-B08: Retired keys cannot authorize updates!
   if (Array.isArray(currentRegistry.keys)) {
@@ -3547,6 +3621,16 @@ export function saveTrustRegistry(registry, options = {}) {
     const saveRegDigest = computeRegistryDigest(registry);
     const saveNonHwmDigest = computeRegistryNonHwmDigest(registry);
     assertMonotonicWitnessFreshness(dir, registry.registryVersion, saveHwmIdx, saveHwmDigest, saveRegDigest, { ...opts, nonHwmDigest: saveNonHwmDigest });
+
+    // R21-B01: Prevent saving registry update authorized by a key revoked in the revocation journal
+    if (registry.authorizationProof && registry.authorizationProof.authorizedBy) {
+      const journalRevoked = getJournalRevokedKeyMap(dir, opts);
+      if (journalRevoked.has(registry.authorizationProof.authorizedBy)) {
+        const revIdx = journalRevoked.get(registry.authorizationProof.authorizedBy);
+        throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key '${registry.authorizationProof.authorizedBy}' was revoked in revocation journal at index ${revIdx}; cannot authorize registry`);
+      }
+    }
+
     let priorRegistry = null;
     // Check against existing on-disk registry if present
     if (fs.existsSync(regPath)) {

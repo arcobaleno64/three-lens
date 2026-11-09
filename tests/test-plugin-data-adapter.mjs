@@ -5836,3 +5836,357 @@ test('R20-B04: safeWriteFileSync and append handle partial writes and reject sho
 
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
+
+test('R21-B01: Journal KEY_REVOCATION terminates signer authority for Trust Registry updates and prevents unauthorized authority resurrection', () => {
+  const tempDir = createTempDir('r21-b01-');
+  const rootAuth = generateTestAuthority();
+  const delegatedAuthA = generateTestAuthority();
+  const rogueAuthB = generateTestAuthority();
+
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: rootAuth.keyId,
+    trustedRootPublicKeyPem: rootAuth.pem,
+    trustedRootFingerprint: rootAuth.fp
+  };
+
+  // 1. Genesis v1 with rootAuth
+  const reg1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keys: [
+      {
+        keyId: rootAuth.keyId,
+        keyFingerprint: rootAuth.fp,
+        publicKeyPem: rootAuth.pem,
+        status: 'ACTIVE_PINNED_ROOT',
+        issuedAt: '2026-01-01T00:00:00.000Z'
+      }
+    ],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(reg1, opts);
+
+  // 2. Rotate to v2 adding delegatedAuthA as ACTIVE
+  const v1Loaded = loadTrustRegistry(opts).registry;
+  const reg2 = createAuthorizedRegistryUpdate(
+    v1Loaded,
+    {
+      activeKeyId: rootAuth.keyId,
+      activeKeyFingerprint: rootAuth.fp,
+      activePublicKeyPem: rootAuth.pem,
+      keys: [
+        {
+          keyId: rootAuth.keyId,
+          keyFingerprint: rootAuth.fp,
+          publicKeyPem: rootAuth.pem,
+          status: 'ACTIVE_PINNED_ROOT',
+          issuedAt: '2026-01-01T00:00:00.000Z'
+        },
+        {
+          keyId: delegatedAuthA.keyId,
+          keyFingerprint: delegatedAuthA.fp,
+          publicKeyPem: delegatedAuthA.pem,
+          status: 'ACTIVE',
+          issuedAt: new Date().toISOString()
+        }
+      ]
+    },
+    rootAuth.keyId,
+    rootAuth.privateKey,
+    opts
+  );
+  saveTrustRegistry(reg2, opts);
+
+  // 3. Normal operation: delegatedAuthA appends entry 0 (NONCE_REVOCATION)
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.NONCE_REVOCATION,
+    targetId: 'nonce-compromised-0',
+    reason: 'delegatedAuthA normal revocation'
+  }, { ...opts, signerKeyId: delegatedAuthA.keyId, signerPrivateKey: delegatedAuthA.privateKey });
+
+  // 4. Compromise & Revocation: rootAuth appends entry 1 (KEY_REVOCATION revoking delegatedAuthA)
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: delegatedAuthA.keyId,
+    reason: 'delegatedAuthA compromised and revoked'
+  }, { ...opts, signerKeyId: rootAuth.keyId, signerPrivateKey: rootAuth.privateKey });
+
+  // Verify isRevoked confirms delegatedAuthA is revoked
+  const revCheck = isRevoked(delegatedAuthA.keyId, opts);
+  assert.strictEqual(revCheck.revoked, true);
+
+  // 5. Attack Vector 1: Attempt to create Registry v3 via createAuthorizedRegistryUpdate() using revoked delegatedAuthA
+  assert.throws(
+    () => createAuthorizedRegistryUpdate(
+      reg2,
+      {
+        keys: [
+          {
+            keyId: rootAuth.keyId,
+            keyFingerprint: rootAuth.fp,
+            publicKeyPem: rootAuth.pem,
+            status: 'ACTIVE_PINNED_ROOT',
+            issuedAt: '2026-01-01T00:00:00.000Z'
+          },
+          {
+            keyId: rogueAuthB.keyId,
+            keyFingerprint: rogueAuthB.fp,
+            publicKeyPem: rogueAuthB.pem,
+            status: 'ACTIVE',
+            issuedAt: new Date().toISOString()
+          }
+        ]
+      },
+      delegatedAuthA.keyId,
+      delegatedAuthA.privateKey,
+      opts
+    ),
+    /REVOKED_KEY_AUTHORIZATION_REJECTED/
+  );
+
+  // 6. Attack Vector 2: Attacker crafts Registry v3 authorizationProof manually with delegatedAuthA and calls saveTrustRegistry
+  const curJournal = loadRevocationJournal(opts);
+  const curHeadIndex = curJournal.entries.length - 1;
+  const curHeadDigest = sha256Digest(canonicalJsonStringify(curJournal.entries[curHeadIndex]));
+
+  const craftedV3 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 3,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keys: [
+      {
+        keyId: rootAuth.keyId,
+        keyFingerprint: rootAuth.fp,
+        publicKeyPem: rootAuth.pem,
+        status: 'ACTIVE_PINNED_ROOT',
+        issuedAt: '2026-01-01T00:00:00.000Z'
+      },
+      {
+        keyId: rogueAuthB.keyId,
+        keyFingerprint: rogueAuthB.fp,
+        publicKeyPem: rogueAuthB.pem,
+        status: 'ACTIVE',
+        issuedAt: new Date().toISOString()
+      }
+    ],
+    revokedKeyIds: [],
+    revocationHighWaterMark: {
+      headIndex: curHeadIndex,
+      headDigest: curHeadDigest,
+      updatedAt: new Date().toISOString(),
+      authorizedBy: rootAuth.keyId
+    }
+  };
+  const craftedHwmSignPayload = Buffer.from(canonicalJsonStringify({
+    headIndex: curHeadIndex,
+    headDigest: curHeadDigest,
+    updatedAt: craftedV3.revocationHighWaterMark.updatedAt,
+    authorizedBy: rootAuth.keyId
+  }), 'utf8');
+  craftedV3.revocationHighWaterMark.signature = crypto.sign(null, craftedHwmSignPayload, rootAuth.privateKey).toString('hex');
+
+  const v3AuthPayload = Buffer.from(computeRegistryAuthorizationPayload(craftedV3), 'utf8');
+  craftedV3.authorizationProof = {
+    authorizedBy: delegatedAuthA.keyId,
+    signature: crypto.sign(null, v3AuthPayload, delegatedAuthA.privateKey).toString('hex'),
+    timestamp: new Date().toISOString()
+  };
+
+  assert.throws(
+    () => saveTrustRegistry(craftedV3, opts),
+    /REVOKED_KEY_AUTHORIZATION_REJECTED/
+  );
+
+  // 7. Attack Vector 3: Attacker directly overwrites supervisor-trust-registry.json on disk with craftedV3
+  const regPath = getTrustRegistryPath(opts);
+  fs.writeFileSync(regPath, JSON.stringify(craftedV3, null, 2) + '\n', 'utf8');
+
+  assert.throws(
+    () => loadTrustRegistry(opts),
+    /REVOKED_KEY_AUTHORIZATION_REJECTED/
+  );
+
+  assert.throws(
+    () => loadRevocationJournal(opts),
+    /TRUST_REGISTRY_INVALID|REVOKED_KEY_AUTHORIZATION_REJECTED/
+  );
+
+  // 8. Verify rogue key rogueAuthB cannot be recognized or append any revocation records
+  assert.throws(
+    () => appendRevocationEntry({
+      revocationType: REVOCATION_TYPES.NONCE_REVOCATION,
+      targetId: 'rogue-target',
+      reason: 'rogue operation'
+    }, { ...opts, signerKeyId: rogueAuthB.keyId, signerPrivateKey: rogueAuthB.privateKey }),
+    /INACTIVE_SIGNER_REJECTED|REVOKED_KEY_AUTHORIZATION_REJECTED|TRUST_REGISTRY_INVALID/
+  );
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('R21-B02: Clean-room process restart recovers COMMITTED WAL across process crash before secondary witness sync', () => {
+  const tempDir = createTempDir('r21-b02-');
+  const rootAuth = generateTestAuthority();
+
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: rootAuth.keyId,
+    trustedRootPublicKeyPem: rootAuth.pem,
+    trustedRootFingerprint: rootAuth.fp
+  };
+
+  const reg1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keys: [{
+      keyId: rootAuth.keyId,
+      keyFingerprint: rootAuth.fp,
+      publicKeyPem: rootAuth.pem,
+      status: 'ACTIVE_PINNED_ROOT',
+      issuedAt: '2026-01-01T00:00:00.000Z'
+    }],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(reg1, opts);
+
+  // Append entry 0 normally
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'victim-0',
+    reason: 'Initial revocation'
+  }, { ...opts, signerKeyId: rootAuth.keyId, signerPrivateKey: rootAuth.privateKey });
+
+  const journalPath = getRevocationJournalPath(opts);
+  const cpPath = getRevocationCheckpointPath(opts);
+  const regPath = getTrustRegistryPath(opts);
+  const walPath = path.join(path.dirname(regPath), REVOCATION_TXN_FILE);
+  const histV1Path = path.join(path.dirname(regPath), 'history', 'trust-registry.v1.json');
+
+  const lines = fs.readFileSync(journalPath, 'utf8').trim().split(/\r?\n/);
+  const entry0Digest = sha256Digest(canonicalJsonStringify(JSON.parse(lines[0])));
+
+  // Prepare entry 1
+  const entry1 = {
+    entryIndex: 1,
+    timestamp: new Date().toISOString(),
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: 'victim-1',
+    reason: 'Second revocation before crash',
+    prevEntryDigest: entry0Digest,
+    signedBy: rootAuth.keyId
+  };
+  entry1.signature = crypto.sign(null, Buffer.from(computeRevocationEntrySignPayload(entry1), 'utf8'), rootAuth.privateKey).toString('hex');
+  const entry1Digest = sha256Digest(canonicalJsonStringify(entry1));
+  fs.appendFileSync(journalPath, JSON.stringify(entry1) + '\n', 'utf8');
+
+  fs.writeFileSync(cpPath, JSON.stringify({
+    headIndex: 1,
+    headDigest: entry1Digest,
+    updatedAt: entry1.timestamp,
+    registryVersion: 1
+  }, null, 2) + '\n', 'utf8');
+
+  const curReg = JSON.parse(fs.readFileSync(regPath, 'utf8'));
+  curReg.revocationHighWaterMark = {
+    headIndex: 1,
+    headDigest: entry1Digest,
+    updatedAt: entry1.timestamp,
+    authorizedBy: rootAuth.keyId
+  };
+  curReg.revocationHighWaterMark.signature = crypto.sign(
+    null,
+    Buffer.from(canonicalJsonStringify({
+      headIndex: 1,
+      headDigest: entry1Digest,
+      updatedAt: entry1.timestamp,
+      authorizedBy: rootAuth.keyId
+    }), 'utf8'),
+    rootAuth.privateKey
+  ).toString('hex');
+  fs.writeFileSync(regPath, JSON.stringify(curReg, null, 2) + '\n', 'utf8');
+  fs.writeFileSync(histV1Path, JSON.stringify(curReg, null, 2) + '\n', 'utf8');
+
+  // Create COMMITTED WAL simulating crash before secondary witness write
+  const committedWal = {
+    txnId: 'tx-r21-b02-committed-crash-clean-process',
+    status: 'COMMITTED',
+    timestamp: new Date().toISOString(),
+    committedAt: new Date().toISOString(),
+    signedBy: rootAuth.keyId,
+    journalPath,
+    checkpointPath: cpPath,
+    regPath,
+    histPath: histV1Path,
+    initialJournalSize: lines[0].length + 1,
+    initialJournalExisted: true,
+    initialJournalSha256: sha256Digest(Buffer.from(lines[0] + '\n')),
+    initialCheckpointSha256: '0'.repeat(64),
+    initialCheckpointExisted: true,
+    initialRegistrySha256: '0'.repeat(64),
+    initialRegistryExisted: true,
+    initialRegistryVersion: 1,
+    initialHwmHeadIndex: 0,
+    initialHwmHeadDigest: entry0Digest,
+    committedHwmHeadIndex: 1,
+    committedHwmHeadDigest: entry1Digest,
+    expectedTargetHwmHeadIndex: 1,
+    expectedTargetHwmHeadDigest: entry1Digest,
+    expectedTargetRegistryVersion: 1
+  };
+  committedWal.signature = crypto.sign(
+    null,
+    Buffer.from(computeTransactionWalSignPayload(committedWal), 'utf8'),
+    rootAuth.privateKey
+  ).toString('hex');
+  fs.writeFileSync(walPath, JSON.stringify(committedWal, null, 2) + '\n', 'utf8');
+
+  // Execute clean-room process restart via child_process.execFileSync
+  const adapterUrl = pathToFileURL(path.resolve('scripts/adapters/plugin-data-adapter.mjs')).href;
+  const script = `
+    import { loadRevocationJournal, isRevoked, getMonotonicWitness } from '${adapterUrl}';
+    import assert from 'node:assert';
+    import fs from 'node:fs';
+
+    const opts = ${JSON.stringify(opts)};
+    const journal = loadRevocationJournal(opts);
+    assert.strictEqual(journal.entries.length, 2, 'Journal entries count mismatch');
+    assert.strictEqual(journal.entries[1].targetId, 'victim-1');
+
+    const witness = getMonotonicWitness('${tempDir.replace(/\\/g, '\\\\')}', opts);
+    assert.strictEqual(witness.maxSeenHwmHeadIndex, 1, 'Witness failed to advance to committed index 1');
+
+    const rev0 = isRevoked('victim-0', opts);
+    assert.strictEqual(rev0.revoked, true);
+
+    const rev1 = isRevoked('victim-1', opts);
+    assert.strictEqual(rev1.revoked, true);
+
+    assert.strictEqual(fs.existsSync('${walPath.replace(/\\/g, '\\\\')}'), false, 'WAL file was not cleaned up');
+  `;
+
+  execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+    stdio: 'pipe',
+    env: { ...process.env, NODE_NO_WARNINGS: '1' }
+  });
+
+  // Verify in parent process as well
+  assert.strictEqual(fs.existsSync(walPath), false);
+  const jAfter = loadRevocationJournal(opts);
+  assert.strictEqual(jAfter.entries.length, 2);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
