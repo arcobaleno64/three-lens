@@ -2,23 +2,33 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ACP_DIAGNOSTIC_SEVERITY,
+  assertFindingDispositionAuthority,
   mapSeverityToAcpDiagnostic,
   formatAcpDiagnostic,
   serializeJsonRpcNotification,
   formatPublishDiagnosticsNotification,
+  formatBallotProgressNotification,
+  handleInitialize,
   parseJsonRpcMessage,
   createAcpDiagnosticEmitter
 } from '../scripts/adapters/acp-adapter.mjs';
 
-test('ACP Adapter: mapSeverityToAcpDiagnostic severity mapping', () => {
-  assert.equal(mapSeverityToAcpDiagnostic('CRITICAL'), ACP_DIAGNOSTIC_SEVERITY.ERROR);
-  assert.equal(mapSeverityToAcpDiagnostic('HIGH'), ACP_DIAGNOSTIC_SEVERITY.ERROR);
-  assert.equal(mapSeverityToAcpDiagnostic('MEDIUM'), ACP_DIAGNOSTIC_SEVERITY.WARNING);
-  assert.equal(mapSeverityToAcpDiagnostic('LOW'), ACP_DIAGNOSTIC_SEVERITY.INFORMATION);
-  assert.equal(mapSeverityToAcpDiagnostic('INFO'), ACP_DIAGNOSTIC_SEVERITY.HINT);
-  assert.equal(mapSeverityToAcpDiagnostic('NONE'), ACP_DIAGNOSTIC_SEVERITY.HINT);
-  assert.equal(mapSeverityToAcpDiagnostic('UNKNOWN'), ACP_DIAGNOSTIC_SEVERITY.HINT);
-  assert.equal(mapSeverityToAcpDiagnostic(null), ACP_DIAGNOSTIC_SEVERITY.HINT);
+test('ACP Adapter: mapSeverityToAcpDiagnostic severity mapping and Default-Deny clamping', () => {
+  // Confirmed reportable findings map to appropriate severity
+  assert.equal(mapSeverityToAcpDiagnostic('CRITICAL', 'REPORTABLE'), ACP_DIAGNOSTIC_SEVERITY.ERROR);
+  assert.equal(mapSeverityToAcpDiagnostic('HIGH', 'CONFIRMED'), ACP_DIAGNOSTIC_SEVERITY.ERROR);
+  assert.equal(mapSeverityToAcpDiagnostic('MEDIUM', 'REPORTABLE'), ACP_DIAGNOSTIC_SEVERITY.WARNING);
+  assert.equal(mapSeverityToAcpDiagnostic('LOW', 'REPORTABLE'), ACP_DIAGNOSTIC_SEVERITY.INFORMATION);
+  assert.equal(mapSeverityToAcpDiagnostic('INFO', 'REPORTABLE'), ACP_DIAGNOSTIC_SEVERITY.HINT);
+  assert.equal(mapSeverityToAcpDiagnostic('NONE', 'REPORTABLE'), ACP_DIAGNOSTIC_SEVERITY.HINT);
+  assert.equal(mapSeverityToAcpDiagnostic('UNKNOWN', 'REPORTABLE'), ACP_DIAGNOSTIC_SEVERITY.HINT);
+  assert.equal(mapSeverityToAcpDiagnostic(null, 'REPORTABLE'), ACP_DIAGNOSTIC_SEVERITY.HINT);
+
+  // R01-F04 Invariant: Unverified candidates are strictly clamped to HINT (4), never ERROR (1)
+  assert.equal(mapSeverityToAcpDiagnostic('CRITICAL', 'UNVERIFIED'), ACP_DIAGNOSTIC_SEVERITY.HINT);
+  assert.equal(mapSeverityToAcpDiagnostic('HIGH', 'DEFERRED'), ACP_DIAGNOSTIC_SEVERITY.HINT);
+  assert.equal(mapSeverityToAcpDiagnostic('CRITICAL', 'CANDIDATE'), ACP_DIAGNOSTIC_SEVERITY.HINT);
+  assert.equal(mapSeverityToAcpDiagnostic('CRITICAL', null), ACP_DIAGNOSTIC_SEVERITY.HINT);
 });
 
 test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata', () => {
@@ -27,6 +37,7 @@ test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata'
     ruleId: 'CWE-89',
     title: 'SQL Injection via query concatenation',
     severity: 'HIGH',
+    disposition: 'REPORTABLE',
     location: {
       uri: 'src/db.js',
       startLine: 42,
@@ -53,7 +64,47 @@ test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata'
   });
   assert.equal(diag.data.id, 'FIND-001');
   assert.equal(diag.data.lineageId, 'lin-abc-123');
+  assert.equal(diag.data.authorityConfirmed, true);
   assert.equal(diag.data.remediation, 'Use parameterized queries');
+});
+
+test('ACP Adapter: R01-F04 Authority Gate clamps unverified candidate in formatAcpDiagnostic', () => {
+  const candidate = {
+    id: 'CAND-001',
+    ruleId: 'CWE-918',
+    title: 'Potential SSRF candidate',
+    severity: 'CRITICAL',
+    disposition: 'DEFERRED',
+    location: { startLine: 12 }
+  };
+
+  const diag = formatAcpDiagnostic(candidate);
+
+  // Must NOT be an Error (1) under Default-Deny
+  assert.equal(diag.severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
+  assert.equal(diag.data.authorityConfirmed, false);
+  assert.ok(diag.message.includes('[UNVERIFIED CANDIDATE]'));
+});
+
+test('ACP Adapter: R01-F05 Safe integer clamping and boundary defense', () => {
+  const weirdFinding = {
+    id: 'F-WEIRD',
+    ruleId: 'CWE-022',
+    severity: 'HIGH',
+    disposition: 'CONFIRMED',
+    location: {
+      startLine: -10,
+      endLine: NaN,
+      startColumn: null,
+      endColumn: Infinity
+    }
+  };
+
+  const diag = formatAcpDiagnostic(weirdFinding);
+  assert.equal(diag.range.start.line, 0);
+  assert.equal(diag.range.end.line, 0);
+  assert.equal(diag.range.start.character, 0);
+  assert.equal(diag.range.end.character, 0);
 });
 
 test('ACP Adapter: serializeJsonRpcNotification single-line JSON with trailing LF', () => {
@@ -74,6 +125,7 @@ test('ACP Adapter: formatPublishDiagnosticsNotification formats full notificatio
       ruleId: 'CWE-79',
       title: 'XSS flaw',
       severity: 'MEDIUM',
+      disposition: 'CONFIRMED',
       location: { startLine: 10 }
     }
   ];
@@ -87,6 +139,25 @@ test('ACP Adapter: formatPublishDiagnosticsNotification formats full notificatio
   assert.equal(parsed.params.diagnostics.length, 1);
   assert.equal(parsed.params.diagnostics[0].code, 'CWE-79');
   assert.equal(parsed.params.diagnostics[0].severity, 2);
+});
+
+test('ACP Adapter: R01-F03 formatBallotProgressNotification emits window/logMessage', () => {
+  const line = formatBallotProgressNotification('CAND-CWE-918-01', 'REACHABILITY', 'CONFIRMED', 'HTTP sink directly reachable');
+  const parsed = JSON.parse(line.trim());
+
+  assert.equal(parsed.jsonrpc, '2.0');
+  assert.equal(parsed.method, 'window/logMessage');
+  assert.equal(parsed.params.type, 3);
+  assert.ok(parsed.params.message.includes('[3-Lens Ballot] Candidate CAND-CWE-918-01 - Lens REACHABILITY: CONFIRMED'));
+});
+
+test('ACP Adapter: R01-F03 handleInitialize returns ACP diagnostic and progress capabilities', () => {
+  const resp = handleInitialize({ id: 42, method: 'initialize' });
+  assert.equal(resp.jsonrpc, '2.0');
+  assert.equal(resp.id, 42);
+  assert.equal(resp.result.capabilities.diagnosticProvider, true);
+  assert.equal(resp.result.capabilities.progressProvider, true);
+  assert.equal(resp.result.serverInfo.name, 'three-lens-acp-adapter');
 });
 
 test('ACP Adapter: parseJsonRpcMessage validation and error handling', () => {
@@ -107,7 +178,7 @@ test('ACP Adapter: parseJsonRpcMessage validation and error handling', () => {
   assert.equal(parsedMalformed.error, 'PARSE_ERROR');
 });
 
-test('ACP Adapter: createAcpDiagnosticEmitter stream writing', () => {
+test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting', () => {
   const chunks = [];
   const mockStream = {
     write(chunk) {
@@ -120,12 +191,19 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing', () => {
     id: 'F-1',
     ruleId: 'CWE-22',
     severity: 'CRITICAL',
+    disposition: 'CONFIRMED',
     location: { startLine: 1 }
   });
 
-  assert.equal(chunks.length, 1);
-  const parsed = JSON.parse(chunks[0].trim());
-  assert.equal(parsed.method, 'textDocument/publishDiagnostics');
-  assert.equal(parsed.params.diagnostics[0].code, 'CWE-22');
-  assert.equal(parsed.params.diagnostics[0].severity, 1);
+  emitter.emitBallotProgress('CAND-01', 'DEFENSES', 'REFUTES', 'Sanitizer active');
+
+  assert.equal(chunks.length, 2);
+  const diagParsed = JSON.parse(chunks[0].trim());
+  assert.equal(diagParsed.method, 'textDocument/publishDiagnostics');
+  assert.equal(diagParsed.params.diagnostics[0].code, 'CWE-22');
+  assert.equal(diagParsed.params.diagnostics[0].severity, 1);
+
+  const ballotParsed = JSON.parse(chunks[1].trim());
+  assert.equal(ballotParsed.method, 'window/logMessage');
+  assert.ok(ballotParsed.params.message.includes('DEFENSES: REFUTES'));
 });

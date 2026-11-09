@@ -1479,7 +1479,7 @@ export function runTests() {
     const cleanExtractDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-audit-zip-clean-'));
     try {
       // Copy project files (excluding .git) to simulate freshly extracted zip archive
-      const copyItems = ['package.json', 'LICENSE', 'README.md', 'SECURITY.md', 'plugin.json', 'hooks.json', 'hooks', 'rules', 'agents', 'skills', 'evals', 'schemas', '.security-audit', 'recommended-security-audit-permissions.json', 'scripts', 'tests'];
+      const copyItems = ['package.json', 'LICENSE', 'README.md', 'SECURITY.md', 'plugin.json', 'hooks.json', 'hooks', 'rules', 'agents', 'skills', 'evals', 'schemas', '.security-audit', 'recommended-security-audit-permissions.json', 'scripts', 'tests', 'tool-integrity-manifest.json'];
       for (const item of copyItems) {
         const srcPath = path.resolve(process.cwd(), item);
         if (fs.existsSync(srcPath)) {

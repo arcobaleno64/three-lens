@@ -3614,8 +3614,10 @@ export function finalizeScan({
     if (toolIntegrity.status === 'SELF_AUDIT_MODE') {
       assuranceLabel = 'SELF_AUDIT_BOUNDED_CLEAN';
     } else if (!hasConfirmedProjectContext) {
-      // R9-T10: Project Security Context absent -> assurance CONTEXT_LIMITED
+      // R9-T10 & R01-F08: Project Security Context absent -> assurance CONTEXT_LIMITED
+      // Under Default-Deny, CONTEXT_LIMITED cannot declare clean (preventing downstream misinterpretation as Clean Attestation)
       assuranceLabel = 'CONTEXT_LIMITED';
+      canDeclareClean = false;
     } else {
       // R9-T11: confirmed Project Security Context -> eligible for BOUNDED_CLEAN
       assuranceLabel = 'BOUNDED_CLEAN';

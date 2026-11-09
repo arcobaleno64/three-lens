@@ -161,6 +161,12 @@ export function validateV2Corpus(corpusPath = path.join(REPO_ROOT, 'evals/v2-cor
       if (!c.cveId || !/^CVE-\d{4}-\d{4,}$/.test(c.cveId)) {
         errors.push(`${prefix}: UPSTREAM_VERIFIED_OSS must have valid cveId (e.g. CVE-2020-7598), found '${c.cveId}'`);
       }
+      if (!c.upstreamCommitSha || !/^[0-9a-f]{40}$/i.test(c.upstreamCommitSha)) {
+        errors.push(`${prefix}: UPSTREAM_VERIFIED_OSS must have valid 40-character hex upstreamCommitSha, found '${c.upstreamCommitSha}'`);
+      }
+      if (!c.upstreamRepo || !/^https:\/\/github\.com\/[^/]+\/[^/]+/i.test(c.upstreamRepo)) {
+        errors.push(`${prefix}: UPSTREAM_VERIFIED_OSS must have valid upstreamRepo URL, found '${c.upstreamRepo}'`);
+      }
     }
 
     if (!['VULNERABLE', 'FIXED_COUNTERPART', 'CLEAN_CONTROL'].includes(c.role)) {

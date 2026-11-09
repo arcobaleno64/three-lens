@@ -4,7 +4,7 @@
   "protocolVersion": "2.0.0",
   "frameworkReference": "evals/protocols/v2.0-three-layer-evaluation-framework.md",
   "status": "FROZEN_BEFORE_RUN",
-  "frozenAt": "2026-10-12T00:00:00Z",
+  "frozenAt": "2026-11-09T16:00:00Z",
   "targetSystem": "@arcobaleno64/three-lens",
   "governance": {
     "authority": "Antigravity Security Governance & Assurance Directorate",
