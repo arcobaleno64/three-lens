@@ -136,6 +136,21 @@ export async function runHarness(options = {}) {
   let failedCount = 0;
   const resolvedOutDir = path.resolve(outDir);
 
+  // R05-F05: Confine outDir strictly to dedicated repository harness sandbox paths
+  const allowedBaseDirs = [
+    path.join(REPO_ROOT, 'evals', 'oss-checkouts'),
+    path.join(REPO_ROOT, 'evals', 'live-runs'),
+    path.join(REPO_ROOT, 'scratch')
+  ];
+  const isAllowedOutDir = allowedBaseDirs.some(base =>
+    resolvedOutDir === base || resolvedOutDir.startsWith(base + path.sep)
+  );
+  if (!isAllowedOutDir) {
+    throw new Error(
+      `Security Exception (R05-F05): outDir '${resolvedOutDir}' must be confined to repository sandbox paths (${allowedBaseDirs.map(d => path.relative(REPO_ROOT, d)).join(', ')})`
+    );
+  }
+
   for (const tc of targets) {
     const upstreamUrl = tc.upstreamRepoUrl || tc.upstreamRepo;
     const commitSha = tc.upstreamCommitSha || tc.commitSha;
@@ -179,23 +194,29 @@ export async function runHarness(options = {}) {
         throw new Error(`Path containment violation: ${targetDir} escapes outDir ${resolvedOutDir}`);
       }
 
-      // R04-F05: Safe harness directory purger preventing recursive deletion of arbitrary user directories
+      // R04-F05 & R05-F03: Safe harness directory purger preventing recursive deletion of arbitrary directories
+      // Harness marker metadata is stored OUTSIDE the checkout directory to ensure Zero Workspace Pollution.
       function safePurgeHarnessTarget(dir, baseOutDir, expectedRemote) {
         if (!dir.startsWith(baseOutDir + path.sep)) {
           throw new Error(`Security Exception: targetDir ${dir} escapes base outDir ${baseOutDir}`);
         }
         if (!fs.existsSync(dir)) return;
-        const marker = path.join(dir, '.three-lens-harness-checkout');
+        const marker = path.join(baseOutDir, `.${path.basename(dir)}.harness-metadata.json`);
+        const legacyInternalMarker = path.join(dir, '.three-lens-harness-checkout');
         const gitConfig = path.join(dir, '.git', 'config');
         const isHarnessOwned = fs.existsSync(marker) ||
+          fs.existsSync(legacyInternalMarker) ||
           (fs.existsSync(gitConfig) && fs.readFileSync(gitConfig, 'utf8').includes(expectedRemote));
         if (!isHarnessOwned && fs.readdirSync(dir).length > 0) {
           throw new Error(`Safety Exception (R04-F05): Refusing to delete directory '${dir}' without verified harness ownership`);
         }
         fs.rmSync(dir, { recursive: true, force: true });
+        if (fs.existsSync(marker)) {
+          try { fs.unlinkSync(marker); } catch {}
+        }
       }
 
-      // R03-F02 & R04-F03: Full 40-char SHA matching and worktree verification immune to skip-worktree
+      // R03-F02, R04-F03 & R05-F03: Full 40-char SHA matching and worktree verification immune to skip-worktree / assume-unchanged
       let isExistingValidRepo = false;
       if (fs.existsSync(targetDir) && fs.existsSync(path.join(targetDir, '.git'))) {
         try {
@@ -205,12 +226,24 @@ export async function runHarness(options = {}) {
           // R04-F03: Exact 40-character commit SHA match
           const isExactCommit = headRev.toLowerCase() === commitSha.toLowerCase();
           
-          // R04-F03: Detect index manipulation / skip-worktree via diff-index and diff-files
+          // R05-F03: Detect index manipulation / skip-worktree / assume-unchanged via git ls-files -v
+          // In git ls-files -v:
+          // 'H' = cached (normal valid index entry)
+          // 'S' = skip-worktree (tampered/masked index entry)
+          // 'h' = assume-unchanged (tampered/masked index entry)
+          const lsFilesOut = execFileSync('git', ['ls-files', '-v'], { cwd: targetDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+          const hasIndexTampering = lsFilesOut.split(/\r?\n/).some(line => {
+            const trimmed = line.trim();
+            if (!trimmed) return false;
+            const tag = trimmed[0];
+            return tag === 'S' || tag === 'h' || (tag !== 'H' && tag !== '?');
+          });
+
           let isTreeIntact = false;
           try {
             execFileSync('git', ['diff-index', '--quiet', 'HEAD', '--'], { cwd: targetDir, stdio: ['ignore', 'pipe', 'pipe'] });
             execFileSync('git', ['diff-files', '--quiet'], { cwd: targetDir, stdio: ['ignore', 'pipe', 'pipe'] });
-            isTreeIntact = (statusOutput === '');
+            isTreeIntact = (statusOutput === '' && !hasIndexTampering);
           } catch {
             isTreeIntact = false;
           }
@@ -238,12 +271,13 @@ export async function runHarness(options = {}) {
         try {
           execFileSync('git', ['clone', '--no-checkout', upstreamUrl, targetDir], { stdio: 'pipe' });
           execFileSync('git', ['checkout', commitSha], { cwd: targetDir, stdio: 'pipe' });
-          // Stamp harness ownership marker (R04-F05)
-          fs.writeFileSync(path.join(targetDir, '.three-lens-harness-checkout'), JSON.stringify({
+          // Stamp harness ownership marker OUTSIDE targetDir to prevent working tree pollution (R05-F03)
+          const externalMarker = path.join(resolvedOutDir, `.${path.basename(targetDir)}.harness-metadata.json`);
+          fs.writeFileSync(externalMarker, JSON.stringify({
             caseId: tc.caseId,
             upstreamCommitSha: commitSha,
             createdAt: new Date().toISOString()
-          }));
+          }, null, 2));
           console.log(`  ✔ Successfully checked out ${commitSha.slice(0, 10)}`);
           verifiedCount++;
         } catch (err) {

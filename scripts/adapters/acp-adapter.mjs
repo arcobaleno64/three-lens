@@ -18,6 +18,8 @@
  */
 
 import path from 'node:path';
+import crypto from 'node:crypto';
+import { DEFAULT_SUPERVISOR_PUBLIC_PEM } from './plugin-data-adapter.mjs';
 
 /**
  * Standard LSP / ACP Diagnostic Severity ratings:
@@ -35,68 +37,111 @@ export const ACP_DIAGNOSTIC_SEVERITY = Object.freeze({
 
 /**
  * Checks whether a finding has passed 3-lens consensus and achieved authoritative reportable status.
- * Under Default-Deny (R03-F03), self-asserted disposition strings without consensus,
- * provenance, or ballots cannot claim authorityConfirmed.
+ * Under Default-Deny (R05-F01), mere field presence or unverified consensus/proof cannot claim authority.
  * @param {object} finding
+ * @param {object} [options={}]
  * @returns {boolean}
  */
-export function assertFindingDispositionAuthority(finding) {
+export function assertFindingDispositionAuthority(finding, options = {}) {
   if (!finding || typeof finding !== 'object') return false;
   const disp = String(finding.disposition || '').toUpperCase().trim();
   const isReportableDisp = disp === 'CONFIRMED' || disp === 'REPORTABLE';
   if (!isReportableDisp) return false;
 
-  // R04-F01 Defense: Under Default-Deny, authorityConfirmed CANNOT be granted by mere field presence.
-  // Spoofed inputs such as lineageId: 'x', authorityProof: {}, consensus: { totalVotes: 2 },
-  // or ballots: [{}, {}] must strictly fail closed.
+  // R05-F01 Defense: Under Default-Deny, authorityConfirmed CANNOT be granted by mere field presence
+  // or self-asserted consensus/lineage/ballots. Spoofed inputs must strictly fail closed.
 
   // 1. Genuine 3-Lens Ballot Panel
-  if (Array.isArray(finding.ballots) && finding.ballots.length >= 2) {
-    const validLenses = new Set(['REACHABILITY', 'DEFENSES', 'IMPACT', 'TAINT', 'DISCOVERY']);
-    const supportingBallots = finding.ballots.filter(b =>
-      b && typeof b === 'object' &&
-      validLenses.has(String(b.lens || '').toUpperCase()) &&
-      ['SUPPORTS', 'CONFIRMED'].includes(String(b.decision || '').toUpperCase()) &&
-      (Array.isArray(b.evidence) ? b.evidence.length > 0 : Boolean(b.evidence))
-    );
-    if (supportingBallots.length >= 2) {
-      return true;
+  // Must have at least 3 distinct canonical lenses (REACHABILITY, DEFENSES, IMPACT).
+  // Two ballots with identical lens or unknown lens are strictly rejected.
+  if (Array.isArray(finding.ballots)) {
+    const requiredLenses = new Set(['REACHABILITY', 'DEFENSES', 'IMPACT']);
+    const supportingLenses = new Set();
+    let hasRefutation = false;
+
+    for (const b of finding.ballots) {
+      if (!b || typeof b !== 'object') continue;
+      const lens = String(b.lens || '').toUpperCase().trim();
+      const decision = String(b.decision || '').toUpperCase().trim();
+      if (decision === 'REFUTES' || decision === 'FALSE_POSITIVE') {
+        hasRefutation = true;
+      }
+      if (requiredLenses.has(lens) && (decision === 'SUPPORTS' || decision === 'CONFIRMED')) {
+        const hasEvidence = Array.isArray(b.evidence) ? b.evidence.length > 0 : Boolean(b.evidence);
+        if (hasEvidence) {
+          supportingLenses.add(lens);
+        }
+      }
+    }
+
+    // Decisive refutation decisively suppresses candidate under Default-Deny
+    if (hasRefutation) return false;
+
+    // All 3 distinct lenses must affirmatively support with evidence
+    if (supportingLenses.size >= 3) {
+      const allPresent = Array.from(requiredLenses).every(l => supportingLenses.has(l));
+      if (allPresent) return true;
     }
   }
 
-  // 2. Genuine Finalizer Consensus Object
-  if (finding.consensus && typeof finding.consensus === 'object') {
-    const c = finding.consensus;
-    const isUnanimousOrQuorum = (c.unanimous === true && Number(c.supports || c.totalVotes) >= 2) ||
-      (Number(c.supports) >= 2 && Number(c.refutes || 0) === 0);
-    const isVerifiedStatus = c.status === 'VERIFIED' || c.verified === true || c.authoritative === true;
-    if (isUnanimousOrQuorum && isVerifiedStatus) {
-      return true;
-    }
-  }
-
-  // 3. Genuine Finalizer votesSummary (from deriveFinalDisposition)
-  if (finding.votesSummary && typeof finding.votesSummary === 'object') {
-    const vs = finding.votesSummary;
-    if (vs.unanimous === true && Number(vs.supports) >= 2 && Number(vs.refutes || 0) === 0) {
-      return true;
-    }
-  }
-
-  // 4. Cryptographic Authority Attestation
+  // 2. Cryptographic Authority Attestation
+  // Must verify authentic digital signature against trusted supervisor public key.
+  // Mere string length checks or self-supplied keys without verification are strictly rejected.
   if (finding.authorityProof && typeof finding.authorityProof === 'object') {
     const ap = finding.authorityProof;
-    if (
-      ap.finalizerAttestation === true &&
-      typeof ap.signature === 'string' && ap.signature.length >= 32 &&
-      typeof ap.verifierPublicKey === 'string' && ap.verifierPublicKey.length >= 32
-    ) {
-      return true;
+    if (ap.finalizerAttestation === true && ap.signature) {
+      try {
+        const trustedKeyPem = (options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM).trim().replace(/\r\n/g, '\n');
+        // Verify key identity: verifierPublicKey (if supplied) must match trusted root key
+        if (ap.verifierPublicKey) {
+          const suppliedKeyPem = String(ap.verifierPublicKey).trim().replace(/\r\n/g, '\n');
+          if (suppliedKeyPem !== trustedKeyPem) {
+            return false;
+          }
+        }
+        const payload = Buffer.from(
+          `${finding.id || ''}:${finding.ruleId || ''}:${finding.severity || ''}:${disp}:${ap.signedBy || 'SUPERVISOR_ROOT'}`,
+          'utf8'
+        );
+        const sigBuf = Buffer.from(ap.signature, 'hex');
+        const isValid = crypto.verify(null, payload, trustedKeyPem, sigBuf);
+        if (isValid) return true;
+      } catch {
+        return false;
+      }
     }
   }
 
   // Default-Deny: Any other input (including lone lineageId: 'x', empty objects, or unverified consensus) is rejected.
   return false;
+}
+
+/**
+ * Signs an authority proof for an authoritative finding using a trusted private key.
+ * @param {object} finding
+ * @param {KeyObject|string} privateKey
+ * @param {string} [signedBy='SUPERVISOR_ROOT']
+ * @param {string} [verifierPublicKey=DEFAULT_SUPERVISOR_PUBLIC_PEM]
+ * @returns {object}
+ */
+export function signFindingAuthorityProof(
+  finding,
+  privateKey,
+  signedBy = 'SUPERVISOR_ROOT',
+  verifierPublicKey = DEFAULT_SUPERVISOR_PUBLIC_PEM
+) {
+  const disp = String(finding.disposition || '').toUpperCase().trim();
+  const payload = Buffer.from(
+    `${finding.id || ''}:${finding.ruleId || ''}:${finding.severity || ''}:${disp}:${signedBy}`,
+    'utf8'
+  );
+  const signature = crypto.sign(null, payload, privateKey).toString('hex');
+  return {
+    finalizerAttestation: true,
+    signedBy,
+    signature,
+    verifierPublicKey
+  };
 }
 
 /**
@@ -147,7 +192,7 @@ function safeNonNegativeInteger(val, fallback = 0) {
  * @param {object} finding
  * @returns {object}
  */
-export function formatAcpDiagnostic(finding) {
+export function formatAcpDiagnostic(finding, options = {}) {
   if (!finding || typeof finding !== 'object') {
     throw new TypeError('Finding must be a non-null object');
   }
@@ -163,7 +208,7 @@ export function formatAcpDiagnostic(finding) {
   const endChar = safeNonNegativeInteger(rawEndCol - 1, startChar);
 
   const disposition = finding.disposition ? String(finding.disposition).toUpperCase().trim() : 'UNVERIFIED';
-  const isConfirmed = assertFindingDispositionAuthority(finding);
+  const isConfirmed = assertFindingDispositionAuthority(finding, options);
 
   // R03-F03 Defense: If not confirmed via consensus, force disposition to UNVERIFIED for severity calculation
   const effectiveDisp = isConfirmed ? disposition : 'UNVERIFIED';
@@ -222,14 +267,15 @@ export function serializeJsonRpcNotification(method, params) {
  * Formats a full `textDocument/publishDiagnostics` notification for an array of findings in a file.
  * @param {string} uri Target document URI or file path
  * @param {Array<object>} findings
+ * @param {object} [options={}]
  * @returns {string} JSON-RPC 2.0 notification line
  */
-export function formatPublishDiagnosticsNotification(uri, findings = []) {
+export function formatPublishDiagnosticsNotification(uri, findings = [], options = {}) {
   if (!uri || typeof uri !== 'string') {
     throw new TypeError('Document URI must be a non-empty string');
   }
 
-  const diagnostics = (Array.isArray(findings) ? findings : []).map(formatAcpDiagnostic);
+  const diagnostics = (Array.isArray(findings) ? findings : []).map(f => formatAcpDiagnostic(f, options));
   return serializeJsonRpcNotification('textDocument/publishDiagnostics', {
     uri,
     diagnostics
@@ -334,36 +380,58 @@ export function parseJsonRpcMessage(raw) {
  * @param {object} stream Writable stream (defaults to process.stdout)
  */
 export function createAcpDiagnosticEmitter(stream = process.stdout) {
-  let isCancelled = false;
+  const cancelledSessions = new Set();
+  const cancelledRequests = new Set();
   let isShutdown = false;
 
   return {
-    isCancelled() { return isCancelled; },
-    isShutdown() { return isShutdown; },
-    emitDiagnostic(uri, finding) {
-      if (isCancelled || isShutdown) return null;
-      const line = formatPublishDiagnosticsNotification(uri, [finding]);
+    isCancelled(sessionId = '__default__') {
+      return cancelledSessions.has(sessionId);
+    },
+    isShutdown() {
+      return isShutdown;
+    },
+    resetSession(sessionId = '__default__') {
+      cancelledSessions.delete(sessionId);
+    },
+    startPromptTurn(sessionId = '__default__') {
+      cancelledSessions.delete(sessionId);
+    },
+    emitDiagnostic(uri, finding, options = {}) {
+      const sid = options.sessionId || '__default__';
+      if (cancelledSessions.has(sid) || isShutdown) return null;
+      const line = formatPublishDiagnosticsNotification(uri, [finding], options);
       stream.write(line);
       return line;
     },
-    emitBatch(uri, findings) {
-      if (isCancelled || isShutdown) return null;
-      const line = formatPublishDiagnosticsNotification(uri, findings);
+    emitBatch(uri, findings, options = {}) {
+      const sid = options.sessionId || '__default__';
+      if (cancelledSessions.has(sid) || isShutdown) return null;
+      const line = formatPublishDiagnosticsNotification(uri, findings, options);
       stream.write(line);
       return line;
     },
-    emitBallotProgress(candidateId, lens, vote, details = '') {
-      if (isCancelled || isShutdown) return null;
+    emitBallotProgress(candidateId, lens, vote, details = '', options = {}) {
+      const sid = options.sessionId || '__default__';
+      if (cancelledSessions.has(sid) || isShutdown) return null;
       const line = formatBallotProgressNotification(candidateId, lens, vote, details);
       stream.write(line);
       return line;
     },
     emitSessionUpdate(sessionId, update = {}) {
-      if (isCancelled || isShutdown) return null;
+      const sid = sessionId || '__default__';
+      if (cancelledSessions.has(sid) || isShutdown) return null;
+      // R05-F02: Official ACP v1 format: { sessionId, update: { sessionUpdate: ... } }
+      const updatePayload = (update && typeof update === 'object' && update.sessionUpdate !== undefined)
+        ? update
+        : { sessionUpdate: 'agent_message_chunk', ...update };
       const notif = {
         jsonrpc: '2.0',
         method: 'session/update',
-        params: { sessionId, ...update }
+        params: {
+          sessionId: sid,
+          update: updatePayload
+        }
       };
       const line = JSON.stringify(notif) + '\n';
       stream.write(line);
@@ -378,21 +446,54 @@ export function createAcpDiagnosticEmitter(stream = process.stdout) {
         stream.write(respLine);
         return response;
       }
-      if (parsed.method === 'session/cancel' || parsed.method === '$/cancelRequest') {
-        // R04-F02: Persist cancelled state to immediately drop subsequent diagnostics
-        isCancelled = true;
-        // In ACP / JSON-RPC 2.0, if no id is provided, it is a notification and must not emit a response
+      if (parsed.method === 'session/prompt') {
+        const sid = parsed.params?.sessionId || '__default__';
+        // R05-F02: New prompt turn clears prior turn cancellation for this session
+        cancelledSessions.delete(sid);
         if (parsed.id !== undefined && parsed.id !== null) {
           const response = {
             jsonrpc: '2.0',
             id: parsed.id,
-            result: { cancelled: true }
+            result: { status: 'acknowledged', sessionId: sid }
+          };
+          stream.write(JSON.stringify(response) + '\n');
+          return response;
+        }
+        return { acknowledged: true, sessionId: sid };
+      }
+      if (parsed.method === 'session/cancel') {
+        const sid = parsed.params?.sessionId || '__default__';
+        // R05-F02: Session-scoped cancellation
+        cancelledSessions.add(sid);
+        if (parsed.id !== undefined && parsed.id !== null) {
+          const response = {
+            jsonrpc: '2.0',
+            id: parsed.id,
+            result: { cancelled: true, sessionId: sid, stopReason: 'cancelled' }
           };
           const respLine = JSON.stringify(response) + '\n';
           stream.write(respLine);
           return response;
         }
-        return { cancelled: true };
+        return { cancelled: true, sessionId: sid };
+      }
+      if (parsed.method === '$/cancel_request' || parsed.method === '$/cancelRequest') {
+        const reqId = parsed.params?.id ?? parsed.params?.requestId;
+        if (reqId !== undefined && reqId !== null) {
+          cancelledRequests.add(reqId);
+        }
+        cancelledSessions.add('__default__');
+        if (parsed.id !== undefined && parsed.id !== null) {
+          const response = {
+            jsonrpc: '2.0',
+            id: parsed.id,
+            result: { cancelled: true, requestId: reqId }
+          };
+          const respLine = JSON.stringify(response) + '\n';
+          stream.write(respLine);
+          return response;
+        }
+        return { cancelled: true, requestId: reqId };
       }
       if (parsed.method === 'shutdown') {
         isShutdown = true;

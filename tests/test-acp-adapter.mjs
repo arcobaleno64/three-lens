@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import {
   ACP_DIAGNOSTIC_SEVERITY,
   assertFindingDispositionAuthority,
@@ -10,7 +11,8 @@ import {
   formatBallotProgressNotification,
   handleInitialize,
   parseJsonRpcMessage,
-  createAcpDiagnosticEmitter
+  createAcpDiagnosticEmitter,
+  signFindingAuthorityProof
 } from '../scripts/adapters/acp-adapter.mjs';
 import { validateAcpHandshake } from '../scripts/adapters/acp-transport-adapter.mjs';
 
@@ -74,7 +76,7 @@ test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata'
   assert.equal(diag.data.remediation, 'Use parameterized queries');
 });
 
-test('ACP Adapter: R04-F01 Spoofed authority claims (lineageId, empty authorityProof, mock consensus) strictly fail closed to HINT', () => {
+test('ACP Adapter: R04-F01 / R05-F01 Spoofed authority claims strictly fail closed to HINT', () => {
   // 1. ChatGPT explicit mandate: REPORTABLE + CRITICAL + lineageId: 'x'
   const spoofedLineage = {
     id: 'SPOOF-001',
@@ -103,37 +105,70 @@ test('ACP Adapter: R04-F01 Spoofed authority claims (lineageId, empty authorityP
   assert.equal(formatAcpDiagnostic(spoofedProof).data.authorityConfirmed, false);
   assert.equal(formatAcpDiagnostic(spoofedProof).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
 
-  // 3. Unverified consensus: { totalVotes: 2 }
+  // 3. Unverified consensus: { totalVotes: 2, supports: 2, unanimous: true, status: 'VERIFIED' } (R05-F01)
   const spoofedConsensus = {
     id: 'SPOOF-003',
     ruleId: 'CWE-89',
     title: 'Candidate with unverified consensus count',
     severity: 'CRITICAL',
     disposition: 'REPORTABLE',
-    consensus: { totalVotes: 2 },
+    consensus: { totalVotes: 3, supports: 3, unanimous: true, status: 'VERIFIED' },
     location: { startLine: 10 }
   };
   assert.equal(formatAcpDiagnostic(spoofedConsensus).data.authorityConfirmed, false);
   assert.equal(formatAcpDiagnostic(spoofedConsensus).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
 
-  // 4. Empty ballots: [{}, {}]
-  const spoofedBallots = {
+  // 4. Unverified votesSummary: { unanimous: true, supports: 3, refutes: 0 } (R05-F01)
+  const spoofedVotesSummary = {
     id: 'SPOOF-004',
     ruleId: 'CWE-89',
-    title: 'Candidate with empty ballot objects',
+    title: 'Candidate with unverified votesSummary',
     severity: 'CRITICAL',
     disposition: 'REPORTABLE',
-    ballots: [{}, {}],
+    votesSummary: { unanimous: true, supports: 3, refutes: 0 },
     location: { startLine: 10 }
   };
-  assert.equal(formatAcpDiagnostic(spoofedBallots).data.authorityConfirmed, false);
-  assert.equal(formatAcpDiagnostic(spoofedBallots).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
+  assert.equal(formatAcpDiagnostic(spoofedVotesSummary).data.authorityConfirmed, false);
+  assert.equal(formatAcpDiagnostic(spoofedVotesSummary).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
 
-  // 5. Positive counterpart: Cryptographic authorityProof with valid attestation passes
-  const validProofCandidate = {
-    id: 'VALID-001',
+  // 5. Two identical lens ballots (e.g. 2x REACHABILITY) (R05-F01)
+  const duplicateLensBallots = {
+    id: 'SPOOF-005',
     ruleId: 'CWE-89',
-    title: 'Authenticated finding with cryptographic attestation',
+    title: 'Candidate with duplicate lens ballots',
+    severity: 'CRITICAL',
+    disposition: 'REPORTABLE',
+    ballots: [
+      { lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: ['trace 1'] },
+      { lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: ['trace 2'] }
+    ],
+    location: { startLine: 10 }
+  };
+  assert.equal(formatAcpDiagnostic(duplicateLensBallots).data.authorityConfirmed, false);
+  assert.equal(formatAcpDiagnostic(duplicateLensBallots).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
+
+  // 6. Refutation ballot present (Default-Deny veto)
+  const refutedCandidate = {
+    id: 'SPOOF-006',
+    ruleId: 'CWE-89',
+    title: 'Candidate with refutation veto',
+    severity: 'CRITICAL',
+    disposition: 'REPORTABLE',
+    ballots: [
+      { lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: ['trace 1'] },
+      { lens: 'DEFENSES', decision: 'REFUTES', evidence: ['sanitizer active'] },
+      { lens: 'IMPACT', decision: 'SUPPORTS', evidence: ['payload'] }
+    ],
+    location: { startLine: 10 }
+  };
+  assert.equal(formatAcpDiagnostic(refutedCandidate).data.authorityConfirmed, false);
+  assert.equal(formatAcpDiagnostic(refutedCandidate).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
+
+  // 7. Forged 32-char signature length string without real crypto verification (R05-F01)
+  const forgedSigCandidate = {
+    id: 'SPOOF-007',
+    ruleId: 'CWE-89',
+    title: 'Candidate with mock 32-char string signature',
     severity: 'CRITICAL',
     disposition: 'REPORTABLE',
     authorityProof: {
@@ -143,9 +178,57 @@ test('ACP Adapter: R04-F01 Spoofed authority claims (lineageId, empty authorityP
     },
     location: { startLine: 10 }
   };
-  const diagValid = formatAcpDiagnostic(validProofCandidate);
-  assert.equal(diagValid.data.authorityConfirmed, true);
-  assert.equal(diagValid.severity, ACP_DIAGNOSTIC_SEVERITY.ERROR);
+  assert.equal(formatAcpDiagnostic(forgedSigCandidate).data.authorityConfirmed, false);
+  assert.equal(formatAcpDiagnostic(forgedSigCandidate).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
+
+  // 8. Positive counterpart A: Authentic 3-Lens panel (REACHABILITY, DEFENSES, IMPACT)
+  const authentic3LensCandidate = {
+    id: 'VALID-3LENS-001',
+    ruleId: 'CWE-89',
+    title: 'Candidate with authentic 3-lens quorum',
+    severity: 'CRITICAL',
+    disposition: 'REPORTABLE',
+    ballots: [
+      { lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: ['http sink reachable'] },
+      { lens: 'DEFENSES', decision: 'SUPPORTS', evidence: ['no escaping applied'] },
+      { lens: 'IMPACT', decision: 'SUPPORTS', evidence: ['database compromise possible'] }
+    ],
+    location: { startLine: 10 }
+  };
+  const diag3Lens = formatAcpDiagnostic(authentic3LensCandidate);
+  assert.equal(diag3Lens.data.authorityConfirmed, true);
+  assert.equal(diag3Lens.severity, ACP_DIAGNOSTIC_SEVERITY.ERROR);
+
+  // 9. Positive counterpart B: Authentic cryptographic Ed25519 signature verified
+  const keyPair = crypto.generateKeyPairSync('ed25519');
+  const pubPem = keyPair.publicKey.export({ type: 'spki', format: 'pem' });
+  const validCryptoCandidate = {
+    id: 'VALID-CRYPTO-001',
+    ruleId: 'CWE-89',
+    title: 'Authenticated finding with cryptographic attestation',
+    severity: 'CRITICAL',
+    disposition: 'REPORTABLE',
+    location: { startLine: 10 }
+  };
+  validCryptoCandidate.authorityProof = signFindingAuthorityProof(
+    validCryptoCandidate,
+    keyPair.privateKey,
+    'SUPERVISOR_ROOT',
+    pubPem
+  );
+  const diagCrypto = formatAcpDiagnostic(validCryptoCandidate, { trustedRootPublicKeyPem: pubPem });
+  assert.equal(diagCrypto.data.authorityConfirmed, true);
+  assert.equal(diagCrypto.severity, ACP_DIAGNOSTIC_SEVERITY.ERROR);
+
+  // 10. Tampered signed candidate fails verification
+  const tamperedCryptoCandidate = {
+    ...validCryptoCandidate,
+    severity: 'LOW' // Modified field breaks signature!
+  };
+  assert.equal(
+    formatAcpDiagnostic(tamperedCryptoCandidate, { trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
+    false
+  );
 });
 
 test('ACP Adapter: R03-F03 Self-asserted REPORTABLE without consensus strictly clamped to HINT under Default-Deny', () => {
@@ -246,11 +329,11 @@ test('ACP Adapter: formatPublishDiagnosticsNotification formats full notificatio
       title: 'XSS flaw',
       severity: 'MEDIUM',
       disposition: 'CONFIRMED',
-      consensus: {
-        status: 'VERIFIED',
-        unanimous: true,
-        supports: 3
-      },
+      ballots: [
+        { lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: ['trace'] },
+        { lens: 'DEFENSES', decision: 'SUPPORTS', evidence: ['none'] },
+        { lens: 'IMPACT', decision: 'SUPPORTS', evidence: ['script execution'] }
+      ],
       lineageId: 'lin-f1-01',
       location: { startLine: 10 }
     }
@@ -299,7 +382,7 @@ test('ACP Adapter: R01-F03 / R02-02 handleInitialize aligns with validateAcpHand
   assert.ok(resp.result._meta.supportedNotifications.includes('textDocument/publishDiagnostics'));
 });
 
-test('ACP Adapter: R03-F04 / R04-F02 session cancellation, notification handling and stream suppression', () => {
+test('ACP Adapter: R03-F04 / R04-F02 / R05-F02 session cancellation, turn isolation, and ACP v1 payload', () => {
   const chunks = [];
   const mockStream = {
     write(chunk) {
@@ -309,24 +392,43 @@ test('ACP Adapter: R03-F04 / R04-F02 session cancellation, notification handling
 
   const emitter = createAcpDiagnosticEmitter(mockStream);
 
-  // 1. Notification (no id) must NOT write response to stream
-  const notifCancel = emitter.handleMessage('{"jsonrpc": "2.0", "method": "session/cancel", "params": {}}\n');
+  // 1. Session-scoped cancellation: cancel sess-1
+  const notifCancel = emitter.handleMessage('{"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "sess-1"}}\n');
   assert.equal(notifCancel.cancelled, true);
+  assert.equal(notifCancel.sessionId, 'sess-1');
   assert.equal(chunks.length, 0, 'Notification without id must not write a response to stream');
-  assert.equal(emitter.isCancelled(), true);
+  assert.equal(emitter.isCancelled('sess-1'), true);
+  assert.equal(emitter.isCancelled('sess-2'), false, 'sess-2 must remain uncancelled');
 
-  // 2. Cancellation strictly drops subsequent emitDiagnostic and emitSessionUpdate calls
-  const droppedDiag = emitter.emitDiagnostic('src/index.js', { id: 'F-DROPPED', severity: 'HIGH' });
+  // 2. Cancellation strictly drops subsequent emitDiagnostic and emitSessionUpdate calls for sess-1
+  const droppedDiag = emitter.emitDiagnostic('src/index.js', { id: 'F-DROPPED', severity: 'HIGH' }, { sessionId: 'sess-1' });
   assert.equal(droppedDiag, null);
   const droppedUpdate = emitter.emitSessionUpdate('sess-1', { progress: 0.5 });
   assert.equal(droppedUpdate, null);
-  assert.equal(chunks.length, 0, 'Cancelled emitter must not write any diagnostic or update');
+  assert.equal(chunks.length, 0, 'Cancelled session must not write any diagnostic or update');
 
-  // 3. Request (with id) writes standard JSON-RPC response
+  // 3. Uncancelled session sess-2 continues to emit and conforms to ACP v1 { sessionId, update: { sessionUpdate, ... } }
+  const liveUpdate = emitter.emitSessionUpdate('sess-2', { progress: 0.8 });
+  assert.ok(liveUpdate !== null);
+  assert.equal(chunks.length, 1);
+  const updateObj = JSON.parse(chunks[0].trim());
+  assert.equal(updateObj.jsonrpc, '2.0');
+  assert.equal(updateObj.method, 'session/update');
+  assert.equal(updateObj.params.sessionId, 'sess-2');
+  assert.equal(updateObj.params.update.sessionUpdate, 'agent_message_chunk');
+  assert.equal(updateObj.params.update.progress, 0.8);
+
+  // 4. New prompt turn for sess-1 resets cancellation state (R05-F02)
+  emitter.handleMessage('{"jsonrpc": "2.0", "method": "session/prompt", "params": {"sessionId": "sess-1"}}\n');
+  assert.equal(emitter.isCancelled('sess-1'), false, 'session/prompt must clear prior turn cancellation');
+  const restoredUpdate = emitter.emitSessionUpdate('sess-1', { progress: 0.1 });
+  assert.ok(restoredUpdate !== null);
+
+  // 5. Request (with id) writes standard JSON-RPC response
   const freshChunks = [];
   const freshStream = { write(c) { freshChunks.push(c); } };
   const freshEmitter = createAcpDiagnosticEmitter(freshStream);
-  const cancelResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 101, "method": "session/cancel", "params": {}}\n');
+  const cancelResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 101, "method": "session/cancel", "params": {"sessionId": "sess-101"}}\n');
   assert.equal(cancelResp.id, 101);
   assert.equal(cancelResp.result.cancelled, true);
   assert.equal(freshChunks.length, 1);
@@ -334,7 +436,14 @@ test('ACP Adapter: R03-F04 / R04-F02 session cancellation, notification handling
   assert.equal(respObj.id, 101);
   assert.equal(respObj.result.cancelled, true);
 
-  // 4. Shutdown request handling
+  // 6. $/cancel_request notification and request handling
+  freshEmitter.handleMessage('{"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": "req-99"}}\n');
+  assert.equal(freshChunks.length, 1, 'Notification $/cancel_request must not write to stream');
+  const cancelReqResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 103, "method": "$/cancel_request", "params": {"requestId": "req-103"}}\n');
+  assert.equal(cancelReqResp.id, 103);
+  assert.equal(cancelReqResp.result.cancelled, true);
+
+  // 7. Shutdown request handling
   const shutdownResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 102, "method": "shutdown", "params": {}}\n');
   assert.equal(shutdownResp.id, 102);
   assert.equal(shutdownResp.result, null);
