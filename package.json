@@ -90,5 +90,20 @@
     "devsecops",
     "subagents",
     "code-review"
+  ],
+  "files": [
+    "agents",
+    "assets",
+    "hooks",
+    "rules",
+    "schemas",
+    "skills",
+    "plugin.json",
+    "hooks.json",
+    "recommended-security-audit-permissions.json",
+    "LICENSE",
+    "README.md",
+    "README.zh-TW.md",
+    "SECURITY.md"
   ]
 }

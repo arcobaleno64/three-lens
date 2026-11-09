@@ -351,6 +351,23 @@ export function getReleaseArchiveFiles(repoRoot = REPO_ROOT) {
     walk(repoRoot);
   }
 
+  // If package.json defines files allowlist, restrict release archive entries to declared plugin files
+  try {
+    const pkgPath = path.resolve(repoRoot, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      if (Array.isArray(pkg.files) && pkg.files.length > 0) {
+        const allowed = new Set(pkg.files.map(p => p.replace(/\\/g, '/').replace(/\/$/, '')));
+        allowed.add('package.json');
+        files = files.filter(f => {
+          const normalized = f.replace(/\\/g, '/');
+          const top = normalized.split('/')[0];
+          return allowed.has(top) || allowed.has(normalized);
+        });
+      }
+    }
+  } catch {}
+
   return files
     .filter(f => !f.startsWith('scratch/') && !f.startsWith('release-evidence/') && !f.startsWith('.git/'))
     .sort();
