@@ -47,6 +47,11 @@ test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata'
       endColumn: 30
     },
     lineageId: 'lin-abc-123',
+    ballots: [
+      { lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: [{ path: 'src/db.js', line: 42 }] },
+      { lens: 'DEFENSES', decision: 'SUPPORTS', evidence: [{ path: 'src/db.js', line: 42 }] },
+      { lens: 'IMPACT', decision: 'SUPPORTS', evidence: [{ path: 'src/db.js', line: 42 }] }
+    ],
     securityProperty: 'injection-prevention',
     findingType: 'VULNERABILITY',
     proofKind: 'STATIC_TRACE',
@@ -67,6 +72,80 @@ test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata'
   assert.equal(diag.data.lineageId, 'lin-abc-123');
   assert.equal(diag.data.authorityConfirmed, true);
   assert.equal(diag.data.remediation, 'Use parameterized queries');
+});
+
+test('ACP Adapter: R04-F01 Spoofed authority claims (lineageId, empty authorityProof, mock consensus) strictly fail closed to HINT', () => {
+  // 1. ChatGPT explicit mandate: REPORTABLE + CRITICAL + lineageId: 'x'
+  const spoofedLineage = {
+    id: 'SPOOF-001',
+    ruleId: 'CWE-89',
+    title: 'Candidate with mock lineageId only',
+    severity: 'CRITICAL',
+    disposition: 'REPORTABLE',
+    lineageId: 'x',
+    location: { startLine: 10 }
+  };
+  const diagLineage = formatAcpDiagnostic(spoofedLineage);
+  assert.equal(diagLineage.severity, ACP_DIAGNOSTIC_SEVERITY.HINT, 'lineageId alone must not grant authority');
+  assert.equal(diagLineage.data.authorityConfirmed, false);
+  assert.equal(diagLineage.data.disposition, 'UNVERIFIED');
+
+  // 2. Empty authorityProof: {}
+  const spoofedProof = {
+    id: 'SPOOF-002',
+    ruleId: 'CWE-89',
+    title: 'Candidate with empty authorityProof object',
+    severity: 'CRITICAL',
+    disposition: 'REPORTABLE',
+    authorityProof: {},
+    location: { startLine: 10 }
+  };
+  assert.equal(formatAcpDiagnostic(spoofedProof).data.authorityConfirmed, false);
+  assert.equal(formatAcpDiagnostic(spoofedProof).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
+
+  // 3. Unverified consensus: { totalVotes: 2 }
+  const spoofedConsensus = {
+    id: 'SPOOF-003',
+    ruleId: 'CWE-89',
+    title: 'Candidate with unverified consensus count',
+    severity: 'CRITICAL',
+    disposition: 'REPORTABLE',
+    consensus: { totalVotes: 2 },
+    location: { startLine: 10 }
+  };
+  assert.equal(formatAcpDiagnostic(spoofedConsensus).data.authorityConfirmed, false);
+  assert.equal(formatAcpDiagnostic(spoofedConsensus).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
+
+  // 4. Empty ballots: [{}, {}]
+  const spoofedBallots = {
+    id: 'SPOOF-004',
+    ruleId: 'CWE-89',
+    title: 'Candidate with empty ballot objects',
+    severity: 'CRITICAL',
+    disposition: 'REPORTABLE',
+    ballots: [{}, {}],
+    location: { startLine: 10 }
+  };
+  assert.equal(formatAcpDiagnostic(spoofedBallots).data.authorityConfirmed, false);
+  assert.equal(formatAcpDiagnostic(spoofedBallots).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
+
+  // 5. Positive counterpart: Cryptographic authorityProof with valid attestation passes
+  const validProofCandidate = {
+    id: 'VALID-001',
+    ruleId: 'CWE-89',
+    title: 'Authenticated finding with cryptographic attestation',
+    severity: 'CRITICAL',
+    disposition: 'REPORTABLE',
+    authorityProof: {
+      finalizerAttestation: true,
+      signature: '3045022100a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f00220',
+      verifierPublicKey: '04a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6'
+    },
+    location: { startLine: 10 }
+  };
+  const diagValid = formatAcpDiagnostic(validProofCandidate);
+  assert.equal(diagValid.data.authorityConfirmed, true);
+  assert.equal(diagValid.severity, ACP_DIAGNOSTIC_SEVERITY.ERROR);
 });
 
 test('ACP Adapter: R03-F03 Self-asserted REPORTABLE without consensus strictly clamped to HINT under Default-Deny', () => {
@@ -167,6 +246,11 @@ test('ACP Adapter: formatPublishDiagnosticsNotification formats full notificatio
       title: 'XSS flaw',
       severity: 'MEDIUM',
       disposition: 'CONFIRMED',
+      consensus: {
+        status: 'VERIFIED',
+        unanimous: true,
+        supports: 3
+      },
       lineageId: 'lin-f1-01',
       location: { startLine: 10 }
     }
@@ -215,7 +299,7 @@ test('ACP Adapter: R01-F03 / R02-02 handleInitialize aligns with validateAcpHand
   assert.ok(resp.result._meta.supportedNotifications.includes('textDocument/publishDiagnostics'));
 });
 
-test('ACP Adapter: R03-F04 session cancellation and shutdown message handling', () => {
+test('ACP Adapter: R03-F04 / R04-F02 session cancellation, notification handling and stream suppression', () => {
   const chunks = [];
   const mockStream = {
     write(chunk) {
@@ -224,13 +308,37 @@ test('ACP Adapter: R03-F04 session cancellation and shutdown message handling', 
   };
 
   const emitter = createAcpDiagnosticEmitter(mockStream);
-  const cancelResp = emitter.handleMessage('{"jsonrpc": "2.0", "id": 101, "method": "session/cancel", "params": {}}\n');
+
+  // 1. Notification (no id) must NOT write response to stream
+  const notifCancel = emitter.handleMessage('{"jsonrpc": "2.0", "method": "session/cancel", "params": {}}\n');
+  assert.equal(notifCancel.cancelled, true);
+  assert.equal(chunks.length, 0, 'Notification without id must not write a response to stream');
+  assert.equal(emitter.isCancelled(), true);
+
+  // 2. Cancellation strictly drops subsequent emitDiagnostic and emitSessionUpdate calls
+  const droppedDiag = emitter.emitDiagnostic('src/index.js', { id: 'F-DROPPED', severity: 'HIGH' });
+  assert.equal(droppedDiag, null);
+  const droppedUpdate = emitter.emitSessionUpdate('sess-1', { progress: 0.5 });
+  assert.equal(droppedUpdate, null);
+  assert.equal(chunks.length, 0, 'Cancelled emitter must not write any diagnostic or update');
+
+  // 3. Request (with id) writes standard JSON-RPC response
+  const freshChunks = [];
+  const freshStream = { write(c) { freshChunks.push(c); } };
+  const freshEmitter = createAcpDiagnosticEmitter(freshStream);
+  const cancelResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 101, "method": "session/cancel", "params": {}}\n');
   assert.equal(cancelResp.id, 101);
   assert.equal(cancelResp.result.cancelled, true);
+  assert.equal(freshChunks.length, 1);
+  const respObj = JSON.parse(freshChunks[0].trim());
+  assert.equal(respObj.id, 101);
+  assert.equal(respObj.result.cancelled, true);
 
-  const shutdownResp = emitter.handleMessage('{"jsonrpc": "2.0", "id": 102, "method": "shutdown", "params": {}}\n');
+  // 4. Shutdown request handling
+  const shutdownResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 102, "method": "shutdown", "params": {}}\n');
   assert.equal(shutdownResp.id, 102);
   assert.equal(shutdownResp.result, null);
+  assert.equal(freshEmitter.isShutdown(), true);
 });
 
 test('ACP Adapter: parseJsonRpcMessage validation and error handling', () => {
@@ -265,6 +373,11 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting
     ruleId: 'CWE-22',
     severity: 'CRITICAL',
     disposition: 'CONFIRMED',
+    ballots: [
+      { lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: [{ path: 'src/index.js', line: 1 }] },
+      { lens: 'DEFENSES', decision: 'SUPPORTS', evidence: [{ path: 'src/index.js', line: 1 }] },
+      { lens: 'IMPACT', decision: 'SUPPORTS', evidence: [{ path: 'src/index.js', line: 1 }] }
+    ],
     lineageId: 'lin-f1-crit',
     location: { startLine: 1 }
   });

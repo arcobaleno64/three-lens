@@ -179,13 +179,43 @@ export async function runHarness(options = {}) {
         throw new Error(`Path containment violation: ${targetDir} escapes outDir ${resolvedOutDir}`);
       }
 
-      // R03-F02 Fix: Strictly verify git repository integrity and HEAD revision, avoiding false success on partial checkouts
+      // R04-F05: Safe harness directory purger preventing recursive deletion of arbitrary user directories
+      function safePurgeHarnessTarget(dir, baseOutDir, expectedRemote) {
+        if (!dir.startsWith(baseOutDir + path.sep)) {
+          throw new Error(`Security Exception: targetDir ${dir} escapes base outDir ${baseOutDir}`);
+        }
+        if (!fs.existsSync(dir)) return;
+        const marker = path.join(dir, '.three-lens-harness-checkout');
+        const gitConfig = path.join(dir, '.git', 'config');
+        const isHarnessOwned = fs.existsSync(marker) ||
+          (fs.existsSync(gitConfig) && fs.readFileSync(gitConfig, 'utf8').includes(expectedRemote));
+        if (!isHarnessOwned && fs.readdirSync(dir).length > 0) {
+          throw new Error(`Safety Exception (R04-F05): Refusing to delete directory '${dir}' without verified harness ownership`);
+        }
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+
+      // R03-F02 & R04-F03: Full 40-char SHA matching and worktree verification immune to skip-worktree
       let isExistingValidRepo = false;
       if (fs.existsSync(targetDir) && fs.existsSync(path.join(targetDir, '.git'))) {
         try {
           const headRev = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: targetDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
           const statusOutput = execFileSync('git', ['status', '--porcelain'], { cwd: targetDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-          if (headRev.toLowerCase().startsWith(commitSha.toLowerCase().slice(0, 7)) && statusOutput === '') {
+          
+          // R04-F03: Exact 40-character commit SHA match
+          const isExactCommit = headRev.toLowerCase() === commitSha.toLowerCase();
+          
+          // R04-F03: Detect index manipulation / skip-worktree via diff-index and diff-files
+          let isTreeIntact = false;
+          try {
+            execFileSync('git', ['diff-index', '--quiet', 'HEAD', '--'], { cwd: targetDir, stdio: ['ignore', 'pipe', 'pipe'] });
+            execFileSync('git', ['diff-files', '--quiet'], { cwd: targetDir, stdio: ['ignore', 'pipe', 'pipe'] });
+            isTreeIntact = (statusOutput === '');
+          } catch {
+            isTreeIntact = false;
+          }
+
+          if (isExactCommit && isTreeIntact) {
             isExistingValidRepo = true;
           }
         } catch {
@@ -197,10 +227,10 @@ export async function runHarness(options = {}) {
         console.log(`  ✔ Valid verified checkout found at: ${path.relative(REPO_ROOT, targetDir)}`);
         verifiedCount++;
       } else {
-        // If directory exists but failed validation, remove it before re-cloning
+        // If directory exists but failed validation, safely remove it before re-cloning
         if (fs.existsSync(targetDir)) {
-          console.warn(`  ⚠ Partial or invalid checkout detected at: ${path.relative(REPO_ROOT, targetDir)}, cleaning up...`);
-          fs.rmSync(targetDir, { recursive: true, force: true });
+          console.warn(`  ⚠ Partial or invalid checkout detected at: ${path.relative(REPO_ROOT, targetDir)}, cleaning up safely...`);
+          safePurgeHarnessTarget(targetDir, resolvedOutDir, upstreamUrl);
         }
 
         console.log(`  Cloning to isolated sandbox: ${path.relative(REPO_ROOT, targetDir)}...`);
@@ -208,13 +238,19 @@ export async function runHarness(options = {}) {
         try {
           execFileSync('git', ['clone', '--no-checkout', upstreamUrl, targetDir], { stdio: 'pipe' });
           execFileSync('git', ['checkout', commitSha], { cwd: targetDir, stdio: 'pipe' });
-          console.log(`  ✔ Successfully checked out ${commitSha.slice(0, 7)}`);
+          // Stamp harness ownership marker (R04-F05)
+          fs.writeFileSync(path.join(targetDir, '.three-lens-harness-checkout'), JSON.stringify({
+            caseId: tc.caseId,
+            upstreamCommitSha: commitSha,
+            createdAt: new Date().toISOString()
+          }));
+          console.log(`  ✔ Successfully checked out ${commitSha.slice(0, 10)}`);
           verifiedCount++;
         } catch (err) {
           console.error(`  ✖ Checkout failed: ${err.message}`);
-          // Ensure incomplete directory is immediately deleted fail-closed
+          // Ensure incomplete directory is safely deleted fail-closed
           if (fs.existsSync(targetDir)) {
-            try { fs.rmSync(targetDir, { recursive: true, force: true }); } catch {}
+            try { safePurgeHarnessTarget(targetDir, resolvedOutDir, upstreamUrl); } catch {}
           }
           failedCount++;
         }

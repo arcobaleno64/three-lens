@@ -37,19 +37,20 @@ flowchart TD
      - `gemini-3.8-flash-low` expended 2,369 thinking tokens compared to 8,691 on `gemini-3.8-flash-medium` (**-72.7% thinking token reduction**), cutting execution latency from 101.648s to 44.198s (**-56.5% latency reduction**).
      - Both effort tiers achieved **100% candidate semantic lineage concordance** (`62c3cd33c856f5552c7f3547c67ba2d2`), discovering the identical authentic SSRF vulnerability (`CAND-CWE-918-12`) at the unvalidated `fetch` sink without false suppression.
      - *Boundary Clarification (R01-F06)*: This data point represents stochastic discovery-stage candidate generation on development set fixture `SEM-03`. It is cataloged strictly as a rapid Smoke Check optimization and does not claim full 3-lens finalizer consensus parity across all vulnerability classes.
-2. **Workstream 2 (Upstream Verified OSS Ground Truth Expansion & Remote Authentication — R02-01 & R02-04)**:
+2. **Workstream 2 (Upstream Verified OSS Ground Truth Expansion & Remote Authentication — R02-01, R03-F01, R04-F04)**:
    - Expanded `evals/v2-corpus/layer2-external-validity-corpus.json` from 14 cases to **26 authoritative cases** (13 vulnerable, 10 fixed counterparts, 3 clean controls).
-   - Integrated 12 `UPSTREAM_VERIFIED_OSS` Ground Truth Bundles across **4 distinct CWE families** authenticated directly against upstream GitHub repository remotes:
-     - `CWE-1321` (Prototype Pollution): `minimist` (CVE-2020-7598), `json-pointer` (CVE-2020-7709), `ini` (CVE-2020-7788).
-     - `CWE-022` (Path Traversal): `adm-zip` (CVE-2018-1002204).
-     - `CWE-1333` (ReDoS): `lodash` (CVE-2020-28500).
-     - `CWE-078` (Command Injection): `growl` (CVE-2017-16042).
-   - *R02-04 / R03-F02 Hardening*: `scripts/fetch-upstream-oss-fixture.mjs` enhanced with strict case ID matching (`c.caseId || c.id`), sanitization preventing path containment escape, dual `git rev-parse HEAD` & `git status --porcelain` validation to purge partial checkouts, and fail-closed non-zero exit codes (exit 1) on nonexistent cases or checkout failures.
-3. **Workstream 3 (ACP Native Protocol Inline Streaming Diagnostics & Authority Gate — R02-02, R02-03, R03-F03, R03-F04)**:
-   - Authored `scripts/adapters/acp-adapter.mjs` converting 3-Lens verification ballots and findings into standard ACP / LSP `textDocument/publishDiagnostics` and `window/logMessage` streaming notifications over stdio JSON-RPC 2.0.
-   - *R02-03 / R01-F04 / R03-F03 Hardening*: Default-Deny Authority Invariant strictly enforced inside the adapter: missing or omitted `disposition` defaults to `'UNVERIFIED'`. Pure client self-assertion of `REPORTABLE` is neutralized under `assertFindingDispositionAuthority` unless verified by multi-agent panel consensus (totalVotes >= 2, unanimous), cryptographically verifiable lineage, or valid model provenance. Unverified candidate findings are strictly clamped to `ACP_DIAGNOSTIC_SEVERITY.HINT` (4) with an explicit `[UNVERIFIED CANDIDATE]` notice.
-   - *R02-02 / R03-F04 Hardening*: Aligned `handleInitialize()` response to pass the native ACP handshake validator in `scripts/adapters/acp-transport-adapter.mjs` (`validateAcpHandshake()`), declaring `protocolVersion: 1`, `agentInfo: { name, version }`, active `agentCapabilities`, and vendor `_meta` field. Implemented standard cancellation and shutdown notification handling (`session/cancel`, `$/cancelRequest`, `shutdown`).
-   - Comprehensive test suite `tests/test-acp-adapter.mjs` passes 13/13 tests.
+   - Integrated 12 `UPSTREAM_VERIFIED_OSS` Curated Ground Truth Bundles modeled faithfully after authentic CVEs and upstream fix commits across **4 distinct CWE families**:
+     - `CWE-1321` (Prototype Pollution): `minimist` (CVE-2020-7598), `json-pointer` (CVE-2020-7709 / commit `1dbd1ed`), `ini` (CVE-2020-7788).
+     - `CWE-022` (Path Traversal): `adm-zip` (CVE-2018-1002204 / commit `62f6400`, Snyk Zip-Slip `target.startsWith(targetDir)`).
+     - `CWE-1333` (ReDoS): `lodash` (CVE-2020-28500 / commit `c4847eb`).
+     - `CWE-078` (Command Injection): `growl` (CVE-2017-16042 / v1.9.3 commit `d71177d`, `exec` to `spawn` argument array).
+   - *R03-F02 / R04-F03 / R04-F05 Hardening*: `scripts/fetch-upstream-oss-fixture.mjs` enhanced with full 40-character commit SHA matching, worktree integrity checks via `git diff-index` and `git diff-files` (neutralizing `skip-worktree` blind spots), safe recursive deletion requiring verified harness ownership (R04-F05), and fail-closed exit 1 on nonexistent cases.
+3. **Workstream 3 (ACP Native Protocol Inline Streaming Diagnostics & Authority Gate — R03-F03, R03-F04, R04-F01, R04-F02)**:
+   - Authored `scripts/adapters/acp-adapter.mjs` converting 3-Lens verification ballots and findings into standard ACP / LSP `textDocument/publishDiagnostics`, native `session/update`, and `window/logMessage` streaming notifications over stdio JSON-RPC 2.0.
+   - *R04-F01 Hardening*: Default-Deny Authority Invariant strictly enforced inside `assertFindingDispositionAuthority`: mere field presence (`lineageId: 'x'`, empty `authorityProof: {}`, mock consensus, empty ballots) strictly fails closed. Only findings backed by authentic 3-Lens supporting ballots, unanimous/verified finalizer consensus, or cryptographic attestation may achieve `authorityConfirmed: true` and Error/Warning mapping.
+   - *R04-F02 Hardening*: Persistent cancellation state immediately halts and drops subsequent diagnostic or update emissions; JSON-RPC notifications without `id` emit no extraneous responses.
+   - *R02-02 Handshake*: Aligned `handleInitialize()` response with `validateAcpHandshake()`, declaring `protocolVersion: 1`, `agentInfo: { name, version }`, vendor `_meta` for `LSP_OVER_ACP_V1`, and native `session/update` capability.
+   - Comprehensive test suite `tests/test-acp-adapter.mjs` passes 14/14 tests.
 4. **Workstream 4 (Specification Modernization & Governance Invariants)**:
    - Synchronized target identity in `evals/protocols/v2.0-three-layer-evaluation-framework.md` and `evals/protocols/v2.0-acceptance-criteria.json` to `@arcobaleno64/three-lens`.
    - Scaled Layer 2 upper boundary from 16 to 32 cases to support open-ended corpus expansion, with updated `frozenAt: 2026-11-09T16:00:00Z`.
