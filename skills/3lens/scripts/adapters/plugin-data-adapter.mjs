@@ -854,7 +854,7 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           continue;
         }
 
-        // R33-B01 & R34-B01 & R35-B01: If historical update is signed by a delegated key, root must remain present and retain identical status
+        // R33-B01 & R34-B01 & R35-B01 & R36-B01: If historical update is signed by a delegated key, root must remain present, retain identical status, and cannot be reintroduced
         if (proof.authorizedBy !== rootId) {
           const rootInPrior = priorVerifiedReg.keys?.find(k => k.keyId === rootId);
           const rootInHist = hReg.keys?.find(k => k.keyId === rootId);
@@ -863,6 +863,13 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
               if (options.failClosed !== false) {
                 const cause = !rootInHist ? 'omit sovereign root' : `mutate sovereign root status from '${rootInPrior.status}' to '${rootInHist.status}'`;
                 throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] [DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${proof.authorizedBy}' cannot ${cause} '${rootId}'`);
+              }
+            }
+          } else {
+            // R36-B01: Root reintroduction prohibited
+            if (rootInHist) {
+              if (options.failClosed !== false) {
+                throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] [DELEGATED_ROOT_MUTATION_REJECTED] [DELEGATED_ROOT_REINTRODUCTION_REJECTED] Delegated signer '${proof.authorizedBy}' cannot reintroduce sovereign root '${rootId}' in historical registry ${hf}`);
               }
             }
           }
@@ -984,7 +991,7 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
 
         const proof = currentRegistry.authorizationProof;
         if (proof && typeof proof.signature === 'string' && typeof proof.authorizedBy === 'string') {
-          // R33-B01 & R34-B01 & R35-B01: If signer is delegated, root must remain present and retain identical status
+          // R33-B01 & R34-B01 & R35-B01 & R36-B01: If signer is delegated, root must remain present, retain identical status, and cannot be reintroduced
           if (proof.authorizedBy !== rootId) {
             const rootInPrior = priorVerifiedReg.keys?.find(k => k.keyId === rootId);
             const rootInCur = currentRegistry.keys?.find(k => k.keyId === rootId);
@@ -993,6 +1000,13 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
                 if (options.failClosed !== false) {
                   const cause = !rootInCur ? 'omit sovereign root' : `mutate sovereign root status from '${rootInPrior.status}' to '${rootInCur.status}'`;
                   throw new Error(`[UNTRUSTED_CURRENT_REGISTRY] [DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${proof.authorizedBy}' cannot ${cause} '${rootId}'`);
+                }
+              }
+            } else {
+              // R36-B01: Root reintroduction prohibited
+              if (rootInCur) {
+                if (options.failClosed !== false) {
+                  throw new Error(`[UNTRUSTED_CURRENT_REGISTRY] [DELEGATED_ROOT_MUTATION_REJECTED] [DELEGATED_ROOT_REINTRODUCTION_REJECTED] Delegated signer '${proof.authorizedBy}' cannot reintroduce sovereign root '${rootId}' in current registry`);
                 }
               }
             }
@@ -2955,16 +2969,27 @@ export function validateTrustRegistry(registry, options = {}) {
       }
       signerPem = priorKey.publicKeyPem;
 
-      // R33-B01 & R34-B01 & R35-B01: Delegated key cannot omit sovereign Root or mutate Root status / identity
+      // R33-B01 & R34-B01 & R35-B01 & R36-B01: Delegated key cannot omit sovereign Root, mutate Root status/identity, or reintroduce an absent Root
       if (proof.authorizedBy !== rootId) {
         const rootInPrior = priorReg.keys?.find(k => k.keyId === rootId);
+        const rootInCur = registry.keys?.find(k => k.keyId === rootId);
         if (rootInPrior) {
-          const rootInCur = registry.keys?.find(k => k.keyId === rootId);
           if (!rootInCur || rootInCur.status !== rootInPrior.status) {
             const cause = !rootInCur ? 'omit sovereign root' : `mutate sovereign root status from '${rootInPrior.status}' to '${rootInCur.status}'`;
             return {
               valid: false,
               error: `[DELEGATED_ROOT_MUTATION_REJECTED] Delegated authorization by '${proof.authorizedBy}' cannot ${cause} '${rootId}'`,
+              cryptographicValidity: false,
+              monotonicValidity: true,
+              ancestryContinuity: true
+            };
+          }
+        } else {
+          // R36-B01: If Root was absent in prior registry, delegated key CANNOT reintroduce Root
+          if (rootInCur) {
+            return {
+              valid: false,
+              error: `[DELEGATED_ROOT_MUTATION_REJECTED] [DELEGATED_ROOT_REINTRODUCTION_REJECTED] Delegated authorization by '${proof.authorizedBy}' cannot reintroduce sovereign root '${rootId}' when absent in prior registry`,
               cryptographicValidity: false,
               monotonicValidity: true,
               ancestryContinuity: true
@@ -3028,7 +3053,7 @@ export function createAuthorizedRegistryUpdate(currentRegistry, updates, signerK
   // Fail-Closed: if revocation status cannot be verified due to journal read/corruption errors, reject.
   const effectiveOpts = options && typeof options === 'object' ? options : {};
 
-  // R33-B01 & R35-B01 & R35-B02: Delegated keys cannot mutate, retire, omit, or modify fingerprint of sovereign root anchor
+  // R33-B01 & R35-B01 & R35-B02 & R36-B01: Delegated keys cannot mutate, retire, omit, reintroduce, or modify fingerprint of sovereign root anchor
   const effectiveRootId = effectiveOpts.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
   if (signerKeyId !== effectiveRootId) {
     if (Array.isArray(updates.keys)) {
@@ -3046,6 +3071,11 @@ export function createAuthorizedRegistryUpdate(currentRegistry, updates, signerK
         }
         if (rootInUpdates.publicKeyPem && rootInCur.publicKeyPem && rootInUpdates.publicKeyPem !== rootInCur.publicKeyPem) {
           throw new Error(`[DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${signerKeyId}' cannot modify sovereign root key '${effectiveRootId}' public key PEM`);
+        }
+      } else {
+        // R36-B01: If Root was absent in current registry, delegated signer cannot reintroduce Root
+        if (rootInUpdates) {
+          throw new Error(`[DELEGATED_ROOT_MUTATION_REJECTED] [DELEGATED_ROOT_REINTRODUCTION_REJECTED] Delegated signer '${signerKeyId}' cannot reintroduce sovereign root key '${effectiveRootId}' into keys[] when absent in current registry`);
         }
       }
     }
