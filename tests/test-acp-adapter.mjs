@@ -64,7 +64,7 @@ test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata'
   };
   finding.authorityProof = signFindingAuthorityProof(finding, keyPair.privateKey, 'SUPERVISOR_ROOT', pubPem);
 
-  const diag = formatAcpDiagnostic(finding, { trustedRootPublicKeyPem: pubPem });
+  const diag = formatAcpDiagnostic(finding, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem });
 
   assert.equal(diag.code, 'CWE-89');
   assert.equal(diag.source, 'Three-Lens');
@@ -227,18 +227,56 @@ test('ACP Adapter: R04-F01 / R05-F01 / R06-F01 Spoofed authority claims strictly
     'SUPERVISOR_ROOT',
     pubPem
   );
-  const diagCrypto = formatAcpDiagnostic(validCryptoCandidate, { trustedRootPublicKeyPem: pubPem });
+  const diagCrypto = formatAcpDiagnostic(validCryptoCandidate, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem });
   assert.equal(diagCrypto.data.authorityConfirmed, true);
   assert.equal(diagCrypto.severity, ACP_DIAGNOSTIC_SEVERITY.ERROR);
 
-  // 10. Tampered signed candidate fails verification
-  const tamperedCryptoCandidate = {
+  // 10. R07-F01 Defense: Tampering with ANY field breaks cryptographic signature binding
+  const tamperedSeverity = {
     ...validCryptoCandidate,
     severity: 'LOW' // Modified field breaks signature!
   };
   assert.equal(
-    formatAcpDiagnostic(tamperedCryptoCandidate, { trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
-    false
+    formatAcpDiagnostic(tamperedSeverity, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
+    false,
+    'Tampered severity must fail signature verification'
+  );
+
+  const tamperedTitle = {
+    ...validCryptoCandidate,
+    title: 'Tampered malicious SQL injection title'
+  };
+  assert.equal(
+    formatAcpDiagnostic(tamperedTitle, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
+    false,
+    'Tampered title must fail signature verification'
+  );
+
+  const tamperedLocation = {
+    ...validCryptoCandidate,
+    location: { startLine: 999 }
+  };
+  assert.equal(
+    formatAcpDiagnostic(tamperedLocation, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
+    false,
+    'Tampered location must fail signature verification'
+  );
+
+  const tamperedBallots = {
+    ...validCryptoCandidate,
+    ballots: [{ lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: ['tampered'] }]
+  };
+  assert.equal(
+    formatAcpDiagnostic(tamperedBallots, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
+    false,
+    'Tampered ballots must fail signature verification'
+  );
+
+  // 11. R07-F02 Defense: Caller cannot override trusted root without allowConfiguredRoot: true
+  assert.equal(
+    formatAcpDiagnostic(validCryptoCandidate, { trustedRootPublicKeyPem: pubPem }).data.authorityConfirmed,
+    false,
+    'Untrusted caller root override without allowConfiguredRoot must be rejected'
   );
 });
 
@@ -354,7 +392,7 @@ test('ACP Adapter: formatPublishDiagnosticsNotification formats full notificatio
   ];
   findings[0].authorityProof = signFindingAuthorityProof(findings[0], keyPair.privateKey, 'SUPERVISOR_ROOT', pubPem);
 
-  const raw = formatPublishDiagnosticsNotification('file:///path/to/app.js', findings, { trustedRootPublicKeyPem: pubPem });
+  const raw = formatPublishDiagnosticsNotification('file:///path/to/app.js', findings, { allowConfiguredRoot: true, trustedRootPublicKeyPem: pubPem });
   const parsed = JSON.parse(raw.trim());
 
   assert.equal(parsed.jsonrpc, '2.0');
@@ -448,6 +486,23 @@ test('ACP Adapter: R03-F04 / R04-F02 / R05-F02 / R06-F02 / R06-F03 session cance
   const restoredUpdate = emitter.emitSessionUpdate('sess-1', { progress: 0.2 }, { turnId: 2 });
   assert.ok(restoredUpdate !== null, 'Current generation turn 2 emission must be allowed');
 
+  // R07-F04 Invariant: Fabricated future turnId (e.g. 999) must be rejected fail-closed
+  const futureTurnEmission = emitter.emitSessionUpdate('sess-1', { progress: 0.3 }, { turnId: 999 });
+  assert.equal(futureTurnEmission, null, 'Fabricated future turnId must be strictly rejected');
+
+  // R07-F03 Invariant: session/new initializes session with turn 1 and returns sessionId
+  const sessionNewResp = emitter.handleMessage('{"jsonrpc": "2.0", "id": 301, "method": "session/new", "params": {"sessionId": "sess-new-1"}}\n');
+  assert.equal(sessionNewResp.id, 301);
+  assert.equal(sessionNewResp.result.sessionId, 'sess-new-1');
+  assert.equal(emitter.getCurrentTurnId('sess-new-1'), 1);
+
+  // R07-F03 Invariant: Caller attempting to overwrite content structure with invalid object
+  const spoofedContentUpdate = emitter.emitSessionUpdate('sess-new-1', { content: { type: 'malicious', rawHtml: '<script>' } });
+  assert.ok(spoofedContentUpdate !== null);
+  const spoofedParsed = JSON.parse(spoofedContentUpdate.trim());
+  assert.equal(spoofedParsed.params.update.sessionUpdate, 'agent_message_chunk');
+  assert.deepEqual(spoofedParsed.params.update.content, { type: 'text', text: '' });
+
   // 5. Request (with id) writes standard JSON-RPC response with stopReason: 'cancelled'
   const freshChunks = [];
   const freshStream = { write(c) { freshChunks.push(c); } };
@@ -522,7 +577,7 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting
   };
   finding.authorityProof = signFindingAuthorityProof(finding, keyPair.privateKey, 'SUPERVISOR_ROOT', pubPem);
 
-  emitter.emitDiagnostic('src/index.js', finding, { trustedRootPublicKeyPem: pubPem });
+  emitter.emitDiagnostic('src/index.js', finding, { trustedRootPublicKeyPem: pubPem, allowConfiguredRoot: true });
   emitter.emitBallotProgress('CAND-01', 'DEFENSES', 'REFUTES', 'Sanitizer active');
 
   assert.equal(chunks.length, 2);

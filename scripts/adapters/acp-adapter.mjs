@@ -36,8 +36,48 @@ export const ACP_DIAGNOSTIC_SEVERITY = Object.freeze({
 });
 
 /**
+ * Computes a deterministic SHA-256 digest binding all critical properties of a finding:
+ * id, ruleId, severity, disposition, title, location, lineageId, and ballots (R07-F01).
+ * Tampering with ANY of these fields breaks the cryptographic signature binding.
+ * @param {object} finding
+ * @returns {string} 64-character lowercase hex SHA-256 digest
+ */
+export function computeFindingDigest(finding) {
+  if (!finding || typeof finding !== 'object') return '';
+  const normLocation = finding.location ? {
+    uri: String(finding.location.uri || '').trim(),
+    startLine: Number(finding.location.startLine || 0),
+    endLine: Number(finding.location.endLine || 0),
+    startColumn: Number(finding.location.startColumn || 0),
+    endColumn: Number(finding.location.endColumn || 0)
+  } : null;
+
+  const normBallots = Array.isArray(finding.ballots)
+    ? finding.ballots.map(b => ({
+        lens: String(b?.lens || '').toUpperCase().trim(),
+        decision: String(b?.decision || '').toUpperCase().trim(),
+        evidence: Array.isArray(b?.evidence) ? b.evidence : (b?.evidence ? [b.evidence] : [])
+      })).sort((a, b) => a.lens.localeCompare(b.lens))
+    : [];
+
+  const canonicalObj = {
+    id: String(finding.id || '').trim(),
+    ruleId: String(finding.ruleId || '').trim(),
+    severity: String(finding.severity || '').toUpperCase().trim(),
+    disposition: String(finding.disposition || '').toUpperCase().trim(),
+    title: String(finding.title || '').trim(),
+    location: normLocation,
+    lineageId: finding.lineageId ? String(finding.lineageId).trim() : null,
+    ballots: normBallots
+  };
+
+  return crypto.createHash('sha256').update(JSON.stringify(canonicalObj), 'utf8').digest('hex');
+}
+
+/**
  * Checks whether a finding has passed 3-lens consensus and achieved authoritative reportable status.
- * Under Default-Deny (R05-F01), mere field presence or unverified consensus/proof cannot claim authority.
+ * Under Default-Deny (R06-F01 & R07-F01), mere field presence or unverified consensus/proof cannot claim authority.
+ * Full finding digest is cryptographically bound to the supervisor digital signature.
  * @param {object} finding
  * @param {object} [options={}]
  * @returns {boolean}
@@ -48,7 +88,7 @@ export function assertFindingDispositionAuthority(finding, options = {}) {
   const isReportableDisp = disp === 'CONFIRMED' || disp === 'REPORTABLE';
   if (!isReportableDisp) return false;
 
-  // R06-F01 Defense: Under Default-Deny, authorityConfirmed CANNOT be granted by mere ballots,
+  // R06-F01 & R07-F01 Defense: Under Default-Deny, authorityConfirmed CANNOT be granted by mere ballots,
   // lineageId, or self-asserted consensus. ONLY authentic cryptographic proof signed by
   // the trusted supervisor root key can confer authority. Ballots alone strictly fail closed.
   if (!finding.authorityProof || typeof finding.authorityProof !== 'object') {
@@ -72,7 +112,12 @@ export function assertFindingDispositionAuthority(finding, options = {}) {
   }
 
   try {
-    const trustedKeyPem = (options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM).trim().replace(/\r\n/g, '\n');
+    // R07-F02: Default-Deny on trusted root override. Untrusted callers cannot supply
+    // arbitrary public keys unless allowConfiguredRoot is explicitly granted.
+    const trustedKeyPem = (options.allowConfiguredRoot === true && options.trustedRootPublicKeyPem)
+      ? options.trustedRootPublicKeyPem.trim().replace(/\r\n/g, '\n')
+      : DEFAULT_SUPERVISOR_PUBLIC_PEM.trim().replace(/\r\n/g, '\n');
+
     // Verify key identity: verifierPublicKey (if supplied) must match trusted root key
     if (ap.verifierPublicKey) {
       const suppliedKeyPem = String(ap.verifierPublicKey).trim().replace(/\r\n/g, '\n');
@@ -80,10 +125,10 @@ export function assertFindingDispositionAuthority(finding, options = {}) {
         return false;
       }
     }
-    const payload = Buffer.from(
-      `${finding.id || ''}:${finding.ruleId || ''}:${finding.severity || ''}:${disp}:${ap.signedBy || 'SUPERVISOR_ROOT'}`,
-      'utf8'
-    );
+
+    // R07-F01: Bind entire finding digest into signature payload
+    const digest = computeFindingDigest(finding);
+    const payload = Buffer.from(`${digest}:${ap.signedBy || 'SUPERVISOR_ROOT'}`, 'utf8');
     const sigBuf = Buffer.from(ap.signature, 'hex');
     const isValid = crypto.verify(null, payload, trustedKeyPem, sigBuf);
     return isValid === true;
@@ -94,6 +139,7 @@ export function assertFindingDispositionAuthority(finding, options = {}) {
 
 /**
  * Signs an authority proof for an authoritative finding using a trusted private key.
+ * Cryptographically binds the full canonical digest of the finding (R07-F01).
  * @param {object} finding
  * @param {KeyObject|string} privateKey
  * @param {string} [signedBy='SUPERVISOR_ROOT']
@@ -106,11 +152,8 @@ export function signFindingAuthorityProof(
   signedBy = 'SUPERVISOR_ROOT',
   verifierPublicKey = DEFAULT_SUPERVISOR_PUBLIC_PEM
 ) {
-  const disp = String(finding.disposition || '').toUpperCase().trim();
-  const payload = Buffer.from(
-    `${finding.id || ''}:${finding.ruleId || ''}:${finding.severity || ''}:${disp}:${signedBy}`,
-    'utf8'
-  );
+  const digest = computeFindingDigest(finding);
+  const payload = Buffer.from(`${digest}:${signedBy}`, 'utf8');
   const signature = crypto.sign(null, payload, privateKey).toString('hex');
   return {
     finalizerAttestation: true,
@@ -362,46 +405,46 @@ export function createAcpDiagnosticEmitter(stream = process.stdout) {
   const cancelledTurns = new Set(); // Set of `${sessionId}:${turnId}`
   let isShutdown = false;
 
-  function isTurnCancelled(sessionId, turnId) {
-    if (isShutdown) return true;
-    if (cancelledSessions.has(sessionId)) return true;
+  function isEmissionAllowed(sessionId, turnId, requestId) {
+    if (isShutdown) return false;
+    if (cancelledSessions.has(sessionId)) return false;
+    if (requestId && cancelledRequests.has(requestId)) return false;
+
+    const currentTurn = sessionTurns.get(sessionId) || 1;
+
+    // R07-F04 Strict Guard: If turnId is provided, it must MATCH currentTurn exactly.
+    // Rejects both stale (< current) and fabricated future (> current) tokens fail-closed.
     if (turnId !== undefined && turnId !== null) {
-      if (cancelledTurns.has(`${sessionId}:${turnId}`)) return true;
-      const currentTurn = sessionTurns.get(sessionId);
-      if (currentTurn !== undefined && turnId < currentTurn) return true; // Stale turn generation (R06-F03)
+      const numTurn = Number(turnId);
+      if (numTurn !== currentTurn) return false;
+      if (cancelledTurns.has(`${sessionId}:${numTurn}`)) return false;
+    } else {
+      // If turnId omitted, verify current active turn was not cancelled
+      if (cancelledTurns.has(`${sessionId}:${currentTurn}`)) return false;
     }
-    return false;
+
+    return true;
   }
 
   function formatAcpUpdatePayload(update) {
-    if (!update || typeof update !== 'object') {
-      return {
-        sessionUpdate: 'agent_message_chunk',
-        content: { type: 'text', text: '' }
-      };
-    }
-    if (update.sessionUpdate === 'progress' || (update.progress !== undefined && !update.sessionUpdate)) {
-      return {
-        sessionUpdate: 'progress',
-        progress: Number(update.progress || 0)
-      };
-    }
-    const text = typeof update.content === 'string'
+    const textContent = typeof update?.content === 'string'
       ? update.content
-      : (update.text || update.message || (typeof update.content?.text === 'string' ? update.content.text : ''));
+      : (update?.text || update?.message || (typeof update?.content?.text === 'string' ? update.content.text : ''));
+
+    // R07-F03 Defense: Strict ACP v1 agent_message_chunk payload.
+    // Caller cannot corrupt or overwrite the canonical content structure.
     return {
       sessionUpdate: 'agent_message_chunk',
       content: {
         type: 'text',
-        text: String(text || '')
-      },
-      ...update
+        text: String(textContent || '')
+      }
     };
   }
 
   return {
     isCancelled(sessionId = '__default__', turnId) {
-      return isTurnCancelled(sessionId, turnId);
+      return !isEmissionAllowed(sessionId, turnId);
     },
     getCurrentTurnId(sessionId = '__default__') {
       return sessionTurns.get(sessionId) || 1;
@@ -420,33 +463,29 @@ export function createAcpDiagnosticEmitter(stream = process.stdout) {
     },
     emitDiagnostic(uri, finding, options = {}) {
       const sid = options.sessionId || '__default__';
-      if (isTurnCancelled(sid, options.turnId) || isShutdown) return null;
-      if (options.requestId && cancelledRequests.has(options.requestId)) return null;
+      if (!isEmissionAllowed(sid, options.turnId, options.requestId)) return null;
       const line = formatPublishDiagnosticsNotification(uri, [finding], options);
       stream.write(line);
       return line;
     },
     emitBatch(uri, findings, options = {}) {
       const sid = options.sessionId || '__default__';
-      if (isTurnCancelled(sid, options.turnId) || isShutdown) return null;
-      if (options.requestId && cancelledRequests.has(options.requestId)) return null;
+      if (!isEmissionAllowed(sid, options.turnId, options.requestId)) return null;
       const line = formatPublishDiagnosticsNotification(uri, findings, options);
       stream.write(line);
       return line;
     },
     emitBallotProgress(candidateId, lens, vote, details = '', options = {}) {
       const sid = options.sessionId || '__default__';
-      if (isTurnCancelled(sid, options.turnId) || isShutdown) return null;
-      if (options.requestId && cancelledRequests.has(options.requestId)) return null;
+      if (!isEmissionAllowed(sid, options.turnId, options.requestId)) return null;
       const line = formatBallotProgressNotification(candidateId, lens, vote, details);
       stream.write(line);
       return line;
     },
     emitSessionUpdate(sessionId, update = {}, options = {}) {
       const sid = sessionId || '__default__';
-      if (isTurnCancelled(sid, options.turnId) || isShutdown) return null;
-      if (options.requestId && cancelledRequests.has(options.requestId)) return null;
-      // R05-F02 & R06-F02: Official ACP v1 format with valid content structure
+      if (!isEmissionAllowed(sid, options.turnId, options.requestId)) return null;
+      // R05-F02, R06-F02 & R07-F03: Official ACP v1 format with valid content structure
       const notif = {
         jsonrpc: '2.0',
         method: 'session/update',
@@ -467,6 +506,21 @@ export function createAcpDiagnosticEmitter(stream = process.stdout) {
         const respLine = JSON.stringify(response) + '\n';
         stream.write(respLine);
         return response;
+      }
+      if (parsed.method === 'session/new') {
+        const sid = parsed.params?.sessionId || `sess-${Date.now()}`;
+        sessionTurns.set(sid, 1);
+        cancelledSessions.delete(sid);
+        if (parsed.id !== undefined && parsed.id !== null) {
+          const response = {
+            jsonrpc: '2.0',
+            id: parsed.id,
+            result: { sessionId: sid }
+          };
+          stream.write(JSON.stringify(response) + '\n');
+          return response;
+        }
+        return { sessionId: sid };
       }
       if (parsed.method === 'session/prompt') {
         const sid = parsed.params?.sessionId || '__default__';

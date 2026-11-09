@@ -23,23 +23,30 @@ const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..');
 
 /**
- * Resolves the real canonical filesystem path, resolving all symbolic links and junctions.
+ * Resolves the real canonical filesystem path across symlinks, junctions, and non-existent leaf segments.
+ * Walks up the tree to the nearest existing ancestor, resolves native physical realpath,
+ * and re-appends leaf segments, preventing lexical fallback bypasses (R07-F05).
  * @param {string} p
  * @returns {string}
  */
 export function getCanonicalRealPath(p) {
-  try {
-    return fs.realpathSync.native ? fs.realpathSync.native(p) : fs.realpathSync(p);
-  } catch {
-    const parent = path.dirname(p);
-    const base = path.basename(p);
-    try {
-      const realParent = fs.realpathSync.native ? fs.realpathSync.native(parent) : fs.realpathSync(parent);
-      return path.join(realParent, base);
-    } catch {
-      return path.resolve(p);
-    }
+  let existing = path.resolve(p);
+  const segments = [];
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    segments.unshift(path.basename(existing));
+    existing = parent;
   }
+
+  let realExisting = existing;
+  try {
+    realExisting = fs.realpathSync.native ? fs.realpathSync.native(existing) : fs.realpathSync(existing);
+  } catch {
+    realExisting = path.resolve(existing);
+  }
+
+  return segments.length > 0 ? path.join(realExisting, ...segments) : realExisting;
 }
 
 const DEFAULT_CORPUS_PATH = path.join(REPO_ROOT, 'evals', 'v2-corpus', 'layer2-external-validity-corpus.json');
@@ -223,44 +230,47 @@ export async function runHarness(options = {}) {
         throw new Error(`Path containment violation (R06-F04): ${targetDir} escapes outDir ${resolvedOutDir}`);
       }
 
-      // R04-F05, R05-F03 & R06-F04: Safe harness directory purger with physical containment and identity binding
+      // R04-F05, R05-F03, R06-F04 & R07-F07: Safe harness directory purger with mandatory dual-attestation (AND binding)
       function safePurgeHarnessTarget(dir, baseOutDir, expectedRemote, expectedCaseId, expectedCommitSha) {
         const canonicalDir = getCanonicalRealPath(dir);
         const canonicalBase = getCanonicalRealPath(baseOutDir);
         if (!canonicalDir.startsWith(canonicalBase + path.sep)) {
-          throw new Error(`Security Exception (R06-F04): targetDir ${dir} physically escapes base outDir ${baseOutDir}`);
+          throw new Error(`Security Exception (R07-F05): targetDir ${dir} physically escapes base outDir ${baseOutDir}`);
         }
         if (!fs.existsSync(dir)) return;
 
-        // If target directory itself is a symlink or junction, unlink it without recursing into external target
-        const lstat = fs.lstatSync(dir);
-        if (lstat.isSymbolicLink()) {
+        // If target directory itself is a symlink or junction, unlink it directly without recursing into external target
+        const lstat = fs.lstatSync(dir, { throwIfNoEntry: false });
+        if (lstat && lstat.isSymbolicLink()) {
           fs.unlinkSync(dir);
           return;
         }
 
+        // R07-F07 Dual-Control: Both external marker binding AND git remote check are required (AND logic)
         const marker = path.join(baseOutDir, `.${path.basename(dir)}.harness-metadata.json`);
-        const legacyInternalMarker = path.join(dir, '.three-lens-harness-checkout');
         const gitConfig = path.join(dir, '.git', 'config');
-        let isHarnessOwned = false;
 
+        let markerValid = false;
         if (fs.existsSync(marker)) {
           try {
             const data = JSON.parse(fs.readFileSync(marker, 'utf8'));
             if ((!expectedCaseId || data.caseId === expectedCaseId) &&
                 (!expectedCommitSha || data.upstreamCommitSha === expectedCommitSha)) {
-              isHarnessOwned = true;
+              markerValid = true;
             }
           } catch {}
         }
-        if (fs.existsSync(legacyInternalMarker)) isHarnessOwned = true;
-        if (fs.existsSync(gitConfig) && fs.readFileSync(gitConfig, 'utf8').includes(expectedRemote)) {
-          isHarnessOwned = true;
+
+        const gitRemoteValid = fs.existsSync(gitConfig) && fs.readFileSync(gitConfig, 'utf8').includes(expectedRemote);
+
+        // Require both marker and git remote (or empty directory) to purge safely
+        const isVerifiedHarnessTarget = (markerValid && gitRemoteValid) || fs.readdirSync(dir).length === 0;
+        if (!isVerifiedHarnessTarget) {
+          throw new Error(
+            `Safety Exception (R07-F07): Refusing to delete directory '${dir}' without mandatory dual-attestation (markerValid: ${markerValid}, gitRemoteValid: ${gitRemoteValid})`
+          );
         }
 
-        if (!isHarnessOwned && fs.readdirSync(dir).length > 0) {
-          throw new Error(`Safety Exception (R06-F04): Refusing to delete directory '${dir}' without verified identity binding`);
-        }
         fs.rmSync(dir, { recursive: true, force: true });
         if (fs.existsSync(marker)) {
           try { fs.unlinkSync(marker); } catch {}
