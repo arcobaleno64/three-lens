@@ -1,13 +1,13 @@
 # Milestone 5.5 Multi-Tier Empirical Calibration, Upstream Verified OSS Ground Truth & ACP Streaming Diagnostics Report
 
-**Generated**: `2026-11-10T00:05:00.000Z`  
+**Generated**: `2026-11-10T00:35:00.000Z`  
 **Milestone Scope**: Milestone 5.5 (RFC 0006) — Multi-Tier Empirical Calibration, Upstream Verified OSS Ground Truth & ACP Inline Streaming Diagnostics  
 **Evidence Grade**: `Tier 1: LIVE_AGENT_OBSERVED & DETERMINISTIC_CORPUS_VERIFIED`  
 **Evaluation Protocol**: `evals/protocols/v2.0-three-layer-evaluation-framework.md` / `v2.0-acceptance-criteria.json`  
 **Governance Standard**: NIST SSDF (SP 800-218) / Default-Deny Authority Invariant / Tripartite Governance Invariant  
 **Target Release**: `v1.13.0`  
 **Repository Branch**: `feat/v1.13.0-dev`  
-**Review Status**: In Remediation for Independent Review R01 (ChatGPT Pro)  
+**Review Status**: Independent Review R02 Remediated (Pending R03 Sign-off with ChatGPT Pro)  
 
 ---
 
@@ -20,40 +20,41 @@ flowchart TD
     M54P2["Milestone 5.4 Phase 2<br/>(v1.12.0 Frozen Baseline)"] --> M55["Milestone 5.5 Implementation (v1.13.0)"]
     
     M55 --> WS1["Workstream 1: Multi-Tier Dynamic Calibration<br/>(Low vs Medium vs High on Gemini 3.8 / 4 Argon)"]
-    M55 --> WS2["Workstream 2: Upstream Verified OSS Ground Truth<br/>(Real CVE & Patch Pairs in Layer 2 Corpus)"]
+    M55 --> WS2["Workstream 2: Upstream Verified OSS Ground Truth<br/>(Real CVE & Patch Pairs in Layer 2 Corpus across 4 CWEs)"]
     M55 --> WS3["Workstream 3: ACP Native Protocol Streaming<br/>(IDE Inline Streaming Diagnostics via Stdio JSON-RPC)"]
     M55 --> WS4["Workstream 4: Protocol & Boundary Modernization<br/>(Target Identity Parity & Open Corpus Scaling)"]
     
     WS1 --> Res1["Thinking Tokens -72.7% / Latency -56.5% with 100% SSRF Candidate Lineage Match"]
-    WS2 --> Res2["6 Upstream Verified OSS CVE Pairs (minimist, json-pointer, ini) with GitHub API Auth"]
-    WS3 --> Res3["ACP JSON-RPC 2.0 Streaming Diagnostic Notifications & Authority Gate (10/10 Tests PASS)"]
+    WS2 --> Res2["12 Upstream Verified OSS Cases (minimist, json-pointer, ini, node-tar, lodash, axios)"]
+    WS3 --> Res3["ACP JSON-RPC 2.0 Streaming Diagnostic Notifications & Authority Gate (11/11 Tests PASS)"]
     WS4 --> Res4["Tripartite Invariant Upheld: V2_RELEASE ≠ BLOCKING ≠ CLEAN"]
 ```
 
-### 1.1 Core Milestone Achievements & R01 Remediation Alignment
+### 1.1 Core Milestone Achievements & Round 02 Remediation Alignment
 1. **Workstream 1 (Dynamic Effort Calibration — Bound to Frozen Disk Envelopes)**:
    - Validated CLI forwarding for `--effort <low|medium|high>` in `scripts/run-live-model-benchmark.mjs`.
    - On the `SEM-03` Confused Deputy audit fixture, frozen runs in `evals/live-runs/m54-pilot/` demonstrate:
      - `gemini-3.8-flash-low` expended 2,369 thinking tokens compared to 8,691 on `gemini-3.8-flash-medium` (**-72.7% thinking token reduction**), cutting execution latency from 101.648s to 44.198s (**-56.5% latency reduction**).
      - Both effort tiers achieved **100% candidate semantic lineage concordance** (`62c3cd33c856f5552c7f3547c67ba2d2`), discovering the identical authentic SSRF vulnerability (`CAND-CWE-918-12`) at the unvalidated `fetch` sink without false suppression.
      - *Boundary Clarification (R01-F06)*: This data point represents stochastic discovery-stage candidate generation on development set fixture `SEM-03`. It is cataloged strictly as a rapid Smoke Check optimization and does not claim full 3-lens finalizer consensus parity across all vulnerability classes.
-2. **Workstream 2 (Upstream Verified OSS Ground Truth Expansion & Remote Authentication)**:
-   - Expanded `evals/v2-corpus/layer2-external-validity-corpus.json` from 14 cases to **20 authoritative cases**.
-   - Integrated 6 `UPSTREAM_VERIFIED_OSS` Ground Truth Bundles authenticated directly against upstream GitHub repository remotes (R01-F01 resolved):
-     - `L2-15` & `L2-16`: `minimist` CVE-2020-7598 (`minimistjs/minimist` pre-fix commit `47acf72...`, fix commit `63e7ed0...`).
-     - `L2-17` & `L2-18`: `json-pointer` CVE-2022-4742 (`manuelstofer/json-pointer` pre-fix commit `9b5ea8e...`, fix commit `859c998...`).
-     - `L2-19` & `L2-20`: `ini` CVE-2020-7788 (`npm/ini` pre-fix commit `738eca5...`, fix commit `56d2805...`).
-   - Authored `scripts/fetch-upstream-oss-fixture.mjs` providing hermetic multi-repo checkout and live `--verify-upstream` GitHub API authentication (R01-F02 resolved).
-   - Upstream commit SHAs and in-repo bundled commit SHAs are strictly decoupled and validated.
-3. **Workstream 3 (ACP Native Protocol Inline Streaming Diagnostics & Authority Gate)**:
+2. **Workstream 2 (Upstream Verified OSS Ground Truth Expansion & Remote Authentication — R02-01 & R02-04)**:
+   - Expanded `evals/v2-corpus/layer2-external-validity-corpus.json` from 14 cases to **26 authoritative cases** (13 vulnerable, 10 fixed counterparts, 3 clean controls).
+   - Integrated 12 `UPSTREAM_VERIFIED_OSS` Ground Truth Bundles across **4 distinct CWE families** authenticated directly against upstream GitHub repository remotes:
+     - `CWE-1321` (Prototype Pollution): `minimist` (CVE-2020-7598), `json-pointer` (CVE-2020-7709), `ini` (CVE-2020-7788).
+     - `CWE-022` (Path Traversal): `node-tar` (CVE-2021-32803).
+     - `CWE-1333` (ReDoS): `lodash` (CVE-2020-28500).
+     - `CWE-918` (SSRF Credential/Header Leak): `axios` (CVE-2020-28168).
+   - *R02-04 Hardening*: `scripts/fetch-upstream-oss-fixture.mjs` enhanced with strict case ID matching (`c.caseId || c.id`), sanitization preventing path containment escape, and fail-closed non-zero exit codes on any verification or checkout failure.
+3. **Workstream 3 (ACP Native Protocol Inline Streaming Diagnostics & Authority Gate — R02-02 & R02-03)**:
    - Authored `scripts/adapters/acp-adapter.mjs` converting 3-Lens verification ballots and findings into standard ACP / LSP `textDocument/publishDiagnostics` and `window/logMessage` streaming notifications over stdio JSON-RPC 2.0.
-   - *R01-F04 Hardening*: Default-Deny Authority Invariant strictly enforced inside the adapter: unverified candidate findings (`disposition !== 'CONFIRMED' && disposition !== 'REPORTABLE'`) are clamped to `ACP_DIAGNOSTIC_SEVERITY.HINT` with an explicit `[UNVERIFIED CANDIDATE]` notice, preventing premature IDE Errors.
-   - *R01-F03 & R01-F05 Hardening*: Full ACP initialization lifecycle (`initialize`/`initialized`), ballot progress indicators, and safe non-negative integer clamping on diagnostic ranges.
-   - Comprehensive test suite `tests/test-acp-adapter.mjs` passes 10/10 tests.
+   - *R02-03 / R01-F04 Hardening*: Default-Deny Authority Invariant strictly enforced inside the adapter: missing or omitted `disposition` defaults to `'UNVERIFIED'`. Unverified candidate findings are strictly clamped to `ACP_DIAGNOSTIC_SEVERITY.HINT` (4) with an explicit `[UNVERIFIED CANDIDATE]` notice, preventing premature IDE Errors.
+   - *R02-02 Hardening*: Aligned `handleInitialize()` response to pass the native ACP handshake validator in `scripts/adapters/acp-transport-adapter.mjs` (`validateAcpHandshake()`), declaring `protocolVersion: 1`, `agentInfo: { name, version }`, and active `agentCapabilities`.
+   - Comprehensive test suite `tests/test-acp-adapter.mjs` passes 11/11 tests.
 4. **Workstream 4 (Specification Modernization & Governance Invariants)**:
    - Synchronized target identity in `evals/protocols/v2.0-three-layer-evaluation-framework.md` and `evals/protocols/v2.0-acceptance-criteria.json` to `@arcobaleno64/three-lens`.
-   - Scaled Layer 2 upper boundary from 16 to 32 cases to support open-ended corpus expansion, with updated `frozenAt: 2026-11-09T16:00:00Z` (R01-F07 resolved).
-   - *R01-F08 Hardening*: Finalizer in `skills/3lens/scripts/finalize-scan.mjs` fails closed under Default-Deny when project security context is absent (`assuranceLabel: 'CONTEXT_LIMITED'`), strictly setting `canDeclareClean = false`.
+   - Scaled Layer 2 upper boundary from 16 to 32 cases to support open-ended corpus expansion, with updated `frozenAt: 2026-11-09T16:00:00Z`.
+   - Harmonized all 26 canonical case IDs between report and corpus character-for-character (R01-F07 resolved).
+   - *R01-F08 Hardening*: Finalizer in `skills/3lens/scripts/finalize-scan.mjs` fails closed under Default-Deny when project security context is absent (`assuranceLabel: 'CONTEXT_LIMITED'`), strictly setting `canDeclareClean = false`. Tested explicitly under test 90.
    - Preserved the **Tripartite Governance Invariant**: `v1.13.0` maintains advisory reviewer scope, without premature claims of blocking authority or universal clean certification.
 
 ---
@@ -99,47 +100,54 @@ flowchart TD
 
 ## 3. Workstream 2: Layer 2 Upstream Verified OSS Corpus Expansion
 
-### 3.1 Authoritative Corpus Composition (N=20)
+### 3.1 Authoritative Corpus Composition (N=26)
 
 ```mermaid
-pie title Layer 2 External Validity Corpus Distribution (N=20)
+pie title Layer 2 External Validity Corpus Distribution (N=26)
     "Synthetic Regression (Vulnerable)" : 7
     "Synthetic Fixed Counterparts" : 4
     "Synthetic Clean Controls" : 3
-    "Upstream Verified OSS (Vulnerable)" : 3
-    "Upstream Verified OSS (Fixed)" : 3
+    "Upstream Verified OSS (Vulnerable)" : 6
+    "Upstream Verified OSS (Fixed)" : 6
 ```
 
 | Canonical Case ID | Package / Target | CVE ID | CWE Family | Provenance Type | Role | Upstream Commit SHA |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `L2-01-SYN-VULN-PATHTRAVERSAL` | `path-traversal-archive` | CVE-2020-28500 | CWE-022 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | N/A (Synthetic) |
-| `L2-02-SYN-FIX-PATHTRAVERSAL` | `path-traversal-archive` | CVE-2020-28500 | CWE-022 | `SYNTHETIC_REGRESSION` | `FIXED_COUNTERPART` | N/A (Synthetic) |
-| `L2-03-SYN-VULN-SQLI` | `sql-injection-user-query` | CVE-2021-32803 | CWE-089 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | N/A (Synthetic) |
-| `L2-04-SYN-FIX-SQLI` | `sql-injection-user-query` | CVE-2021-32803 | CWE-089 | `SYNTHETIC_REGRESSION` | `FIXED_COUNTERPART` | N/A (Synthetic) |
-| `L2-05-SYN-VULN-CMDINJ` | `command-injection-helper` | CVE-2020-7598 | CWE-078 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | N/A (Synthetic) |
-| `L2-06-SYN-FIX-CMDINJ` | `command-injection-helper` | CVE-2020-7598 | CWE-078 | `SYNTHETIC_REGRESSION` | `FIXED_COUNTERPART` | N/A (Synthetic) |
-| `L2-07-SYN-VULN-SSRF` | `ssrf-webhook-dispatcher` | CVE-2020-28168 | CWE-918 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | N/A (Synthetic) |
-| `L2-08-SYN-FIX-SSRF` | `ssrf-webhook-dispatcher` | CVE-2020-28168 | CWE-918 | `SYNTHETIC_REGRESSION` | `FIXED_COUNTERPART` | N/A (Synthetic) |
-| `L2-09-SYN-VULN-XSS` | `xss-template-renderer` | CVE-2021-23358 | CWE-079 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | N/A (Synthetic) |
-| `L2-10-SYN-VULN-DESERIALIZATION` | `deserialization-config` | CVE-2020-28246 | CWE-502 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | N/A (Synthetic) |
-| `L2-11-SYN-VULN-REDOS` | `regex-redos-validator` | CVE-2020-7788 | CWE-1333 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | N/A (Synthetic) |
-| `L2-12-SYN-CLEAN-LODASH` | `clean-lodash-util` | Control | N/A | `SYNTHETIC_CLEAN_CONTROL` | `CLEAN_CONTROL` | N/A (Synthetic) |
-| `L2-13-SYN-CLEAN-MINIMIST` | `clean-minimist-cli` | Control | N/A | `SYNTHETIC_CLEAN_CONTROL` | `CLEAN_CONTROL` | N/A (Synthetic) |
-| `L2-14-SYN-CLEAN-NODETAR` | `clean-node-tar-path` | Control | N/A | `SYNTHETIC_CLEAN_CONTROL` | `CLEAN_CONTROL` | N/A (Synthetic) |
-| `L2-15-OSS-VULN-MINIMIST` | `minimist` | CVE-2020-7598 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `47acf72c...` (Verified) |
-| `L2-16-OSS-FIX-MINIMIST` | `minimist` | CVE-2020-7598 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `63e7ed05...` (Verified) |
-| `L2-17-OSS-VULN-JSONPOINTER` | `json-pointer` | CVE-2022-4742 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `9b5ea8e3...` (Verified) |
-| `L2-18-OSS-FIX-JSONPOINTER` | `json-pointer` | CVE-2022-4742 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `859c9984...` (Verified) |
-| `L2-19-OSS-VULN-INI` | `ini` | CVE-2020-7788 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `738eca59...` (Verified) |
-| `L2-20-OSS-FIX-INI` | `ini` | CVE-2020-7788 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `56d2805e...` (Verified) |
+| `L2-01-VULN-INJECTION` | `three-lens` | CVE-2020-28500 | CWE-1333 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | `N/A` |
+| `L2-02-FIX-INJECTION` | `three-lens` | CVE-2020-28500 | CWE-1333 | `SYNTHETIC_REGRESSION` | `FIXED_COUNTERPART` | `N/A` |
+| `L2-03-VULN-AUTHZ` | `three-lens` | N/A | CWE-863 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | `N/A` |
+| `L2-04-FIX-AUTHZ` | `three-lens` | N/A | CWE-863 | `SYNTHETIC_REGRESSION` | `FIXED_COUNTERPART` | `N/A` |
+| `L2-05-VULN-PATHTRAVERSAL` | `three-lens` | CVE-2021-32803 | CWE-22 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | `N/A` |
+| `L2-06-FIX-PATHTRAVERSAL` | `three-lens` | CVE-2021-32803 | CWE-22 | `SYNTHETIC_REGRESSION` | `FIXED_COUNTERPART` | `N/A` |
+| `L2-07-VULN-PROTOTYPEPOLLUTION` | `three-lens` | CVE-2020-7598 | CWE-1321 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | `N/A` |
+| `L2-08-FIX-PROTOTYPEPOLLUTION` | `three-lens` | CVE-2020-7598 | CWE-1321 | `SYNTHETIC_REGRESSION` | `FIXED_COUNTERPART` | `N/A` |
+| `L2-09-VULN-CONCURRENCY` | `three-lens` | N/A | CWE-367 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | `N/A` |
+| `L2-10-VULN-SECRETS` | `three-lens` | N/A | CWE-798 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | `N/A` |
+| `L2-11-VULN-SUPPLYCHAIN` | `three-lens` | CVE-2020-28168 | CWE-200 | `SYNTHETIC_REGRESSION` | `VULNERABLE` | `N/A` |
+| `L2-12-CLEAN-LODASH-CLAMP` | `three-lens` | N/A | CWE-1333 | `SYNTHETIC_CLEAN_CONTROL` | `CLEAN_CONTROL` | `N/A` |
+| `L2-13-CLEAN-MINIMIST-PARSE` | `three-lens` | N/A | CWE-1321 | `SYNTHETIC_CLEAN_CONTROL` | `CLEAN_CONTROL` | `N/A` |
+| `L2-14-CLEAN-TAR-HEADER` | `three-lens` | N/A | CWE-22 | `SYNTHETIC_CLEAN_CONTROL` | `CLEAN_CONTROL` | `N/A` |
+| `L2-15-OSS-VULN-MINIMIST` | `minimist` | CVE-2020-7598 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `47acf72c...` |
+| `L2-16-OSS-FIX-MINIMIST` | `minimist` | CVE-2020-7598 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `63e7ed05...` |
+| `L2-17-OSS-VULN-JSONPOINTER` | `json-pointer` | CVE-2020-7709 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `018e4889...` |
+| `L2-18-OSS-FIX-JSONPOINTER` | `json-pointer` | CVE-2020-7709 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `1dbd1ed6...` |
+| `L2-19-OSS-VULN-INI` | `ini` | CVE-2020-7788 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `738eca59...` |
+| `L2-20-OSS-FIX-INI` | `ini` | CVE-2020-7788 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `56d2805e...` |
+| `L2-21-OSS-VULN-NODETAR` | `node-tar` | CVE-2021-32803 | CWE-022 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `1e33534e...` |
+| `L2-22-OSS-FIX-NODETAR` | `node-tar` | CVE-2021-32803 | CWE-022 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `9dbdeb6d...` |
+| `L2-23-OSS-VULN-LODASH` | `lodash` | CVE-2020-28500 | CWE-1333 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `3469357c...` |
+| `L2-24-OSS-FIX-LODASH` | `lodash` | CVE-2020-28500 | CWE-1333 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `c4847ebe...` |
+| `L2-25-OSS-VULN-AXIOS` | `axios` | CVE-2020-28168 | CWE-918 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `f472e5da...` |
+| `L2-26-OSS-FIX-AXIOS` | `axios` | CVE-2020-28168 | CWE-918 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `c7329fef...` |
 
 ### 3.2 Acceptance Criteria Verification
 Execution of `npm run validate:v2-corpus` confirms:
-- **Total Cases**: 20 (Target: 12–32) ✔ **PASSED**
-- **Vulnerable Cases**: 10 (Target: 6–16) ✔ **PASSED**
-- **Fixed Counterparts**: 7 (Target: 3–10) ✔ **PASSED**
+- **Total Cases**: 26 (Target: 12–32) ✔ **PASSED**
+- **Vulnerable Cases**: 13 (Target: 6–16) ✔ **PASSED**
+- **Fixed Counterparts**: 10 (Target: 3–10) ✔ **PASSED**
 - **Clean Negative Controls**: 3 (Target: 3–10) ✔ **PASSED**
 - **Vulnerability Families**: 7 (Target: $\ge 7$) ✔ **PASSED**
+- **CWE Families in Upstream OSS**: 4 distinct families (`CWE-1321`, `CWE-022`, `CWE-1333`, `CWE-918`) ✔ **PASSED**
 - **Physical File Integrity**: 100% verified on disk and in git object storage.
 - **Upstream Remotes**: 100% authenticated against GitHub REST API via `scripts/fetch-upstream-oss-fixture.mjs --verify-upstream`.
 
@@ -170,19 +178,20 @@ sequenceDiagram
 ```
 
 ### 4.2 Test Verification
-Unit test suite `tests/test-acp-adapter.mjs` executes 10 deterministic invariant checks:
+Unit test suite `tests/test-acp-adapter.mjs` executes 11 deterministic invariant checks:
 1. Severity mapping with Default-Deny clamping for unverified candidates.
 2. Production of standard LSP range and metadata.
-3. Authority Gate enforcement: candidate findings clamped to Hint.
-4. Safe non-negative integer clamping on malformed/negative line numbers.
-5. JSON-RPC 2.0 single-line LF framing without trailing CRLF injection.
-6. Batch publishDiagnostics notification formatting.
-7. Ballot progress notification (`window/logMessage`) formatting.
-8. Initialize request handshake response.
-9. Parse error handling and version validation.
-10. End-to-end stream writing and ballot emission.
+3. Authority Gate enforcement: missing or unverified candidate findings clamped to Hint (4).
+4. Authority Gate candidate enforcement: candidate findings clamped to Hint.
+5. Safe non-negative integer clamping on malformed/negative line numbers.
+6. JSON-RPC 2.0 single-line LF framing without trailing CRLF injection.
+7. Batch publishDiagnostics notification formatting.
+8. Ballot progress notification (`window/logMessage`) formatting.
+9. Initialize request handshake response aligning with `validateAcpHandshake()`.
+10. Parse error handling and version validation.
+11. End-to-end stream writing and ballot emission.
 
-All 10/10 tests pass with 100% determinism.
+All 11/11 tests pass with 100% determinism.
 
 ---
 

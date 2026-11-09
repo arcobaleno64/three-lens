@@ -4028,6 +4028,10 @@ export default appName;`;
     if (finalized90.summary.assuranceLabel !== 'CONTEXT_LIMITED') {
       throw new Error(`R9-T10 VIOLATION: Scan without .security-audit/ yielded ${finalized90.summary.assuranceLabel} instead of CONTEXT_LIMITED`);
     }
+    // R01-F08 Verification: canDeclareClean must be false when context is limited
+    if (finalized90.summary.canDeclareClean !== false) {
+      throw new Error(`R9-T10 VIOLATION: canDeclareClean must be strictly false under CONTEXT_LIMITED, got: ${finalized90.summary.canDeclareClean}`);
+    }
   } finally {
     fs.rmSync(testRoot90, { recursive: true, force: true });
   }

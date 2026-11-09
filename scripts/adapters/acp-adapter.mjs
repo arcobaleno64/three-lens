@@ -46,17 +46,17 @@ export function assertFindingDispositionAuthority(finding) {
 
 /**
  * Maps 3-Lens / CVSS severity levels to standard ACP DiagnosticSeverity numbers.
- * Under Default-Deny (R01-F04), unverified candidates cannot escalate to Error or Warning.
+ * Under Default-Deny (R01-F04 / R02-03), unverified candidates cannot escalate to Error or Warning.
  * @param {string} severity
- * @param {string} [disposition='REPORTABLE']
+ * @param {string} [disposition='UNVERIFIED']
  * @returns {number}
  */
-export function mapSeverityToAcpDiagnostic(severity, disposition = 'REPORTABLE') {
+export function mapSeverityToAcpDiagnostic(severity, disposition = 'UNVERIFIED') {
   const isAuthorityConfirmed = String(disposition || '').toUpperCase().trim() === 'CONFIRMED'
     || String(disposition || '').toUpperCase().trim() === 'REPORTABLE';
 
   if (!isAuthorityConfirmed) {
-    // Unverified candidates are strictly clamped to Hint
+    // Unverified candidates are strictly clamped to Hint under Default-Deny
     return ACP_DIAGNOSTIC_SEVERITY.HINT;
   }
 
@@ -107,7 +107,7 @@ export function formatAcpDiagnostic(finding) {
   const startChar = safeNonNegativeInteger(rawStartCol - 1, 0);
   const endChar = safeNonNegativeInteger(rawEndCol - 1, startChar);
 
-  const disposition = String(finding.disposition || 'REPORTABLE').toUpperCase().trim();
+  const disposition = finding.disposition ? String(finding.disposition).toUpperCase().trim() : 'UNVERIFIED';
   const severityNum = mapSeverityToAcpDiagnostic(finding.severity, disposition);
 
   const rawMsg = finding.title || finding.description || 'Security vulnerability detected';
@@ -197,6 +197,7 @@ export function formatBallotProgressNotification(candidateId, lens, vote, detail
 
 /**
  * Handles ACP / LSP initialize request handshake.
+ * Complies with native ACP handshake contract in `validateAcpHandshake()`.
  * @param {object} request
  * @returns {object} JSON-RPC 2.0 response object
  */
@@ -206,6 +207,20 @@ export function handleInitialize(request = {}) {
     jsonrpc: '2.0',
     id: reqId,
     result: {
+      protocolVersion: 1,
+      agentInfo: {
+        name: 'three-lens-acp-adapter',
+        version: '1.13.0'
+      },
+      agentCapabilities: {
+        promptCapabilities: {
+          streamingDiagnostics: true
+        },
+        sessionCapabilities: {
+          diagnosticProvider: true,
+          progressProvider: true
+        }
+      },
       capabilities: {
         diagnosticProvider: true,
         progressProvider: true

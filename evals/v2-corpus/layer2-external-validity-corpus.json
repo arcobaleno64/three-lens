@@ -10,18 +10,18 @@
     "authority": "Antigravity Security Governance & Assurance Directorate",
     "nonEquivalencePrinciple": "Sample sufficiency != evaluation success",
     "dispositionConjunctiveContract": "Unanimous 3-Lens panel required for REPORTABLE; decisive counterevidence suppresses to FALSE_POSITIVE",
-    "provenanceDiscipline": "Transparently partitioned into SYNTHETIC_REGRESSION (11), SYNTHETIC_CLEAN_CONTROL (3), and UPSTREAM_VERIFIED_OSS (6) ground-truth bundles physically pinned to arcobaleno64/three-lens commit eddd0c38875c356fd20530b2e19cd12734d50155"
+    "provenanceDiscipline": "Transparently partitioned into SYNTHETIC_REGRESSION (11), SYNTHETIC_CLEAN_CONTROL (3), and UPSTREAM_VERIFIED_OSS (12) ground-truth bundles physically pinned to arcobaleno64/three-lens commit eddd0c38875c356fd20530b2e19cd12734d50155"
   },
   "metricsSummary": {
-    "totalCases": 20,
-    "vulnerableCasesCount": 10,
-    "fixedCounterpartsCount": 7,
+    "totalCases": 26,
+    "vulnerableCasesCount": 13,
+    "fixedCounterpartsCount": 10,
     "cleanControlsCount": 3,
     "vulnerabilityFamiliesCount": 7,
     "provenanceBreakdown": {
       "syntheticRegressionCount": 11,
       "syntheticCleanControlCount": 3,
-      "upstreamVerifiedOssCount": 6
+      "upstreamVerifiedOssCount": 12
     },
     "conformance": {
       "totalCasesRange": [
@@ -437,11 +437,11 @@
       "family": "injection-and-validation",
       "role": "VULNERABLE",
       "cwe": "CWE-1321",
-      "title": "json-pointer Prototype Pollution via set() Path Navigation (CVE-2022-4742 Upstream Ground Truth)",
+      "title": "json-pointer Prototype Pollution via set() Path Navigation (CVE-2020-7709 Upstream Ground Truth)",
       "upstreamRepo": "https://github.com/manuelstofer/json-pointer.git",
-      "upstreamCommitSha": "9b5ea8e3b20f9e3065860cf3b018b47708e8794d",
+      "upstreamCommitSha": "018e48894b5808db371568471952e9968f8bd830",
       "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
-      "cveId": "CVE-2022-4742",
+      "cveId": "CVE-2020-7709",
       "targetFile": "evals/oss-corpus/pre-fix/03-json-pointer-prototype-pollution.js",
       "targetSink": "set(obj, pointer, value) at line 15",
       "expectedDisposition": "REPORTABLE",
@@ -451,7 +451,7 @@
       "humanOracle": {
         "status": "CONFIRMED_VALID",
         "adjudicatedBy": "AppSec Audit Panel",
-        "rationale": "Confirmed upstream CVE-2022-4742 advisory and fix commit 859c998."
+        "rationale": "Confirmed upstream CVE-2020-7709 advisory and fix commit 1dbd1ed."
       },
       "blobSha256": "74d09a2cf149d3b30a5afd3157375573eb8f08c4e064b4f04f5e42eee7138662"
     },
@@ -461,11 +461,11 @@
       "family": "injection-and-validation",
       "role": "FIXED_COUNTERPART",
       "cwe": "CWE-1321",
-      "title": "json-pointer Forbidden Token Guard Neutralizing Pollution (CVE-2022-4742 Remediated)",
+      "title": "json-pointer Forbidden Token Guard Neutralizing Pollution (CVE-2020-7709 Remediated)",
       "upstreamRepo": "https://github.com/manuelstofer/json-pointer.git",
-      "upstreamCommitSha": "859c9984b6c407fc2d5a0a7e47c7274daa681941",
+      "upstreamCommitSha": "1dbd1ed6bef76f359dcf44d5b0e849d4881540b2",
       "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
-      "cveId": "CVE-2022-4742",
+      "cveId": "CVE-2020-7709",
       "targetFile": "evals/oss-corpus/post-fix/03-json-pointer-prototype-pollution.js",
       "targetSink": "FORBIDDEN token check at line 12",
       "expectedDisposition": "SUPPRESSED",
@@ -475,7 +475,7 @@
       "humanOracle": {
         "status": "CONFIRMED_VALID",
         "adjudicatedBy": "AppSec Audit Panel",
-        "rationale": "Verified upstream fix commit 859c998."
+        "rationale": "Verified upstream fix commit 1dbd1ed."
       },
       "blobSha256": "86a9ab9b1d6e325b291f91f194bbb09d8e7be0a84403899f0558decdac6b6ad5"
     },
@@ -526,6 +526,150 @@
         "rationale": "Verified upstream fix commit 56d2805."
       },
       "blobSha256": "7f88a462d28fbf8551bdb171ee8ba7f0eb7d505318716c6032411cab526e158d"
+    },
+    {
+      "caseId": "L2-21-OSS-VULN-NODETAR",
+      "provenanceType": "UPSTREAM_VERIFIED_OSS",
+      "family": "path-and-filesystem",
+      "role": "VULNERABLE",
+      "cwe": "CWE-022",
+      "title": "node-tar Path Traversal / Arbitrary File Overwrite on Unpack (CVE-2021-32803 Upstream Ground Truth)",
+      "upstreamRepo": "https://github.com/isaacs/node-tar.git",
+      "upstreamCommitSha": "1e33534e1e96ca6385b3a4749876aea2cda61cea",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": "CVE-2021-32803",
+      "targetFile": "evals/oss-corpus/pre-fix/04-tar-path-traversal.js",
+      "targetSink": "extractEntry(targetDir, entryPath, content) at line 10",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "HIGH",
+      "cvssVector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N",
+      "technicalProof": "Extracting entry with traversal sequences or directory symlink bypass allows writing arbitrary files outside destination folder.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Confirmed upstream CVE-2021-32803 advisory and official fix commit 9dbdeb6."
+      },
+      "blobSha256": "7179c8411d4efb13390655639b23d4ba862bfca1d8cfadf8212ac38fd4d7cf0c"
+    },
+    {
+      "caseId": "L2-22-OSS-FIX-NODETAR",
+      "provenanceType": "UPSTREAM_VERIFIED_OSS",
+      "family": "path-and-filesystem",
+      "role": "FIXED_COUNTERPART",
+      "cwe": "CWE-022",
+      "title": "node-tar Path Containment and DirCache Purge (CVE-2021-32803 Remediated)",
+      "upstreamRepo": "https://github.com/isaacs/node-tar.git",
+      "upstreamCommitSha": "9dbdeb6df8e9dbd96fa9e84341b9d74734be6c20",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": "CVE-2021-32803",
+      "targetFile": "evals/oss-corpus/post-fix/04-tar-path-traversal.js",
+      "targetSink": "path.relative containment assertion at line 13",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "Relative path resolution verifies destination starts with target directory; escapes throw TAR_EXTRACTION_SECURITY_ERROR.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Verified upstream fix commit 9dbdeb6."
+      },
+      "blobSha256": "adba843ce35fcaea9a37b5877d25455af3999067e02fb2bc138b111e0171ecd6"
+    },
+    {
+      "caseId": "L2-23-OSS-VULN-LODASH",
+      "provenanceType": "UPSTREAM_VERIFIED_OSS",
+      "family": "injection-and-validation",
+      "role": "VULNERABLE",
+      "cwe": "CWE-1333",
+      "title": "lodash ReDoS in String Trimming via Catastrophic Regex Backtracking (CVE-2020-28500 Upstream Ground Truth)",
+      "upstreamRepo": "https://github.com/lodash/lodash.git",
+      "upstreamCommitSha": "3469357cff396a26c363f8c1b5a91dde28ba4b1c",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": "CVE-2020-28500",
+      "targetFile": "evals/oss-corpus/pre-fix/02-lodash-redos.js",
+      "targetSink": "toNumber(value) at line 13",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "HIGH",
+      "cvssVector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N",
+      "technicalProof": "Oversized string with leading/trailing whitespaces causes catastrophic backtracking in regex reTrim, freezing the Node.js event loop.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Confirmed upstream CVE-2020-28500 advisory and official fix commit c4847eb."
+      },
+      "blobSha256": "15cd80f2270fee66680e80238e93e83bed24cfee0ad7878d3ca3ad0a428c33cf"
+    },
+    {
+      "caseId": "L2-24-OSS-FIX-LODASH",
+      "provenanceType": "UPSTREAM_VERIFIED_OSS",
+      "family": "injection-and-validation",
+      "role": "FIXED_COUNTERPART",
+      "cwe": "CWE-1333",
+      "title": "lodash Linear Loop-Based Trimming Neutralizing ReDoS (CVE-2020-28500 Remediated)",
+      "upstreamRepo": "https://github.com/lodash/lodash.git",
+      "upstreamCommitSha": "c4847ebe7d14540bb28a8b932a9ce1b9ecbfee1a",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": "CVE-2020-28500",
+      "targetFile": "evals/oss-corpus/post-fix/02-lodash-redos.js",
+      "targetSink": "trimmedStart(trimmedEnd(value)) at line 24",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "Iterative character-code scan replaces regular expression backtracking; execution time strictly linear O(N).",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Verified upstream fix commit c4847eb."
+      },
+      "blobSha256": "2ae7d22114cb97e9186632467fb12fee70273c80bf98e3725bc506218d1a835f"
+    },
+    {
+      "caseId": "L2-25-OSS-VULN-AXIOS",
+      "provenanceType": "UPSTREAM_VERIFIED_OSS",
+      "family": "injection-and-validation",
+      "role": "VULNERABLE",
+      "cwe": "CWE-918",
+      "title": "axios Credential and Authorization Header Leakage on Cross-Origin Redirect (CVE-2020-28168 Upstream Ground Truth)",
+      "upstreamRepo": "https://github.com/axios/axios.git",
+      "upstreamCommitSha": "f472e5da5fe76c72db703d6a0f5190e4ad31e642",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": "CVE-2020-28168",
+      "targetFile": "evals/oss-corpus/pre-fix/05-axios-ssrf-header-leak.js",
+      "targetSink": "handleRedirect(originalUrl, redirectLocation, originalHeaders) at line 10",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "MEDIUM",
+      "cvssVector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N/SC:H/SI:N/SA:N",
+      "technicalProof": "Forwarding original request headers on 3xx redirect to different origin leaks sensitive Authorization and Cookie tokens.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Confirmed upstream CVE-2020-28168 advisory and official fix commit c7329fe."
+      },
+      "blobSha256": "04c4d8089bcebd493b2d8f56ceba484961a9b6c1b8b907f04f9f177dc74c6bc7"
+    },
+    {
+      "caseId": "L2-26-OSS-FIX-AXIOS",
+      "provenanceType": "UPSTREAM_VERIFIED_OSS",
+      "family": "injection-and-validation",
+      "role": "FIXED_COUNTERPART",
+      "cwe": "CWE-918",
+      "title": "axios Cross-Origin Redirect Header Stripping (CVE-2020-28168 Remediated)",
+      "upstreamRepo": "https://github.com/axios/axios.git",
+      "upstreamCommitSha": "c7329fefc890050edd51e40e469a154d0117fc55",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": "CVE-2020-28168",
+      "targetFile": "evals/oss-corpus/post-fix/05-axios-ssrf-header-leak.js",
+      "targetSink": "isSameOrigin check and header deletion at line 14",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "Origin comparison strips Authorization and Cookie headers when redirect targets a different protocol or host.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Verified upstream fix commit c7329fe."
+      },
+      "blobSha256": "26cbb793776f92af81803f4769efd6f2c91536123d18ad4879236d3b1b9b1dd4"
     }
   ]
 }

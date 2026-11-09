@@ -12,6 +12,7 @@ import {
   parseJsonRpcMessage,
   createAcpDiagnosticEmitter
 } from '../scripts/adapters/acp-adapter.mjs';
+import { validateAcpHandshake } from '../scripts/adapters/acp-transport-adapter.mjs';
 
 test('ACP Adapter: mapSeverityToAcpDiagnostic severity mapping and Default-Deny clamping', () => {
   // Confirmed reportable findings map to appropriate severity
@@ -66,6 +67,25 @@ test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata'
   assert.equal(diag.data.lineageId, 'lin-abc-123');
   assert.equal(diag.data.authorityConfirmed, true);
   assert.equal(diag.data.remediation, 'Use parameterized queries');
+});
+
+test('ACP Adapter: R01-F04 / R02-03 Authority Gate strictly clamps candidate with missing disposition', () => {
+  const missingDispCandidate = {
+    id: 'CAND-NO-DISP',
+    ruleId: 'CWE-1321',
+    title: 'Prototype pollution candidate with omitted disposition',
+    severity: 'CRITICAL',
+    // disposition is intentionally omitted / undefined
+    location: { startLine: 5 }
+  };
+
+  const diag = formatAcpDiagnostic(missingDispCandidate);
+
+  // Under Default-Deny, missing disposition MUST NOT default to REPORTABLE/Error
+  assert.equal(diag.severity, ACP_DIAGNOSTIC_SEVERITY.HINT, 'Missing disposition must clamp to HINT (4)');
+  assert.equal(diag.data.authorityConfirmed, false, 'authorityConfirmed must be false');
+  assert.equal(diag.data.disposition, 'UNVERIFIED', 'disposition data must record UNVERIFIED');
+  assert.ok(diag.message.includes('[UNVERIFIED CANDIDATE]'), 'message must have [UNVERIFIED CANDIDATE] prefix');
 });
 
 test('ACP Adapter: R01-F04 Authority Gate clamps unverified candidate in formatAcpDiagnostic', () => {
@@ -151,13 +171,21 @@ test('ACP Adapter: R01-F03 formatBallotProgressNotification emits window/logMess
   assert.ok(parsed.params.message.includes('[3-Lens Ballot] Candidate CAND-CWE-918-01 - Lens REACHABILITY: CONFIRMED'));
 });
 
-test('ACP Adapter: R01-F03 handleInitialize returns ACP diagnostic and progress capabilities', () => {
+test('ACP Adapter: R01-F03 / R02-02 handleInitialize aligns with validateAcpHandshake contract', () => {
   const resp = handleInitialize({ id: 42, method: 'initialize' });
   assert.equal(resp.jsonrpc, '2.0');
   assert.equal(resp.id, 42);
   assert.equal(resp.result.capabilities.diagnosticProvider, true);
   assert.equal(resp.result.capabilities.progressProvider, true);
   assert.equal(resp.result.serverInfo.name, 'three-lens-acp-adapter');
+
+  // R02-02 Verification: Must pass validateAcpHandshake from acp-transport-adapter.mjs
+  const handshakeResult = validateAcpHandshake(resp, { expectedId: 42 });
+  assert.equal(handshakeResult.valid, true, `Handshake must be valid: ${handshakeResult.error}`);
+  assert.equal(handshakeResult.agentInfo.name, 'three-lens-acp-adapter');
+  assert.equal(handshakeResult.agentInfo.version, '1.13.0');
+  assert.ok(handshakeResult.capabilities.promptCapabilities.streamingDiagnostics);
+  assert.ok(handshakeResult.capabilities.sessionCapabilities.diagnosticProvider);
 });
 
 test('ACP Adapter: parseJsonRpcMessage validation and error handling', () => {

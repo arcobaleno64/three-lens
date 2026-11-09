@@ -119,31 +119,37 @@ export async function runHarness(options = {}) {
   const cases = Array.isArray(corpus.cases) ? corpus.cases : [];
   const ossCases = cases.filter(c => c.provenanceType === 'UPSTREAM_VERIFIED_OSS');
 
-  const targets = caseId ? ossCases.filter(c => c.id === caseId) : ossCases;
+  const targets = caseId ? ossCases.filter(c => (c.caseId || c.id) === caseId) : ossCases;
 
   if (targets.length === 0) {
     console.log(`No UPSTREAM_VERIFIED_OSS cases found matching filter.`);
-    return { total: 0, verified: 0, skipped: 0 };
+    return { total: 0, verified: 0, failed: 0, skipped: 0 };
   }
 
   console.log(`Processing ${targets.length} UPSTREAM_VERIFIED_OSS case(s)...`);
 
   let verifiedCount = 0;
+  let failedCount = 0;
+  const resolvedOutDir = path.resolve(outDir);
+
   for (const tc of targets) {
     const upstreamUrl = tc.upstreamRepoUrl || tc.upstreamRepo;
     const commitSha = tc.upstreamCommitSha || tc.commitSha;
 
     const caseId = tc.caseId || tc.id;
     const cwe = tc.cwe || tc.cweFamily || 'N/A';
-    const pkg = tc.package || tc.upstreamRepo?.split('/')?.pop()?.replace(/\.git$/, '') || caseId;
+    const rawPkg = tc.package || tc.upstreamRepo?.split('/')?.pop()?.replace(/\.git$/, '') || caseId;
+    // Strict path traversal defense: strip any non-whitelisted characters
+    const safePkg = String(rawPkg).replace(/[^a-zA-Z0-9._-]/g, '_');
 
-    console.log(`\nCase [${caseId}] ${tc.cveId || 'No-CVE'} (${cwe}) - ${pkg}`);
+    console.log(`\nCase [${caseId}] ${tc.cveId || 'No-CVE'} (${cwe}) - ${safePkg}`);
     console.log(`  Upstream Remote: ${upstreamUrl || 'NONE'}`);
     console.log(`  Commit SHA:      ${commitSha || 'NONE'}`);
     console.log(`  Role:            ${tc.role}`);
 
     if (!upstreamUrl || !commitSha) {
       console.warn(`  ⚠ Missing upstream metadata!`);
+      failedCount++;
       continue;
     }
 
@@ -155,31 +161,40 @@ export async function runHarness(options = {}) {
         verifiedCount++;
       } else {
         console.log(`✖ FAILED (${vRes.error})`);
+        failedCount++;
       }
     } else if (dryRun) {
       console.log(`  ✔ Dry-run format valid: ${commitSha.slice(0, 10)} from ${upstreamUrl}`);
       verifiedCount++;
     } else {
-      // Hermetic checkout logic
-      const targetDir = path.join(outDir, `${tc.package}-${tc.role.toLowerCase()}-${commitSha.slice(0, 7)}`);
+      // Hermetic checkout logic with strict directory containment check
+      const safeRole = String(tc.role || 'role').toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+      const targetDir = path.resolve(resolvedOutDir, `${safePkg}-${safeRole}-${commitSha.slice(0, 7)}`);
+
+      if (!targetDir.startsWith(resolvedOutDir + path.sep)) {
+        throw new Error(`Path containment violation: ${targetDir} escapes outDir ${resolvedOutDir}`);
+      }
+
       if (fs.existsSync(targetDir)) {
         console.log(`  ✔ Already checked out at: ${path.relative(REPO_ROOT, targetDir)}`);
+        verifiedCount++;
       } else {
         console.log(`  Cloning to isolated sandbox: ${path.relative(REPO_ROOT, targetDir)}...`);
-        fs.mkdirSync(outDir, { recursive: true });
+        fs.mkdirSync(resolvedOutDir, { recursive: true });
         try {
           execFileSync('git', ['clone', '--no-checkout', upstreamUrl, targetDir], { stdio: 'pipe' });
           execFileSync('git', ['checkout', commitSha], { cwd: targetDir, stdio: 'pipe' });
           console.log(`  ✔ Successfully checked out ${commitSha.slice(0, 7)}`);
+          verifiedCount++;
         } catch (err) {
           console.error(`  ✖ Checkout failed: ${err.message}`);
+          failedCount++;
         }
       }
-      verifiedCount++;
     }
   }
 
-  return { total: targets.length, verified: verifiedCount };
+  return { total: targets.length, verified: verifiedCount, failed: failedCount };
 }
 
 // CLI Execution Entrypoint
@@ -190,7 +205,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
     process.exit(0);
   }
 
-  runHarness(args).catch(err => {
+  runHarness(args).then(result => {
+    if (result.failed > 0 || (args.verifyUpstream && result.verified !== result.total)) {
+      console.error(`\nHarness finished with ${result.failed} failure(s). Exiting fail-closed.`);
+      process.exit(1);
+    }
+  }).catch(err => {
     console.error(`\nFatal error in fetch harness: ${err.message}`);
     process.exit(1);
   });
