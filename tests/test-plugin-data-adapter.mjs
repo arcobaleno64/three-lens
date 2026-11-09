@@ -6976,6 +6976,67 @@ test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01 & R29-B01 & R30-B01: Stric
   assert.strictEqual(valResult.valid, false);
   assert.match(valResult.error, /\[ROOT_REVOCATION_REJECTED\]/);
 
+  // 3f. Negative Test H (R32-B01 Top-level active-key identity parity & R32-B02 Journal Root revocation fail-closed):
+  // Scenario 1: keys[] Root PEM correct, but top-level activeKeyId=rootId and activePublicKeyPem=attackerPem
+  const forgedTopRootReg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 3,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: sha256Digest(rogueAuth.pem),
+    activePublicKeyPem: rogueAuth.pem,
+    keyType: 'ed25519',
+    pinnedSince: '2026-01-01T00:00:00.000Z',
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-01-01T00:00:00.000Z' },
+      { keyId: delegatedAuthK.keyId, keyFingerprint: delegatedAuthK.fp, publicKeyPem: delegatedAuthK.pem, status: 'ACTIVE', issuedAt: '2026-01-02T00:00:00.000Z' }
+    ],
+    authorizationProof: {
+      authorizedBy: delegatedAuthK.keyId,
+      signature: '0'.repeat(128)
+    }
+  };
+  const topResult = validateTrustRegistry(forgedTopRootReg, opts);
+  assert.strictEqual(topResult.valid, false);
+  assert.match(topResult.error, /\[ROOT_KEY_SUBSTITUTION_REJECTED\]/);
+
+  // Scenario 2: activeKeyId does not match keys[] entry
+  const inconsistentReg = {
+    ...forgedTopRootReg,
+    activeKeyId: 'NON_EXISTENT_KEY_ID',
+    activePublicKeyPem: delegatedAuthK.pem,
+    activeKeyFingerprint: delegatedAuthK.fp
+  };
+  const inconResult = validateTrustRegistry(inconsistentReg, opts);
+  assert.strictEqual(inconResult.valid, false);
+  assert.match(inconResult.error, /\[ACTIVE_KEY_INCONSISTENCY_REJECTED\]/);
+
+  // Scenario 3: External Journal injection of KEY_REVOCATION on Root anchor causes getJournalRevokedKeyMap to fail closed
+  const maliciousJournalDir = createTempDir('malicious-journal-root-rev-');
+  const malJournalPath = path.join(maliciousJournalDir, '.irv-revocation-journal.jsonl');
+  const malEntry = {
+    entryIndex: 0,
+    prevEntryDigest: '0'.repeat(64),
+    timestamp: '2026-01-03T00:00:00.000Z',
+    revocationType: 'KEY_REVOCATION',
+    targetId: rootAuth.keyId,
+    reason: 'ATTACKER_ROOT_REVOCATION',
+    signedBy: rootAuth.keyId
+  };
+  const malPayload = Buffer.from(computeRevocationEntrySignPayload(malEntry), 'utf8');
+  malEntry.signature = crypto.sign(null, malPayload, rootAuth.privateKey).toString('hex');
+  fs.writeFileSync(malJournalPath, JSON.stringify(malEntry) + '\n', 'utf8');
+
+  assert.throws(() => {
+    getJournalRevokedKeyMap(maliciousJournalDir, {
+      trustedRootKeyId: rootAuth.keyId,
+      trustedRootPublicKeyPem: rootAuth.pem
+    });
+  }, /\[ROOT_REVOCATION_REJECTED\]/);
+  fs.rmSync(maliciousJournalDir, { recursive: true, force: true });
+
   // 4. Truly Independent Cold-Start Rollback Test with External System Witness
   const independentSystemWitnessDir = createTempDir('independent-sys-witness-');
   process.env.THREE_LENS_SYSTEM_WITNESS_DIR = independentSystemWitnessDir;
