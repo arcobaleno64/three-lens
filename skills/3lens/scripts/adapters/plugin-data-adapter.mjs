@@ -307,8 +307,24 @@ export function safeOpenStorageFile(targetPath, flags, mode = 0o600, options = {
 }
 
 /**
+ * R20-B04: Safely writes entire buffer/string to file descriptor in a loop, ensuring zero short writes.
+ */
+function writeAllSync(fd, data) {
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8');
+  let offset = 0;
+  while (offset < buf.length) {
+    const written = fs.writeSync(fd, buf, offset, buf.length - offset, null);
+    if (typeof written !== 'number' || written <= 0) {
+      throw new Error(`[SHORT_WRITE_DETECTED] Zero bytes written at offset ${offset} of ${buf.length}`);
+    }
+    offset += written;
+  }
+}
+
+/**
  * Safely writes content to targetPath using safeOpenStorageFile on temp file and atomic rename.
  * Resolves R05-B04: Eliminates TOCTOU windows on storage files.
+ * Resolves R20-B04: Enforces writeAllSync loop to prevent short writes on storage files.
  */
 export function safeWriteFileSync(targetPath, content, options = {}) {
   const dir = path.dirname(targetPath);
@@ -317,7 +333,7 @@ export function safeWriteFileSync(targetPath, content, options = {}) {
   const tmpPath = path.join(dir, `.tmp.${path.basename(targetPath)}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`);
   const fd = safeOpenStorageFile(tmpPath, 'w', 0o600, options);
   try {
-    fs.writeSync(fd, content, null, 'utf8');
+    writeAllSync(fd, content);
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
@@ -764,6 +780,12 @@ function verifyFullJournalChain(journalLines, targetHeadIndex, targetHeadDigest,
     const isSigValid = crypto.verify(null, entrySignPayload, entrySignerPem, Buffer.from(entry.signature, 'hex'));
     if (!isSigValid) {
       throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry at index ${i} signature verification failed`);
+    }
+
+    // R20-B02: If entry revokes a key (KEY_REVOCATION), terminate that key's active window in this chain
+    if (entry.targetId && (entry.revocationType === REVOCATION_TYPES.KEY_REVOCATION || entry.revocationType === 'KEY_REVOCATION')) {
+      const existingMax = maxActiveIndexPerKey.get(entry.targetId);
+      maxActiveIndexPerKey.set(entry.targetId, Math.min(existingMax ?? Infinity, i));
     }
 
     const entryDigest = sha256Digest(canonicalJsonStringify(entry));
@@ -1222,7 +1244,7 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
             return { recovered: false, committed: true, txnId: txnData.txnId };
           }
         } catch (commitCheckErr) {
-          if (commitCheckErr.message && commitCheckErr.message.includes('REGISTRY_DIVERGENCE_DETECTED')) {
+          if (commitCheckErr.message && (commitCheckErr.message.includes('REGISTRY_DIVERGENCE_DETECTED') || commitCheckErr.message.includes('STORAGE_DURABILITY_FAILURE'))) {
             throw commitCheckErr;
           }
         }
@@ -3437,6 +3459,46 @@ export function assertMonotonicWitnessFreshness(dir, candidateRegistryVersion, c
       `[MONOTONIC_WITNESS_DIVERGENCE_DETECTED] Candidate HWM headDigest (${candidateHwmHeadDigest}) diverges from monotonic witness headDigest (${witness.maxSeenHwmHeadDigest}) at index ${candidateHwmHeadIndex}`
     );
   }
+
+  // R20-B01: Journal prefix continuity verification against authenticated monotonic witness.
+  // When candidateHwmHeadIndex > witness.maxSeenHwmHeadIndex and witness.maxSeenHwmHeadIndex >= 0,
+  // the candidate is advancing HWM beyond an established witness.
+  // The on-disk journal MUST exist, must contain at least witness.maxSeenHwmHeadIndex + 1 entries,
+  // and the digest of the entry at witness.maxSeenHwmHeadIndex MUST strictly match witness.maxSeenHwmHeadDigest.
+  if (
+    typeof candidateHwmHeadIndex === 'number' &&
+    candidateHwmHeadIndex > witness.maxSeenHwmHeadIndex &&
+    witness.maxSeenHwmHeadIndex >= 0 &&
+    witness.maxSeenHwmHeadDigest
+  ) {
+    const journalPath = path.join(dir, '.irv-revocation-journal.jsonl');
+    if (!fs.existsSync(journalPath)) {
+      throw new Error(
+        `[JOURNAL_PREFIX_DIVERGENCE_DETECTED] [JOURNAL_MISSING_DETECTED] [JOURNAL_ROLLBACK_DETECTED] Candidate HWM headIndex (${candidateHwmHeadIndex}) advances beyond witnessed index (${witness.maxSeenHwmHeadIndex}) but revocation journal does not exist at ${journalPath}`
+      );
+    }
+    const rawContent = fs.readFileSync(journalPath, 'utf8');
+    const lines = rawContent.split(/\r?\n/).filter((l) => l.trim().length > 0);
+    if (lines.length <= witness.maxSeenHwmHeadIndex) {
+      throw new Error(
+        `[JOURNAL_PREFIX_DIVERGENCE_DETECTED] [JOURNAL_ROLLBACK_DETECTED] Revocation journal entry count (${lines.length}) is less than witnessed headIndex (${witness.maxSeenHwmHeadIndex})`
+      );
+    }
+    try {
+      const entryAtWitness = JSON.parse(lines[witness.maxSeenHwmHeadIndex]);
+      const digestAtWitness = sha256Digest(canonicalJsonStringify(entryAtWitness));
+      if (digestAtWitness !== witness.maxSeenHwmHeadDigest) {
+        throw new Error(
+          `[JOURNAL_PREFIX_DIVERGENCE_DETECTED] Revocation journal entry digest at witnessed index ${witness.maxSeenHwmHeadIndex} (${digestAtWitness}) diverges from authenticated monotonic witness (${witness.maxSeenHwmHeadDigest})`
+        );
+      }
+    } catch (parseErr) {
+      if (parseErr.message.includes('JOURNAL_PREFIX_DIVERGENCE_DETECTED')) throw parseErr;
+      throw new Error(
+        `[JOURNAL_PREFIX_DIVERGENCE_DETECTED] [JOURNAL_CORRUPTION_DETECTED] Failed to parse journal entry at witnessed index ${witness.maxSeenHwmHeadIndex}: ${parseErr.message}`
+      );
+    }
+  }
 }
 
 /**
@@ -3870,10 +3932,11 @@ function doLoadRevocationJournal(options = {}) {
         return { valid: false, entries: [], error: msg, count: i };
       }
 
-      // R14-B04: If signer was retired or revoked, enforce that entryIndex <= maxActiveIndex
+      // R14-B04 & R20-B02: If signer was retired, removed, or revoked (via Registry or earlier KEY_REVOCATION in journal),
+      // enforce that entryIndex <= maxActiveIndex
       const maxIdxForSigner = maxActiveIndexPerKey.get(parsed.signedBy);
       if (typeof maxIdxForSigner === 'number' && maxIdxForSigner !== Infinity && parsed.entryIndex > maxIdxForSigner) {
-        const msg = `[RETIRED_KEY_AUTHORIZATION_REJECTED] Signer '${parsed.signedBy}' was retired at index ${maxIdxForSigner} and cannot authorize revocation record at index ${parsed.entryIndex}`;
+        const msg = `[RETIRED_KEY_AUTHORIZATION_REJECTED] Signer '${parsed.signedBy}' was retired or revoked at index ${maxIdxForSigner} and cannot authorize revocation record at index ${parsed.entryIndex}`;
         if (options.failClosed !== false) throw new Error(msg);
         return { valid: false, entries: [], error: msg, count: i };
       }
@@ -3884,6 +3947,12 @@ function doLoadRevocationJournal(options = {}) {
         const msg = `Signature verification failed for revocation record at line ${i + 1} (targetId: ${parsed.targetId})`;
         if (options.failClosed !== false) throw new Error(msg);
         return { valid: false, entries: [], error: msg, count: i };
+      }
+
+      // R20-B02: If this entry revokes a key (KEY_REVOCATION), terminate that key's active signing window in this journal
+      if (parsed.targetId && (parsed.revocationType === REVOCATION_TYPES.KEY_REVOCATION || parsed.revocationType === 'KEY_REVOCATION')) {
+        const existingMax = maxActiveIndexPerKey.get(parsed.targetId);
+        maxActiveIndexPerKey.set(parsed.targetId, Math.min(existingMax ?? Infinity, parsed.entryIndex));
       }
 
       entries.push(parsed);
@@ -3907,6 +3976,30 @@ function doLoadRevocationJournal(options = {}) {
       const digestAtHwm = sha256Digest(canonicalJsonStringify(entryAtHwm));
       if (digestAtHwm !== registryHwm.headDigest) {
         const msg = `[JOURNAL_HEAD_MISMATCH] Journal entry at index ${registryHwm.headIndex} digest does not match trust registry high-water mark headDigest`;
+        if (options.failClosed !== false) throw new Error(msg);
+        return { valid: false, entries: [], error: msg, count: entries.length, path: journalPath };
+      }
+    }
+
+    // R14-B07, R15-B01 & R20-B01: Enforce journal prefix continuity against authenticated monotonic witness.
+    // If a persistent witness exists with maxSeenHwmHeadIndex >= 0, the candidate journal MUST contain that index
+    // and its entry digest at that index MUST match witness.maxSeenHwmHeadDigest.
+    const curWitness = getMonotonicWitness(dir, options);
+    if (
+      curWitness &&
+      typeof curWitness.maxSeenHwmHeadIndex === 'number' &&
+      curWitness.maxSeenHwmHeadIndex >= 0 &&
+      curWitness.maxSeenHwmHeadDigest
+    ) {
+      if (entries.length < curWitness.maxSeenHwmHeadIndex + 1) {
+        const msg = `[JOURNAL_PREFIX_DIVERGENCE_DETECTED] [JOURNAL_ROLLBACK_DETECTED] Journal entry count (${entries.length}) is less than witnessed headIndex (${curWitness.maxSeenHwmHeadIndex})`;
+        if (options.failClosed !== false) throw new Error(msg);
+        return { valid: false, entries: [], error: msg, count: entries.length, path: journalPath };
+      }
+      const entryAtWitness = entries[curWitness.maxSeenHwmHeadIndex];
+      const digestAtWitness = sha256Digest(canonicalJsonStringify(entryAtWitness));
+      if (digestAtWitness !== curWitness.maxSeenHwmHeadDigest) {
+        const msg = `[JOURNAL_PREFIX_DIVERGENCE_DETECTED] Journal entry digest at witnessed index ${curWitness.maxSeenHwmHeadIndex} (${digestAtWitness}) diverges from authenticated monotonic witness (${curWitness.maxSeenHwmHeadDigest})`;
         if (options.failClosed !== false) throw new Error(msg);
         return { valid: false, entries: [], error: msg, count: entries.length, path: journalPath };
       }
@@ -4058,6 +4151,14 @@ export function appendRevocationEntry(entryInput, options = {}) {
     }
 
     const journal = loadRevocationJournal({ ...options, failClosed: true, skipLock: true });
+    // R20-B02: Verify that signedBy has not been revoked in the journal (KEY_REVOCATION)
+    if (journal.entries && Array.isArray(journal.entries)) {
+      for (const e of journal.entries) {
+        if (e.targetId === signedBy && (e.revocationType === REVOCATION_TYPES.KEY_REVOCATION || e.revocationType === 'KEY_REVOCATION')) {
+          throw new Error(`[REVOKED_SIGNER_REJECTED] Signer '${signedBy}' was revoked in revocation journal at entry index ${e.entryIndex}`);
+        }
+      }
+    }
     const entryIndex = journal.entries.length;
 
     let prevEntryDigest = '0'.repeat(64);
@@ -4155,10 +4256,10 @@ export function appendRevocationEntry(entryInput, options = {}) {
     safeWriteFileSync(txnPath, JSON.stringify(txnData, null, 2) + '\n', options);
 
     try {
-      // 1. Safe append to journal with descriptor inspection (R05-B04)
+      // 1. Safe append to journal with descriptor inspection (R05-B04) and writeAllSync (R20-B04)
       const fd = safeOpenStorageFile(journalPath, 'a+', 0o600, options);
       try {
-        fs.writeSync(fd, line, null, 'utf8');
+        writeAllSync(fd, line);
         fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
@@ -4234,6 +4335,12 @@ export function appendRevocationEntry(entryInput, options = {}) {
         path: normalizePath(journalPath)
       };
     } catch (txErr) {
+      // R20-B03: Point of No Return: Once transaction is COMMITTED, physical on-disk state is irreversible.
+      // If witness update or WAL unlinking fails, NEVER roll back committed journal/checkpoint/registry state.
+      // Retain COMMITTED WAL so recovery can re-verify and complete witness dual-anchor synchronization.
+      if (txnData.status === 'COMMITTED') {
+        throw new Error(`[COMMITTED_TRANSACTION_WITNESS_SYNC_FAILED] Revocation transaction was fully committed to disk but witness synchronization failed: ${txErr.message}`);
+      }
       // R05-B03 & Round 07 F-03 & R10-B02-A: Descriptor-bound safe rollback
       try {
         if (initialJournalExisted) {
