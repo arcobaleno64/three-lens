@@ -912,6 +912,7 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
     const onDiskRegValidation = validateTrustRegistry(curRegRaw, {
       ...options,
       skipLock: true,
+      skipJournalRevocationCheck: true,
       priorRegistry: effectivePriorReg,
       allowEmbeddedFallback: true,
       failClosed: true
@@ -1133,6 +1134,7 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
     const snapValidation = validateTrustRegistry(parsedReg, {
       ...options,
       skipLock: true,
+      skipJournalRevocationCheck: true,
       allowEmbeddedFallback: true
     });
     if (!snapValidation.valid) {
@@ -1161,6 +1163,7 @@ function _recoverAbortedRevocationTransactionInner(options = {}) {
     const regValidation = validateTrustRegistry(currentReg, {
       ...options,
       skipLock: true,
+      skipJournalRevocationCheck: true,
       allowEmbeddedFallback: true
     });
     if (!regValidation.valid) {
@@ -1423,30 +1426,113 @@ export function getRevocationCheckpointPath(options = {}) {
 }
 
 /**
- * R21-B01: Extracts all KEY_REVOCATION entries directly from the on-disk journal without
+ * R21-B01 & R22-B01: Extracts all KEY_REVOCATION entries directly from the on-disk journal without
  * triggering recursive loadTrustRegistry() / loadRevocationJournal() calls.
  * Returns Map<targetKeyId, earliestRevocationIndex>.
+ *
+ * Fail-Closed Invariant (R22-B01):
+ * - If dir is invalid, throws [INVALID_DIRECTORY].
+ * - If journal file exists, fs.readFileSync() failures MUST throw [JOURNAL_READ_FAILURE].
+ * - If any line contains invalid JSON or lacks required fields, MUST throw [JOURNAL_CORRUPTION_DETECTED].
+ * - If journal file is missing but an established installation recorded prior revocations
+ *   (via checkpoint, candidate registry HWM, or monotonic witness), MUST throw [JOURNAL_ROLLBACK_DETECTED].
+ * - Only genuine clean-slate / uninitialized installations may return an empty map.
  */
 export function getJournalRevokedKeyMap(dir, options = {}) {
   const revokedMap = new Map();
-  if (!dir || typeof dir !== 'string') return revokedMap;
+  if (!dir || typeof dir !== 'string' || !dir.trim()) {
+    throw new Error('[INVALID_DIRECTORY] A valid directory string is required to read revocation journal');
+  }
   const journalPath = path.join(dir, '.irv-revocation-journal.jsonl');
-  if (!fs.existsSync(journalPath)) return revokedMap;
-  try {
-    const content = fs.readFileSync(journalPath, 'utf8');
-    const lines = content.split(/\r?\n/).filter(l => l.trim().length > 0);
-    for (let i = 0; i < lines.length; i++) {
+  const checkpointPath = path.join(dir, 'supervisor-revocation-checkpoint.json');
+
+  if (!fs.existsSync(journalPath)) {
+    // Check if checkpoint records established revocations in dir
+    if (fs.existsSync(checkpointPath)) {
       try {
-        const parsed = JSON.parse(lines[i]);
-        if (parsed && parsed.targetId && (parsed.revocationType === REVOCATION_TYPES.KEY_REVOCATION || parsed.revocationType === 'KEY_REVOCATION')) {
-          if (!revokedMap.has(parsed.targetId)) {
-            const idx = typeof parsed.entryIndex === 'number' ? parsed.entryIndex : i;
-            revokedMap.set(parsed.targetId, idx);
+        const cp = JSON.parse(fs.readFileSync(checkpointPath, 'utf8'));
+        if (typeof cp?.headIndex === 'number' && cp.headIndex >= 0) {
+          throw new Error(`[JOURNAL_ROLLBACK_DETECTED] Journal file missing but checkpoint records headIndex ${cp.headIndex}`);
+        }
+      } catch (cpErr) {
+        if (cpErr.message?.includes('JOURNAL_ROLLBACK_DETECTED')) throw cpErr;
+        throw new Error(`[CHECKPOINT_READ_FAILURE] Failed to read checkpoint at '${checkpointPath}': ${cpErr.message}`);
+      }
+    }
+    // Check if on-disk registry in dir records established revocations
+    const onDiskRegPath = path.join(dir, 'trust-registry.json');
+    if (fs.existsSync(onDiskRegPath)) {
+      try {
+        const reg = JSON.parse(fs.readFileSync(onDiskRegPath, 'utf8'));
+        if (reg?.revocationHighWaterMark && typeof reg.revocationHighWaterMark.headIndex === 'number' && reg.revocationHighWaterMark.headIndex >= 0) {
+          throw new Error(`[JOURNAL_ROLLBACK_DETECTED] Journal file missing but on-disk registry records revocation high-water mark headIndex ${reg.revocationHighWaterMark.headIndex}`);
+        }
+      } catch (rErr) {
+        if (rErr.message?.includes('JOURNAL_ROLLBACK_DETECTED')) throw rErr;
+        throw new Error(`[REGISTRY_READ_FAILURE] Failed to read on-disk registry at '${onDiskRegPath}': ${rErr.message}`);
+      }
+    }
+    // Check if monotonic witness in dir records established revocations
+    const witnessPath = path.join(dir, '.irv-monotonic-witness.json');
+    if (fs.existsSync(witnessPath)) {
+      try {
+        const wit = JSON.parse(fs.readFileSync(witnessPath, 'utf8'));
+        if (typeof wit?.maxSeenHwmHeadIndex === 'number' && wit.maxSeenHwmHeadIndex >= 0) {
+          throw new Error(`[JOURNAL_ROLLBACK_DETECTED] Journal file missing but monotonic witness records headIndex ${wit.maxSeenHwmHeadIndex}`);
+        }
+      } catch (wErr) {
+        if (wErr.message?.includes('JOURNAL_ROLLBACK_DETECTED')) throw wErr;
+        throw new Error(`[WITNESS_READ_FAILURE] Failed to read witness at '${witnessPath}': ${wErr.message}`);
+      }
+    }
+    // Check if any historical registry in dir records established revocations
+    const histDir = path.join(dir, 'history');
+    if (fs.existsSync(histDir)) {
+      try {
+        const histFiles = fs.readdirSync(histDir);
+        for (const hf of histFiles) {
+          if (/^trust-registry\.v\d+\.json$/.test(hf)) {
+            const hReg = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
+            if (hReg?.revocationHighWaterMark && typeof hReg.revocationHighWaterMark.headIndex === 'number' && hReg.revocationHighWaterMark.headIndex >= 0) {
+              throw new Error(`[JOURNAL_ROLLBACK_DETECTED] Journal file missing in established installation with historical high-water mark (${hf})`);
+            }
           }
         }
-      } catch (_) {}
+      } catch (hErr) {
+        if (hErr.message?.includes('JOURNAL_ROLLBACK_DETECTED')) throw hErr;
+      }
     }
-  } catch (_) {}
+    return revokedMap;
+  }
+
+  let content;
+  try {
+    content = fs.readFileSync(journalPath, 'utf8');
+  } catch (ioErr) {
+    throw new Error(`[JOURNAL_READ_FAILURE] Failed to read revocation journal at '${journalPath}': ${ioErr.message}`);
+  }
+
+  const lines = content.split(/\r?\n/).filter(l => l.trim().length > 0);
+  for (let i = 0; i < lines.length; i++) {
+    let parsed;
+    try {
+      parsed = JSON.parse(lines[i]);
+    } catch (parseErr) {
+      throw new Error(`[JOURNAL_CORRUPTION_DETECTED] Corrupted JSON in revocation journal '${journalPath}' at line ${i + 1}: ${parseErr.message}`);
+    }
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error(`[JOURNAL_CORRUPTION_DETECTED] Invalid entry object in revocation journal '${journalPath}' at line ${i + 1}`);
+    }
+    if (typeof parsed.targetId !== 'string' || !parsed.targetId.trim()) {
+      throw new Error(`[JOURNAL_CORRUPTION_DETECTED] Missing targetId in revocation journal '${journalPath}' at line ${i + 1}`);
+    }
+    if (parsed.revocationType === REVOCATION_TYPES.KEY_REVOCATION || parsed.revocationType === 'KEY_REVOCATION') {
+      if (!revokedMap.has(parsed.targetId)) {
+        const idx = typeof parsed.entryIndex === 'number' ? parsed.entryIndex : i;
+        revokedMap.set(parsed.targetId, idx);
+      }
+    }
+  }
   return revokedMap;
 }
 
@@ -1746,8 +1832,34 @@ export function validateTrustRegistry(registry, options = {}) {
   let registryDir = null;
   try {
     registryDir = resolvePluginDataDir(options);
-  } catch (_) {}
-  const journalRevoked = registryDir ? getJournalRevokedKeyMap(registryDir, options) : new Map();
+  } catch (dirErr) {
+    return {
+      valid: false,
+      error: `[INVALID_DIRECTORY] Directory resolution failed: ${dirErr.message}`,
+      cryptographicValidity: false,
+      monotonicValidity: false,
+      ancestryContinuity: false
+    };
+  }
+
+  let journalRevoked = new Map();
+  if (registryDir && options.skipJournalRevocationCheck !== true) {
+    try {
+      journalRevoked = getJournalRevokedKeyMap(registryDir, {
+        ...options,
+        registry,
+        candidateHwm: registry.revocationHighWaterMark
+      });
+    } catch (jErr) {
+      return {
+        valid: false,
+        error: `[REVOCATION_STATUS_UNVERIFIABLE] Cannot verify signer revocation status: ${jErr.message}`,
+        cryptographicValidity: false,
+        monotonicValidity: false,
+        ancestryContinuity: false
+      };
+    }
+  }
 
   // Resolve prior registry from options or historical chain
   let priorReg = options.priorRegistry || null;
@@ -2204,14 +2316,26 @@ export function createAuthorizedRegistryUpdate(currentRegistry, updates, signerK
     throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key '${signerKeyId}' has already been revoked in current registry`);
   }
 
-  // R21-B01: Revoked keys in revocation journal cannot authorize updates
+  // R21-B01 & R22-B01: Revoked keys in revocation journal cannot authorize updates.
+  // Fail-Closed: if revocation status cannot be verified due to journal read/corruption errors, reject.
   const effectiveOpts = options && typeof options === 'object' ? options : {};
   let effectiveDir = null;
   try {
     effectiveDir = resolvePluginDataDir(effectiveOpts);
-  } catch (_) {}
+  } catch (dirErr) {
+    throw new Error(`[REVOCATION_STATUS_UNVERIFIABLE] Cannot resolve plugin directory to verify revocation status: ${dirErr.message}`);
+  }
   if (effectiveDir) {
-    const journalRevoked = getJournalRevokedKeyMap(effectiveDir, effectiveOpts);
+    let journalRevoked;
+    try {
+      journalRevoked = getJournalRevokedKeyMap(effectiveDir, {
+        ...effectiveOpts,
+        registry: currentRegistry,
+        candidateHwm: currentRegistry.revocationHighWaterMark
+      });
+    } catch (jErr) {
+      throw new Error(`[REVOCATION_STATUS_UNVERIFIABLE] Cannot verify signer revocation status for registry update: ${jErr.message}`);
+    }
     if (journalRevoked.has(signerKeyId)) {
       throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key '${signerKeyId}' was revoked in revocation journal at index ${journalRevoked.get(signerKeyId)}; cannot authorize registry update`);
     }
@@ -3622,9 +3746,19 @@ export function saveTrustRegistry(registry, options = {}) {
     const saveNonHwmDigest = computeRegistryNonHwmDigest(registry);
     assertMonotonicWitnessFreshness(dir, registry.registryVersion, saveHwmIdx, saveHwmDigest, saveRegDigest, { ...opts, nonHwmDigest: saveNonHwmDigest });
 
-    // R21-B01: Prevent saving registry update authorized by a key revoked in the revocation journal
+    // R21-B01 & R22-B01: Prevent saving registry update authorized by a key revoked in the revocation journal.
+    // Fail-Closed: if revocation status cannot be verified due to journal read/corruption errors, reject.
     if (registry.authorizationProof && registry.authorizationProof.authorizedBy) {
-      const journalRevoked = getJournalRevokedKeyMap(dir, opts);
+      let journalRevoked;
+      try {
+        journalRevoked = getJournalRevokedKeyMap(dir, {
+          ...opts,
+          registry,
+          candidateHwm: registry.revocationHighWaterMark
+        });
+      } catch (jErr) {
+        throw new Error(`[REVOCATION_STATUS_UNVERIFIABLE] Cannot verify signer revocation status before saving registry: ${jErr.message}`);
+      }
       if (journalRevoked.has(registry.authorizationProof.authorizedBy)) {
         const revIdx = journalRevoked.get(registry.authorizationProof.authorizedBy);
         throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key '${registry.authorizationProof.authorizedBy}' was revoked in revocation journal at index ${revIdx}; cannot authorize registry`);

@@ -40,7 +40,8 @@ import {
   getMonotonicWitness,
   assertSafeStorageTarget,
   updateMonotonicWitness,
-  computeRegistryNonHwmDigest
+  computeRegistryNonHwmDigest,
+  getJournalRevokedKeyMap
 } from '../scripts/adapters/plugin-data-adapter.mjs';
 
 function createTempDir(prefix = 'test-plugin-data-') {
@@ -6187,6 +6188,174 @@ test('R21-B02: Clean-room process restart recovers COMMITTED WAL across process 
   assert.strictEqual(fs.existsSync(walPath), false);
   const jAfter = loadRevocationJournal(opts);
   assert.strictEqual(jAfter.entries.length, 2);
+
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('R22-B01: Journal read failure / corruption enforces strict Default-Deny Fail-Closed and prevents authority resurrect', () => {
+  const tempDir = createTempDir('r22-b01-fail-closed-');
+  const rootAuth = generateTestAuthority();
+  const delegatedAuthA = generateTestAuthority();
+  const rogueAuthB = generateTestAuthority();
+
+  const v1Reg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keyType: 'ed25519',
+    pinnedSince: '2026-10-16T06:55:39.565Z',
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    keys: [{ keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' }]
+  };
+
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: rootAuth.keyId,
+    trustedRootPublicKeyPem: rootAuth.pem,
+    trustedRootFingerprint: rootAuth.fp
+  };
+
+  saveTrustRegistry(v1Reg, opts);
+
+  // Rotate to v2 delegating authority to delegatedAuthA
+  const v2Reg = createAuthorizedRegistryUpdate(
+    v1Reg,
+    {
+      activeKeyId: delegatedAuthA.keyId,
+      activeKeyFingerprint: delegatedAuthA.fp,
+      activePublicKeyPem: delegatedAuthA.pem,
+      keys: [
+        { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' },
+        { keyId: delegatedAuthA.keyId, keyFingerprint: delegatedAuthA.fp, publicKeyPem: delegatedAuthA.pem, status: 'ACTIVE', issuedAt: '2026-10-16T06:55:39.565Z' }
+      ]
+    },
+    rootAuth.keyId,
+    rootAuth.privateKey,
+    opts
+  );
+  saveTrustRegistry(v2Reg, opts);
+
+  // Root revokes delegatedAuthA in journal
+  appendRevocationEntry(
+    { revocationType: REVOCATION_TYPES.KEY_REVOCATION, targetId: delegatedAuthA.keyId, reason: 'EMERGENCY_DELEGATE_REVOCATION' },
+    { ...opts, signerKeyId: rootAuth.keyId, signerPrivateKey: rootAuth.privateKey }
+  );
+
+  const journalPath = path.join(tempDir, '.irv-revocation-journal.jsonl');
+  const validJournalContent = fs.readFileSync(journalPath, 'utf8');
+
+  // --- Sub-test 1: Malformed JSON in journal triggers JOURNAL_CORRUPTION_DETECTED and fails closed ---
+  fs.writeFileSync(journalPath, 'INVALID_JSON_CORRUPTED_LINE\n', 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[JOURNAL_CORRUPTION_DETECTED\]/
+  );
+  assert.throws(
+    () => createAuthorizedRegistryUpdate(v2Reg, { activeKeyId: rogueAuthB.keyId }, delegatedAuthA.keyId, delegatedAuthA.privateKey, opts),
+    /\[REVOCATION_STATUS_UNVERIFIABLE\]/
+  );
+  const valCorrupt = validateTrustRegistry(v2Reg, opts);
+  assert.strictEqual(valCorrupt.valid, false);
+  assert.ok(valCorrupt.error.includes('[REVOCATION_STATUS_UNVERIFIABLE]'));
+
+  // --- Sub-test 2: Missing targetId in journal triggers JOURNAL_CORRUPTION_DETECTED ---
+  fs.writeFileSync(journalPath, JSON.stringify({ entryIndex: 0, revocationType: 'KEY_REVOCATION' }) + '\n', 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[JOURNAL_CORRUPTION_DETECTED\].*Missing targetId/
+  );
+
+  // --- Sub-test 3: Deleted journal in established directory triggers JOURNAL_ROLLBACK_DETECTED ---
+  fs.unlinkSync(journalPath);
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[JOURNAL_ROLLBACK_DETECTED\]/
+  );
+  assert.throws(
+    () => createAuthorizedRegistryUpdate(v2Reg, { activeKeyId: rogueAuthB.keyId }, delegatedAuthA.keyId, delegatedAuthA.privateKey, opts),
+    /\[REVOCATION_STATUS_UNVERIFIABLE\]/
+  );
+
+  // Restore journal to valid state
+  fs.writeFileSync(journalPath, validJournalContent, 'utf8');
+
+  // --- Sub-test 4: End-to-end A -> v3 -> B negative replay under journal read fault ---
+  // Construct candidate v3 signed by revoked key A attempting to grant ACTIVE authority to B
+  const journalEntry0 = JSON.parse(validJournalContent.trim());
+  const entry0Digest = sha256Digest(canonicalJsonStringify(journalEntry0));
+
+  const updatePayload = {
+    schemaVersion: '1.0.0',
+    registryVersion: 3,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rogueAuthB.keyId,
+    activeKeyFingerprint: rogueAuthB.fp,
+    activePublicKeyPem: rogueAuthB.pem,
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' },
+      { keyId: delegatedAuthA.keyId, keyFingerprint: delegatedAuthA.fp, publicKeyPem: delegatedAuthA.pem, status: 'ACTIVE', issuedAt: '2026-10-16T06:55:39.565Z' },
+      { keyId: rogueAuthB.keyId, keyFingerprint: rogueAuthB.fp, publicKeyPem: rogueAuthB.pem, status: 'ACTIVE', issuedAt: '2026-10-16T06:55:39.565Z' }
+    ],
+    revokedKeyIds: [],
+    revocationHighWaterMark: {
+      headIndex: 0,
+      headDigest: entry0Digest,
+      authorizedBy: rootAuth.keyId,
+      updatedAt: new Date().toISOString()
+    }
+  };
+  updatePayload.authorizationProof = {
+    authorizedBy: delegatedAuthA.keyId,
+    signature: crypto.sign(
+      null,
+      Buffer.from(computeRegistryNonHwmDigest(updatePayload), 'utf8'),
+      delegatedAuthA.privateKey
+    ).toString('hex')
+  };
+
+  // When journal is valid: rejected because A is revoked in journal
+  assert.throws(
+    () => saveTrustRegistry(updatePayload, opts),
+    /\[REVOKED_KEY_AUTHORIZATION_REJECTED\]/
+  );
+
+  // Inject read failure on journal
+  fs.writeFileSync(journalPath, '{"broken": 1}\n', 'utf8');
+  assert.throws(
+    () => saveTrustRegistry(updatePayload, opts),
+    /\[REVOCATION_STATUS_UNVERIFIABLE\]/
+  );
+
+  // Ensure disk injection of forged v3 is strictly rejected by loadTrustRegistry
+  const regPath = path.join(tempDir, 'trust-registry.json');
+  fs.writeFileSync(regPath, JSON.stringify(updatePayload, null, 2), 'utf8');
+  assert.throws(
+    () => loadTrustRegistry(opts),
+    /\[REVOCATION_STATUS_UNVERIFIABLE\]|Corrupt trust registry/
+  );
+
+  // Ensure rogue key B cannot append to journal under any condition
+  assert.throws(
+    () => appendRevocationEntry(
+      { revocationType: REVOCATION_TYPES.NONCE_REVOCATION, targetId: 'VICTIM-ROGUE' },
+      { ...opts, signerKeyId: rogueAuthB.keyId, signerPrivateKey: rogueAuthB.privateKey }
+    ),
+    /Failed to read trust registry|\[REVOCATION_STATUS_UNVERIFIABLE\]|\[TRUST_REGISTRY_INVALID\]|Cannot load revocation journal/
+  );
+
+  // Restore valid journal and registry
+  fs.writeFileSync(journalPath, validJournalContent, 'utf8');
+  fs.writeFileSync(regPath, JSON.stringify(v2Reg, null, 2), 'utf8');
+
+  // Verify historical chain v1/v2 remains valid
+  const cleanLoad = loadTrustRegistry(opts);
+  assert.strictEqual(cleanLoad.valid, true);
+  assert.strictEqual(cleanLoad.registry.registryVersion, 2);
 
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
