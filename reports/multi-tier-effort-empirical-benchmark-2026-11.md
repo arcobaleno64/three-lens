@@ -25,7 +25,7 @@ flowchart TD
     M55 --> WS4["Workstream 4: Protocol & Boundary Modernization<br/>(Target Identity Parity & Open Corpus Scaling)"]
     
     WS1 --> Res1["Thinking Tokens -72.7% / Latency -56.5% with 100% SSRF Candidate Lineage Match"]
-    WS2 --> Res2["12 Upstream Verified OSS Cases (minimist, json-pointer, ini, node-tar, lodash, axios)"]
+    WS2 --> Res2["12 Upstream Verified OSS Cases (minimist, json-pointer, ini, adm-zip, lodash, growl)"]
     WS3 --> Res3["ACP JSON-RPC 2.0 Streaming Diagnostic Notifications & Authority Gate (11/11 Tests PASS)"]
     WS4 --> Res4["Tripartite Invariant Upheld: V2_RELEASE ≠ BLOCKING ≠ CLEAN"]
 ```
@@ -41,15 +41,15 @@ flowchart TD
    - Expanded `evals/v2-corpus/layer2-external-validity-corpus.json` from 14 cases to **26 authoritative cases** (13 vulnerable, 10 fixed counterparts, 3 clean controls).
    - Integrated 12 `UPSTREAM_VERIFIED_OSS` Ground Truth Bundles across **4 distinct CWE families** authenticated directly against upstream GitHub repository remotes:
      - `CWE-1321` (Prototype Pollution): `minimist` (CVE-2020-7598), `json-pointer` (CVE-2020-7709), `ini` (CVE-2020-7788).
-     - `CWE-022` (Path Traversal): `node-tar` (CVE-2021-32803).
+     - `CWE-022` (Path Traversal): `adm-zip` (CVE-2018-1002204).
      - `CWE-1333` (ReDoS): `lodash` (CVE-2020-28500).
-     - `CWE-918` (SSRF Credential/Header Leak): `axios` (CVE-2020-28168).
-   - *R02-04 Hardening*: `scripts/fetch-upstream-oss-fixture.mjs` enhanced with strict case ID matching (`c.caseId || c.id`), sanitization preventing path containment escape, and fail-closed non-zero exit codes on any verification or checkout failure.
-3. **Workstream 3 (ACP Native Protocol Inline Streaming Diagnostics & Authority Gate — R02-02 & R02-03)**:
+     - `CWE-078` (Command Injection): `growl` (CVE-2017-16042).
+   - *R02-04 / R03-F02 Hardening*: `scripts/fetch-upstream-oss-fixture.mjs` enhanced with strict case ID matching (`c.caseId || c.id`), sanitization preventing path containment escape, dual `git rev-parse HEAD` & `git status --porcelain` validation to purge partial checkouts, and fail-closed non-zero exit codes (exit 1) on nonexistent cases or checkout failures.
+3. **Workstream 3 (ACP Native Protocol Inline Streaming Diagnostics & Authority Gate — R02-02, R02-03, R03-F03, R03-F04)**:
    - Authored `scripts/adapters/acp-adapter.mjs` converting 3-Lens verification ballots and findings into standard ACP / LSP `textDocument/publishDiagnostics` and `window/logMessage` streaming notifications over stdio JSON-RPC 2.0.
-   - *R02-03 / R01-F04 Hardening*: Default-Deny Authority Invariant strictly enforced inside the adapter: missing or omitted `disposition` defaults to `'UNVERIFIED'`. Unverified candidate findings are strictly clamped to `ACP_DIAGNOSTIC_SEVERITY.HINT` (4) with an explicit `[UNVERIFIED CANDIDATE]` notice, preventing premature IDE Errors.
-   - *R02-02 Hardening*: Aligned `handleInitialize()` response to pass the native ACP handshake validator in `scripts/adapters/acp-transport-adapter.mjs` (`validateAcpHandshake()`), declaring `protocolVersion: 1`, `agentInfo: { name, version }`, and active `agentCapabilities`.
-   - Comprehensive test suite `tests/test-acp-adapter.mjs` passes 11/11 tests.
+   - *R02-03 / R01-F04 / R03-F03 Hardening*: Default-Deny Authority Invariant strictly enforced inside the adapter: missing or omitted `disposition` defaults to `'UNVERIFIED'`. Pure client self-assertion of `REPORTABLE` is neutralized under `assertFindingDispositionAuthority` unless verified by multi-agent panel consensus (totalVotes >= 2, unanimous), cryptographically verifiable lineage, or valid model provenance. Unverified candidate findings are strictly clamped to `ACP_DIAGNOSTIC_SEVERITY.HINT` (4) with an explicit `[UNVERIFIED CANDIDATE]` notice.
+   - *R02-02 / R03-F04 Hardening*: Aligned `handleInitialize()` response to pass the native ACP handshake validator in `scripts/adapters/acp-transport-adapter.mjs` (`validateAcpHandshake()`), declaring `protocolVersion: 1`, `agentInfo: { name, version }`, active `agentCapabilities`, and vendor `_meta` field. Implemented standard cancellation and shutdown notification handling (`session/cancel`, `$/cancelRequest`, `shutdown`).
+   - Comprehensive test suite `tests/test-acp-adapter.mjs` passes 13/13 tests.
 4. **Workstream 4 (Specification Modernization & Governance Invariants)**:
    - Synchronized target identity in `evals/protocols/v2.0-three-layer-evaluation-framework.md` and `evals/protocols/v2.0-acceptance-criteria.json` to `@arcobaleno64/three-lens`.
    - Scaled Layer 2 upper boundary from 16 to 32 cases to support open-ended corpus expansion, with updated `frozenAt: 2026-11-09T16:00:00Z`.
@@ -133,12 +133,12 @@ pie title Layer 2 External Validity Corpus Distribution (N=26)
 | `L2-18-OSS-FIX-JSONPOINTER` | `json-pointer` | CVE-2020-7709 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `1dbd1ed6...` |
 | `L2-19-OSS-VULN-INI` | `ini` | CVE-2020-7788 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `738eca59...` |
 | `L2-20-OSS-FIX-INI` | `ini` | CVE-2020-7788 | CWE-1321 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `56d2805e...` |
-| `L2-21-OSS-VULN-NODETAR` | `node-tar` | CVE-2021-32803 | CWE-022 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `1e33534e...` |
-| `L2-22-OSS-FIX-NODETAR` | `node-tar` | CVE-2021-32803 | CWE-022 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `9dbdeb6d...` |
+| `L2-21-OSS-VULN-ADMZIP` | `adm-zip` | CVE-2018-1002204 | CWE-022 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `e116bc18...` |
+| `L2-22-OSS-FIX-ADMZIP` | `adm-zip` | CVE-2018-1002204 | CWE-022 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `62f64004...` |
 | `L2-23-OSS-VULN-LODASH` | `lodash` | CVE-2020-28500 | CWE-1333 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `3469357c...` |
 | `L2-24-OSS-FIX-LODASH` | `lodash` | CVE-2020-28500 | CWE-1333 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `c4847ebe...` |
-| `L2-25-OSS-VULN-AXIOS` | `axios` | CVE-2020-28168 | CWE-918 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `f472e5da...` |
-| `L2-26-OSS-FIX-AXIOS` | `axios` | CVE-2020-28168 | CWE-918 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `c7329fef...` |
+| `L2-25-OSS-VULN-GROWL` | `growl` | CVE-2017-16042 | CWE-078 | `UPSTREAM_VERIFIED_OSS` | `VULNERABLE` | `dc8aae04...` |
+| `L2-26-OSS-FIX-GROWL` | `growl` | CVE-2017-16042 | CWE-078 | `UPSTREAM_VERIFIED_OSS` | `FIXED_COUNTERPART` | `d71177d5...` |
 
 ### 3.2 Acceptance Criteria Verification
 Execution of `npm run validate:v2-corpus` confirms:

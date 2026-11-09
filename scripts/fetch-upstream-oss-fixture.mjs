@@ -122,6 +122,10 @@ export async function runHarness(options = {}) {
   const targets = caseId ? ossCases.filter(c => (c.caseId || c.id) === caseId) : ossCases;
 
   if (targets.length === 0) {
+    if (caseId) {
+      console.error(`✖ Error: Specified caseId '${caseId}' does not exist in corpus.`);
+      return { total: 0, verified: 0, failed: 1, skipped: 0 };
+    }
     console.log(`No UPSTREAM_VERIFIED_OSS cases found matching filter.`);
     return { total: 0, verified: 0, failed: 0, skipped: 0 };
   }
@@ -175,10 +179,30 @@ export async function runHarness(options = {}) {
         throw new Error(`Path containment violation: ${targetDir} escapes outDir ${resolvedOutDir}`);
       }
 
-      if (fs.existsSync(targetDir)) {
-        console.log(`  ✔ Already checked out at: ${path.relative(REPO_ROOT, targetDir)}`);
+      // R03-F02 Fix: Strictly verify git repository integrity and HEAD revision, avoiding false success on partial checkouts
+      let isExistingValidRepo = false;
+      if (fs.existsSync(targetDir) && fs.existsSync(path.join(targetDir, '.git'))) {
+        try {
+          const headRev = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: targetDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+          const statusOutput = execFileSync('git', ['status', '--porcelain'], { cwd: targetDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+          if (headRev.toLowerCase().startsWith(commitSha.toLowerCase().slice(0, 7)) && statusOutput === '') {
+            isExistingValidRepo = true;
+          }
+        } catch {
+          isExistingValidRepo = false;
+        }
+      }
+
+      if (isExistingValidRepo) {
+        console.log(`  ✔ Valid verified checkout found at: ${path.relative(REPO_ROOT, targetDir)}`);
         verifiedCount++;
       } else {
+        // If directory exists but failed validation, remove it before re-cloning
+        if (fs.existsSync(targetDir)) {
+          console.warn(`  ⚠ Partial or invalid checkout detected at: ${path.relative(REPO_ROOT, targetDir)}, cleaning up...`);
+          fs.rmSync(targetDir, { recursive: true, force: true });
+        }
+
         console.log(`  Cloning to isolated sandbox: ${path.relative(REPO_ROOT, targetDir)}...`);
         fs.mkdirSync(resolvedOutDir, { recursive: true });
         try {
@@ -188,6 +212,10 @@ export async function runHarness(options = {}) {
           verifiedCount++;
         } catch (err) {
           console.error(`  ✖ Checkout failed: ${err.message}`);
+          // Ensure incomplete directory is immediately deleted fail-closed
+          if (fs.existsSync(targetDir)) {
+            try { fs.rmSync(targetDir, { recursive: true, force: true }); } catch {}
+          }
           failedCount++;
         }
       }

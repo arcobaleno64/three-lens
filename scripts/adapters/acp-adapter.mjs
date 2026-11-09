@@ -35,13 +35,28 @@ export const ACP_DIAGNOSTIC_SEVERITY = Object.freeze({
 
 /**
  * Checks whether a finding has passed 3-lens consensus and achieved authoritative reportable status.
+ * Under Default-Deny (R03-F03), self-asserted disposition strings without consensus,
+ * provenance, or ballots cannot claim authorityConfirmed.
  * @param {object} finding
  * @returns {boolean}
  */
 export function assertFindingDispositionAuthority(finding) {
   if (!finding || typeof finding !== 'object') return false;
   const disp = String(finding.disposition || '').toUpperCase().trim();
-  return disp === 'CONFIRMED' || disp === 'REPORTABLE';
+  const isReportableDisp = disp === 'CONFIRMED' || disp === 'REPORTABLE';
+  if (!isReportableDisp) return false;
+
+  // R03-F03 Defense: Verify consensus / provenance evidence exists under Default-Deny.
+  // Mere string self-assertions without verified consensus are strictly rejected.
+  const hasConsensus = Boolean(
+    (finding.consensus && typeof finding.consensus === 'object' && (finding.consensus.unanimous || finding.consensus.totalVotes >= 2))
+    || finding.lineageId
+    || finding.authorityProof
+    || finding.modelProvenance?.toolRevision
+    || (Array.isArray(finding.ballots) && finding.ballots.length >= 2)
+  );
+
+  return hasConsensus;
 }
 
 /**
@@ -108,12 +123,14 @@ export function formatAcpDiagnostic(finding) {
   const endChar = safeNonNegativeInteger(rawEndCol - 1, startChar);
 
   const disposition = finding.disposition ? String(finding.disposition).toUpperCase().trim() : 'UNVERIFIED';
-  const severityNum = mapSeverityToAcpDiagnostic(finding.severity, disposition);
+  const isConfirmed = assertFindingDispositionAuthority(finding);
+
+  // R03-F03 Defense: If not confirmed via consensus, force disposition to UNVERIFIED for severity calculation
+  const effectiveDisp = isConfirmed ? disposition : 'UNVERIFIED';
+  const severityNum = mapSeverityToAcpDiagnostic(finding.severity, effectiveDisp);
 
   const rawMsg = finding.title || finding.description || 'Security vulnerability detected';
   const sanitizedMsg = String(rawMsg).replace(/[\r\n]+/g, ' ').slice(0, 2048);
-
-  const isConfirmed = assertFindingDispositionAuthority(finding);
   const displayMsg = isConfirmed ? sanitizedMsg : `[UNVERIFIED CANDIDATE] ${sanitizedMsg}`;
 
   const diag = {
@@ -131,7 +148,7 @@ export function formatAcpDiagnostic(finding) {
       securityProperty: finding.securityProperty || null,
       findingType: finding.findingType || 'VULNERABILITY',
       proofKind: finding.proofKind || 'STATIC_TRACE',
-      disposition: disposition,
+      disposition: effectiveDisp,
       authorityConfirmed: isConfirmed
     }
   };
@@ -197,7 +214,8 @@ export function formatBallotProgressNotification(candidateId, lens, vote, detail
 
 /**
  * Handles ACP / LSP initialize request handshake.
- * Complies with native ACP handshake contract in `validateAcpHandshake()`.
+ * Complies with native ACP handshake contract in `validateAcpHandshake()`,
+ * declaring vendor metadata for the LSP-over-ACP streaming diagnostic bridge.
  * @param {object} request
  * @returns {object} JSON-RPC 2.0 response object
  */
@@ -220,6 +238,17 @@ export function handleInitialize(request = {}) {
           diagnosticProvider: true,
           progressProvider: true
         }
+      },
+      _meta: {
+        protocolBridge: 'LSP_OVER_ACP_V1',
+        vendorCapabilities: {
+          streamingDiagnostics: true,
+          ballotProgress: true
+        },
+        supportedNotifications: [
+          'textDocument/publishDiagnostics',
+          'window/logMessage'
+        ]
       },
       capabilities: {
         diagnosticProvider: true,
@@ -280,6 +309,26 @@ export function createAcpDiagnosticEmitter(stream = process.stdout) {
       if (!parsed || parsed.error) return null;
       if (parsed.method === 'initialize') {
         const response = handleInitialize(parsed);
+        const respLine = JSON.stringify(response) + '\n';
+        stream.write(respLine);
+        return response;
+      }
+      if (parsed.method === 'session/cancel' || parsed.method === '$/cancelRequest') {
+        const response = {
+          jsonrpc: '2.0',
+          id: parsed.id ?? null,
+          result: { cancelled: true }
+        };
+        const respLine = JSON.stringify(response) + '\n';
+        stream.write(respLine);
+        return response;
+      }
+      if (parsed.method === 'shutdown') {
+        const response = {
+          jsonrpc: '2.0',
+          id: parsed.id ?? null,
+          result: null
+        };
         const respLine = JSON.stringify(response) + '\n';
         stream.write(respLine);
         return response;
