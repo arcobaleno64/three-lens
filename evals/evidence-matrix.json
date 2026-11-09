@@ -38,7 +38,7 @@
         },
         {
           "path": "skills/3lens/tool-integrity-manifest.json",
-          "sha256": "9fae5c9dc3f6e1142591f43184284e4d693fbfe126fd5c2d35ebb6146ee76b88",
+          "sha256": "c69759139d1849c4f77ad31a7091b70cdc452394a6285e278e1700439315e73e",
           "description": "Cryptographic TCB integrity manifest pinning critical script hashes"
         },
         {
