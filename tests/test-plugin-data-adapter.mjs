@@ -6613,7 +6613,7 @@ test('R25-B01 & R25-B02: Monotonic witness storage path alignment and unauthenti
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
-test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01 & R29-B01: Strict Genesis root anchor confinement, filename version binding, progressive historical journal revocation screening, baseline HWM=-1 gating, and cold-start rollback recovery', () => {
+test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01 & R29-B01 & R30-B01: Strict Genesis root anchor confinement, filename version binding, progressive historical journal revocation screening, baseline HWM=-1 gating, delegated prefix isolation, and cold-start rollback recovery', () => {
   const tempDir = createTempDir('r26-r27-security-gates-');
   const rootAuth = generateTestAuthority();
   const rogueAuth = generateTestAuthority();
@@ -6828,6 +6828,81 @@ test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01 & R29-B01: Strict Genesis 
   // Attacker writes v3 signed by revoked K into BOTH history/trust-registry.v3.json AND supervisor-trust-registry.json.
   // In R28-B01, attacker tried to bypass currentRegistry check by placing revoked-signer v3 into the historical chain.
   // resolveJournalTrustedKeyWindows MUST reject history v3 with [UNTRUSTED_HISTORICAL_REGISTRY] [REVOKED_SIGNER_AUTHORIZATION_REJECTED]!
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v3.json'), JSON.stringify(attackerV3Reg), 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[UNTRUSTED_HISTORICAL_REGISTRY\]|\[REVOKED_SIGNER_AUTHORIZATION_REJECTED\]/
+  );
+  fs.rmSync(path.join(histDir, 'trust-registry.v3.json'), { force: true });
+
+  // 3d. Negative Test F (R30-B01 Auditor Blocker Counterexample):
+  // Baseline HWM=-1 for v1 and v2. Root authorizes K in v2.
+  // Journal entry 0 is signed by delegated K (e.g. NONCE_REVOCATION).
+  // Journal entry 1 is signed by Root, revoking K (KEY_REVOCATION).
+  // Attacker uses revoked K to sign v3 (introducing rogueAuth A) and appends entry 2 signed by A.
+  // Neither current registry nor historical registry v3 can accept K's signature, and A MUST NEVER enter trustedKeys!
+  fs.rmSync(path.join(tempDir, '.irv-revocation-journal.jsonl'), { force: true });
+  fs.rmSync(path.join(tempDir, 'supervisor-trust-registry.json'), { force: true });
+
+  // Re-write clean historical v1 & v2 with baseline HWM=-1
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v1.json'), JSON.stringify(validGenesisV1), 'utf8');
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v2.json'), JSON.stringify(validV2Hist), 'utf8');
+
+  // Entry 0 signed by delegatedAuthK
+  const entry0Delegated = {
+    entryIndex: 0,
+    prevEntryDigest: '0'.repeat(64),
+    revocationType: REVOCATION_TYPES.NONCE_REVOCATION,
+    targetId: 'TARGET-NONCE-PREFIX-BY-K',
+    signedBy: delegatedAuthK.keyId,
+    reason: 'LEGITIMATE_DELEGATED_ENTRY_BEFORE_REVOCATION',
+    timestamp: new Date().toISOString()
+  };
+  const entry0DelegatedPayload = Buffer.from(computeRevocationEntrySignPayload(entry0Delegated), 'utf8');
+  entry0Delegated.signature = crypto.sign(null, entry0DelegatedPayload, delegatedAuthK.privateKey).toString('hex');
+  const entry0DelegatedDigest = sha256Digest(canonicalJsonStringify(entry0Delegated));
+
+  // Entry 1 signed by Root revoking delegatedAuthK
+  const entry1RootRevoke = {
+    entryIndex: 1,
+    prevEntryDigest: entry0DelegatedDigest,
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: delegatedAuthK.keyId,
+    signedBy: rootAuth.keyId,
+    reason: 'ROOT_REVOKES_DELEGATED_K',
+    timestamp: new Date().toISOString()
+  };
+  const entry1RootPayload = Buffer.from(computeRevocationEntrySignPayload(entry1RootRevoke), 'utf8');
+  entry1RootRevoke.signature = crypto.sign(null, entry1RootPayload, rootAuth.privateKey).toString('hex');
+  const entry1RootDigest = sha256Digest(canonicalJsonStringify(entry1RootRevoke));
+
+  // Entry 2 signed by rogueAuth
+  const entry2Rogue = {
+    entryIndex: 2,
+    prevEntryDigest: entry1RootDigest,
+    revocationType: REVOCATION_TYPES.NONCE_REVOCATION,
+    targetId: 'TARGET-ROGUE-NONCE-AFTER-REVOKED-K',
+    signedBy: rogueAuth.keyId,
+    reason: 'ROGUE_ENTRY_ATTEMPT',
+    timestamp: new Date().toISOString()
+  };
+  const entry2RoguePayload = Buffer.from(computeRevocationEntrySignPayload(entry2Rogue), 'utf8');
+  entry2Rogue.signature = crypto.sign(null, entry2RoguePayload, rogueAuth.privateKey).toString('hex');
+
+  fs.writeFileSync(
+    path.join(tempDir, '.irv-revocation-journal.jsonl'),
+    [entry0Delegated, entry1RootRevoke, entry2Rogue].map(e => JSON.stringify(e)).join('\n') + '\n',
+    'utf8'
+  );
+
+  // Scenario 1: Attacker writes v3 signed by K to current registry (supervisor-trust-registry.json)
+  fs.writeFileSync(path.join(tempDir, 'supervisor-trust-registry.json'), JSON.stringify(attackerV3Reg), 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[UNTRUSTED_CURRENT_REGISTRY\]|\[REVOKED_SIGNER_AUTHORIZATION_REJECTED\]/
+  );
+
+  // Scenario 2: Attacker also writes v3 signed by K into history/trust-registry.v3.json
   fs.writeFileSync(path.join(histDir, 'trust-registry.v3.json'), JSON.stringify(attackerV3Reg), 'utf8');
   assert.throws(
     () => getJournalRevokedKeyMap(tempDir, opts),
