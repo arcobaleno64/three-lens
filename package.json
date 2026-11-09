@@ -1,6 +1,6 @@
 {
   "name": "@arcobaleno64/three-lens",
-  "version": "1.11.0",
+  "version": "1.12.0",
   "description": "three-lens (3lens) is an evidence-backed, multi-stage security assurance and vulnerability verification plugin for Antigravity CLI (agy).",
   "type": "module",
   "license": "MIT",

@@ -2,7 +2,7 @@
 
 > **Governing Specification**: [RFC 0002: Track D - External Reproducibility, Real-World Transfer & Adoption Readiness](../rfcs/0002-external-reproducibility-and-adoption-readiness.md)  
 > **Status**: REPRODUCIBILITY_READY / D-AC-10 OPEN  
-> **Frozen Baseline**: `agy-security-audit v1.11.0`
+> **Frozen Baseline**: `agy-security-audit v1.12.0`
 
 ---
 

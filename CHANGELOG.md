@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.12.0] - 2026-11-09
+
+### Milestone 5.4 Phase 2: Multi-Tier Reasoning, Dual-Anchor Governance & Context Compression Contracts
+This release concludes Milestone 5.4 Phase 2 across 37 rounds of independent cryptographic and AppSec review. It introduces persistent cross-session trust governance with zero-workspace pollution via `PLUGIN_DATA`, fail-closed `/compact` state preservation contracts, high-performance package slimming (-85% unpacked footprint), and modularization of the 121-rule SARIF invariant test suite.
+
+### Added
+- **Dual-Anchor `PLUGIN_DATA` Persistence & Governance**:
+  - Isolated global trust registry and append-only cryptographic revocation journal (`journal.jsonl`).
+  - Strict sovereign root anchoring, monotonic sequence numbers, and fail-closed transaction recovery across clean process restarts.
+- **Fail-Closed `/compact` Context Contract**:
+  - Nonce-anchored cryptographic state preservation across Antigravity CLI context compression boundaries.
+  - Zero workspace pollution: all governance state safely confined outside the target repository.
+- **Modularized Test Suite & Package Slimming**:
+  - Extracted 121 invariant verification tests from `render-sarif.mjs` into `tests/test-render-sarif.mjs`, reducing scanner script footprint to 319 lines.
+  - Enforced `package.json` files whitelist, reducing unpacked npm archive from 7.9 MB (398 files) to 1.2 MB (74 files, -85% reduction).
+
+### Changed
+- **Marketplace & Platform Alignment**:
+  - Aligned agent skill bindings (`skills: [3lens]`) with Antigravity canonical registration.
+  - Transparent fail-open boundary documentation for PreInvocation / PreToolUse hooks with defense-in-depth relying on Layer 1 sandbox.
+
+---
+
 ## [1.11.0] - 2026-11-07
 
 ### Three-Lens Identity Realignment & Ecosystem Hardening
