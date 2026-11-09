@@ -1,8 +1,11 @@
 --- a/evals/oss-corpus/07-adm-zip-path-traversal.js
 +++ b/evals/oss-corpus/07-adm-zip-path-traversal.js
-@@ -9,2 +9,5 @@
-   const target = path.resolve(targetDir, entryName);
-+  if (!target.startsWith(targetDir)) {
-+    throw new Error(`INVALID_FILENAME: ${entryName}`); // CVE-2018-1002204 official fix
+@@ -9,2 +9,7 @@
+-  const target = path.resolve(targetDir, entryName);
++  const resolvedTargetDir = path.resolve(targetDir);
++  const target = path.resolve(resolvedTargetDir, entryName);
++  const boundaryPrefix = resolvedTargetDir.endsWith(path.sep) ? resolvedTargetDir : resolvedTargetDir + path.sep;
++  if (!target.startsWith(boundaryPrefix) && target !== resolvedTargetDir) {
++    throw new Error(`INVALID_FILENAME: ${entryName}`); // CVE-2018-1002204 path containment guard
 +  }
    fs.mkdirSync(path.dirname(target), { recursive: true });
