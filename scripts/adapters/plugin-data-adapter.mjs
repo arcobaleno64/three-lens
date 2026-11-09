@@ -788,6 +788,39 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           continue;
         }
 
+        // R31-B02: Reject historical registry attempting to revoke root anchor
+        if (Array.isArray(hReg.revokedKeyIds) && hReg.revokedKeyIds.includes(rootId)) {
+          if (options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] [REVOKED_KEY_AUTHORIZATION_REJECTED] [ROOT_REVOCATION_REJECTED] Historical registry ${hf} attempts to revoke trusted root key '${rootId}'`);
+          }
+          continue;
+        }
+
+        // R31-B01: Root keyId, PEM, and status binding invariant in historical registry
+        let hasRogueRootInHist = false;
+        let rogueRootReason = '';
+        for (const hk of hReg.keys || []) {
+          if (hk && hk.keyId === rootId) {
+            if (hk.publicKeyPem !== rootPem || hk.status === 'REVOKED') {
+              hasRogueRootInHist = true;
+              rogueRootReason = `Historical registry ${hf} attempts to substitute or revoke trusted root key '${rootId}'`;
+              break;
+            }
+          } else if (hk && hk.keyId !== rootId) {
+            if (hk.status === 'ACTIVE_PINNED_ROOT' || hk.publicKeyPem === rootPem) {
+              hasRogueRootInHist = true;
+              rogueRootReason = `Non-root key '${hk.keyId}' in historical registry ${hf} claims root status or root key PEM`;
+              break;
+            }
+          }
+        }
+        if (hasRogueRootInHist) {
+          if (options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] [ROOT_KEY_SUBSTITUTION_REJECTED] ${rogueRootReason}`);
+          }
+          continue;
+        }
+
         const proof = hReg.authorizationProof;
         if (!proof || typeof proof.signature !== 'string' || typeof proof.authorizedBy !== 'string') {
           if (options.failClosed !== false) {
@@ -835,6 +868,17 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
         const hRevokedSet = new Set(Array.isArray(hReg?.revokedKeyIds) ? hReg.revokedKeyIds : []);
         for (const hk of hReg?.keys || []) {
           if (hk && hk.keyId && hk.publicKeyPem) {
+            if (hk.keyId === rootId) {
+              // R31-B01: Root anchor is immutable across all historical registries: always pin to canonical rootPem
+              trustedKeys.set(rootId, rootPem);
+              if (hk.status === 'RETIRED') {
+                const cur = maxActiveIndexPerKey.get(rootId);
+                maxActiveIndexPerKey.set(rootId, Math.min(cur ?? Infinity, priorHwmIdx));
+              } else {
+                maxActiveIndexPerKey.set(rootId, Infinity);
+              }
+              continue;
+            }
             trustedKeys.set(hk.keyId, hk.publicKeyPem);
             const isRevokedInHist = hRevokedSet.has(hk.keyId) || hk.status === 'REVOKED';
             if (isRevokedInHist) {
@@ -843,12 +887,10 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
             } else if (hk.status === 'RETIRED') {
               const cur = maxActiveIndexPerKey.get(hk.keyId);
               maxActiveIndexPerKey.set(hk.keyId, Math.min(cur ?? Infinity, priorHwmIdx));
-            } else if (hk.status === 'ACTIVE' || hk.status === 'ACTIVE_PINNED_ROOT') {
-              // R30-B01: Active keys (Root or delegated) in an authenticated historical registry have active
+            } else if (hk.status === 'ACTIVE') {
+              // R30-B01: Active keys (delegated) in an authenticated historical registry have active
               // signing authority (Infinity) unless/until terminated by a subsequent retirement, revocation,
-              // or journal entry. Bounding an active delegated key by past hHwmIdx (-1) causes
-              // advanceJournalRevocations to prematurely break on legitimate delegated journal entries,
-              // blinding the state machine to subsequent Root revocations.
+              // or journal entry.
               maxActiveIndexPerKey.set(hk.keyId, Infinity);
             }
           }
@@ -889,6 +931,38 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
         }
       } else if (currentRegistry.registryVersion === priorVerifiedReg.registryVersion + 1) {
         // Next version after history: must have valid authorizationProof from priorVerifiedReg
+
+        // R31-B02: Current registry cannot revoke pinned root key
+        if (Array.isArray(currentRegistry.revokedKeyIds) && currentRegistry.revokedKeyIds.includes(rootId)) {
+          if (options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_CURRENT_REGISTRY] [REVOKED_KEY_AUTHORIZATION_REJECTED] [ROOT_REVOCATION_REJECTED] Current registry attempts to revoke trusted root key '${rootId}'`);
+          }
+        }
+
+        // R31-B01: Root keyId, PEM, and status binding invariant in current registry
+        let hasRogueRootInCur = false;
+        let rogueRootCurReason = '';
+        for (const ck of currentRegistry.keys || []) {
+          if (ck && ck.keyId === rootId) {
+            if (ck.publicKeyPem !== rootPem || ck.status === 'REVOKED') {
+              hasRogueRootInCur = true;
+              rogueRootCurReason = `Current registry attempts to substitute or revoke trusted root key '${rootId}'`;
+              break;
+            }
+          } else if (ck && ck.keyId !== rootId) {
+            if (ck.status === 'ACTIVE_PINNED_ROOT' || ck.publicKeyPem === rootPem) {
+              hasRogueRootInCur = true;
+              rogueRootCurReason = `Non-root key '${ck.keyId}' in current registry claims root status or root key PEM`;
+              break;
+            }
+          }
+        }
+        if (hasRogueRootInCur) {
+          if (options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_CURRENT_REGISTRY] [ROOT_KEY_SUBSTITUTION_REJECTED] ${rogueRootCurReason}`);
+          }
+        }
+
         const proof = currentRegistry.authorizationProof;
         if (proof && typeof proof.signature === 'string' && typeof proof.authorizedBy === 'string') {
           // R27-B02 & R29-B01: Signer must not be revoked in prior registry or in verified journal records
@@ -964,8 +1038,23 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
       );
       for (const k of currentRegistry.keys) {
         if (k && k.keyId && k.publicKeyPem) {
+          if (k.keyId === rootId) {
+            // R31-B01: Root anchor is immutable in current registry: always pin to canonical rootPem
+            trustedKeys.set(rootId, rootPem);
+            if (k.status === 'RETIRED') {
+              if (!maxActiveIndexPerKey.has(rootId) || maxActiveIndexPerKey.get(rootId) === Infinity) {
+                const retiredHwm = priorVerifiedReg
+                  ? (typeof priorVerifiedReg?.revocationHighWaterMark?.headIndex === 'number' ? priorVerifiedReg.revocationHighWaterMark.headIndex : -1)
+                  : (typeof currentRegistry?.revocationHighWaterMark?.headIndex === 'number' ? currentRegistry.revocationHighWaterMark.headIndex : -1);
+                maxActiveIndexPerKey.set(rootId, retiredHwm);
+              }
+            } else {
+              maxActiveIndexPerKey.set(rootId, Infinity);
+            }
+            continue;
+          }
           const isRevokedInCur = curRevokedSet.has(k.keyId) || k.status === 'REVOKED';
-          if (!isRevokedInCur && (k.status === 'ACTIVE_PINNED_ROOT' || k.status === 'ACTIVE')) {
+          if (!isRevokedInCur && k.status === 'ACTIVE') {
             trustedKeys.set(k.keyId, k.publicKeyPem);
             maxActiveIndexPerKey.set(k.keyId, Infinity);
           } else if (isRevokedInCur || k.status === 'RETIRED') {
@@ -1005,6 +1094,7 @@ function verifyFullJournalChain(journalLines, targetHeadIndex, targetHeadDigest,
     throw new Error('[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry count is insufficient for target index');
   }
   const dir = resolvePluginDataDir(options);
+  const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
   const { trustedKeys, maxActiveIndexPerKey } = resolveJournalTrustedKeyWindows(dir, curReg, options);
 
   let expectedPrevDigest = '0'.repeat(64);
@@ -1041,8 +1131,9 @@ function verifyFullJournalChain(journalLines, targetHeadIndex, targetHeadDigest,
       throw new Error(`[TRANSACTION_WAL_CORRUPTION_DETECTED] Journal entry at index ${i} signature verification failed`);
     }
 
-    // R20-B02: If entry revokes a key (KEY_REVOCATION), terminate that key's active window in this chain
-    if (entry.targetId && (entry.revocationType === REVOCATION_TYPES.KEY_REVOCATION || entry.revocationType === 'KEY_REVOCATION')) {
+    // R20-B02 & R31-B02: If entry revokes a key (KEY_REVOCATION), terminate that key's active window in this chain.
+    // Root anchor is immune to revocation.
+    if (entry.targetId && entry.targetId !== rootId && (entry.revocationType === REVOCATION_TYPES.KEY_REVOCATION || entry.revocationType === 'KEY_REVOCATION')) {
       const existingMax = maxActiveIndexPerKey.get(entry.targetId);
       maxActiveIndexPerKey.set(entry.targetId, Math.min(existingMax ?? Infinity, i));
     }
@@ -1798,6 +1889,7 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
   }
 
   // R24-B01 & R26-B01/B02: Resolve trusted keys and active signing windows for cryptographic signature verification
+  const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
   const activeRegForKeys = options.registry || onDiskRegForKeys;
   const { trustedKeys, maxActiveIndexPerKey } = resolveJournalTrustedKeyWindows(dir, activeRegForKeys, options);
 
@@ -1877,7 +1969,8 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
     }
 
     // Terminate signer lifecycle dynamically if this entry revokes a key
-    if (parsed.targetId && (parsed.revocationType === REVOCATION_TYPES.KEY_REVOCATION || parsed.revocationType === 'KEY_REVOCATION')) {
+    // R31-B02: Root anchor is immune to revocation
+    if (parsed.targetId && parsed.targetId !== rootId && (parsed.revocationType === REVOCATION_TYPES.KEY_REVOCATION || parsed.revocationType === 'KEY_REVOCATION')) {
       const existingMax = maxActiveIndexPerKey.get(parsed.targetId);
       maxActiveIndexPerKey.set(parsed.targetId, Math.min(existingMax ?? Infinity, parsed.entryIndex));
       if (!revokedMap.has(parsed.targetId)) {
@@ -2180,6 +2273,45 @@ export function validateTrustRegistry(registry, options = {}) {
 
   // R19-B01: Single non-contradictory revocation authority check:
   // A key listed in revokedKeyIds MUST NOT be activeKeyId or retain ACTIVE / ACTIVE_PINNED_ROOT status in keys[].
+  const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
+  const rootPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
+
+  // R31-B02: Pinned root anchor cannot be revoked
+  if (registry.revokedKeyIds.includes(rootId)) {
+    return {
+      valid: false,
+      error: `[REVOKED_KEY_AUTHORIZATION_REJECTED] [ROOT_REVOCATION_REJECTED] Pinned root key '${rootId}' cannot be revoked in trust registry`,
+      cryptographicValidity: false,
+      monotonicValidity: true,
+      ancestryContinuity: true
+    };
+  }
+
+  // R31-B01: Root keyId, PEM, and status binding invariant
+  for (const k of registry.keys) {
+    if (k && k.keyId === rootId) {
+      if (k.publicKeyPem !== rootPem || k.status === 'REVOKED') {
+        return {
+          valid: false,
+          error: `[ROOT_KEY_SUBSTITUTION_REJECTED] Pinned root key '${rootId}' cannot have modified public key PEM or revoked status in keys[]`,
+          cryptographicValidity: false,
+          monotonicValidity: true,
+          ancestryContinuity: true
+        };
+      }
+    } else if (k && k.keyId !== rootId) {
+      if (k.status === 'ACTIVE_PINNED_ROOT' || k.publicKeyPem === rootPem) {
+        return {
+          valid: false,
+          error: `[ROOT_KEY_SUBSTITUTION_REJECTED] Non-root key '${k.keyId}' cannot claim ACTIVE_PINNED_ROOT status or duplicate root public key`,
+          cryptographicValidity: false,
+          monotonicValidity: true,
+          ancestryContinuity: true
+        };
+      }
+    }
+  }
+
   if (registry.revokedKeyIds.includes(registry.activeKeyId)) {
     return {
       valid: false,
@@ -2255,6 +2387,18 @@ export function validateTrustRegistry(registry, options = {}) {
         candidateHwm: registry.revocationHighWaterMark
       });
     } catch (jErr) {
+      if (
+        jErr.message.includes('[ROOT_KEY_SUBSTITUTION_REJECTED]') ||
+        jErr.message.includes('[ROOT_REVOCATION_REJECTED]')
+      ) {
+        return {
+          valid: false,
+          error: jErr.message,
+          cryptographicValidity: false,
+          monotonicValidity: false,
+          ancestryContinuity: false
+        };
+      }
       if (jErr.message.includes('[REVOKED_SIGNER_AUTHORIZATION_REJECTED]') || jErr.message.includes('REVOKED_KEY_AUTHORIZATION_REJECTED') || jErr.message.includes('[RETIRED_KEY_AUTHORIZATION_REJECTED]')) {
         return {
           valid: false,
@@ -2731,6 +2875,18 @@ export function createAuthorizedRegistryUpdate(currentRegistry, updates, signerK
         candidateHwm: currentRegistry.revocationHighWaterMark
       });
     } catch (jErr) {
+      if (
+        jErr.message.includes('[ROOT_KEY_SUBSTITUTION_REJECTED]') ||
+        jErr.message.includes('[ROOT_REVOCATION_REJECTED]')
+      ) {
+        return {
+          valid: false,
+          error: jErr.message,
+          cryptographicValidity: false,
+          monotonicValidity: false,
+          ancestryContinuity: false
+        };
+      }
       if (jErr.message.includes('[REVOKED_SIGNER_AUTHORIZATION_REJECTED]') || jErr.message.includes('REVOKED_KEY_AUTHORIZATION_REJECTED') || jErr.message.includes('[RETIRED_KEY_AUTHORIZATION_REJECTED]')) {
         throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key was revoked in revocation journal or prior registry: ${jErr.message}`);
       }
@@ -4157,6 +4313,12 @@ export function saveTrustRegistry(registry, options = {}) {
           candidateHwm: registry.revocationHighWaterMark
         });
       } catch (jErr) {
+        if (
+          jErr.message.includes('[ROOT_KEY_SUBSTITUTION_REJECTED]') ||
+          jErr.message.includes('[ROOT_REVOCATION_REJECTED]')
+        ) {
+          throw jErr;
+        }
         if (jErr.message.includes('[REVOKED_SIGNER_AUTHORIZATION_REJECTED]') || jErr.message.includes('[RETIRED_KEY_AUTHORIZATION_REJECTED]') || jErr.message.includes('REVOKED_KEY_AUTHORIZATION_REJECTED')) {
           throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key '${registry.authorizationProof.authorizedBy}' was revoked in revocation journal or prior registry; cannot authorize registry`);
         }
@@ -4501,6 +4663,7 @@ function doLoadRevocationJournal(options = {}) {
     }
 
     // R18-B04: Unified historical key lifecycle resolution shared with WAL recovery
+    const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
     const { trustedKeys, maxActiveIndexPerKey } = resolveJournalTrustedKeyWindows(
       dir,
       trustRegistryLoad.valid ? trustRegistryLoad.registry : null,
@@ -4570,8 +4733,9 @@ function doLoadRevocationJournal(options = {}) {
         return { valid: false, entries: [], error: msg, count: i };
       }
 
-      // R20-B02: If this entry revokes a key (KEY_REVOCATION), terminate that key's active signing window in this journal
-      if (parsed.targetId && (parsed.revocationType === REVOCATION_TYPES.KEY_REVOCATION || parsed.revocationType === 'KEY_REVOCATION')) {
+      // R20-B02 & R31-B02: If this entry revokes a key (KEY_REVOCATION), terminate that key's active signing window in this journal.
+      // Root anchor is immune to revocation.
+      if (parsed.targetId && parsed.targetId !== rootId && (parsed.revocationType === REVOCATION_TYPES.KEY_REVOCATION || parsed.revocationType === 'KEY_REVOCATION')) {
         const existingMax = maxActiveIndexPerKey.get(parsed.targetId);
         maxActiveIndexPerKey.set(parsed.targetId, Math.min(existingMax ?? Infinity, parsed.entryIndex));
       }
@@ -4693,6 +4857,12 @@ export function appendRevocationEntry(entryInput, options = {}) {
 
   if (!entryInput.targetId || typeof entryInput.targetId !== 'string') {
     throw new Error('targetId must be a non-empty string');
+  }
+
+  // R31-B02: Pinned root anchor cannot be revoked
+  const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
+  if (entryInput.targetId === rootId && (entryInput.revocationType === REVOCATION_TYPES.KEY_REVOCATION || entryInput.revocationType === 'KEY_REVOCATION')) {
+    throw new Error(`[ROOT_REVOCATION_REJECTED] Pinned root anchor '${rootId}' cannot be revoked via revocation journal`);
   }
 
   if (!options.signerPrivateKey) {

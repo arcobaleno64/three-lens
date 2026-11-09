@@ -6910,6 +6910,72 @@ test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01 & R29-B01 & R30-B01: Stric
   );
   fs.rmSync(path.join(histDir, 'trust-registry.v3.json'), { force: true });
 
+  // 3e. Negative Test G (R31-B01 & R31-B02 Root Substitution and Revocation Immunity Invariant):
+  // Scenario 1: Attacker uses delegated key K to sign a malicious current v3 replacing Root public key
+  const rogueRootReg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 3,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: delegatedAuthK.keyId,
+    activeKeyFingerprint: delegatedAuthK.fp,
+    activePublicKeyPem: delegatedAuthK.pem,
+    keyType: 'ed25519',
+    pinnedSince: '2026-01-01T00:00:00.000Z',
+    rotationPolicy: 'SINGLE_ACTIVE_PINNED_ROOT',
+    revokedKeyIds: [],
+    revocationHighWaterMark: { headIndex: -1, headDigest: '0'.repeat(64), signature: '0'.repeat(128), authorizedBy: delegatedAuthK.keyId },
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: sha256Digest(rogueAuth.pem), publicKeyPem: rogueAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-01-03T00:00:00.000Z' },
+      { keyId: delegatedAuthK.keyId, keyFingerprint: delegatedAuthK.fp, publicKeyPem: delegatedAuthK.pem, status: 'ACTIVE', issuedAt: '2026-01-02T00:00:00.000Z' }
+    ]
+  };
+  const rogueRootPayload = Buffer.from(computeRegistryAuthorizationPayload(rogueRootReg), 'utf8');
+  rogueRootReg.authorizationProof = {
+    signature: crypto.sign(null, rogueRootPayload, delegatedAuthK.privateKey).toString('hex'),
+    authorizedBy: delegatedAuthK.keyId,
+    authorizedAt: '2026-01-03T00:00:00.000Z'
+  };
+  fs.writeFileSync(path.join(tempDir, 'supervisor-trust-registry.json'), JSON.stringify(rogueRootReg), 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[UNTRUSTED_CURRENT_REGISTRY\].*\[ROOT_KEY_SUBSTITUTION_REJECTED\]/
+  );
+
+  // Scenario 2: Attacker writes rogue root registry into historical files
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v3.json'), JSON.stringify(rogueRootReg), 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[UNTRUSTED_HISTORICAL_REGISTRY\].*\[ROOT_KEY_SUBSTITUTION_REJECTED\]/
+  );
+  fs.rmSync(path.join(histDir, 'trust-registry.v3.json'), { force: true });
+
+  // Scenario 3: R31-B02 Root revocation attempt via appendRevocationEntry is strictly rejected
+  assert.throws(
+    () => appendRevocationEntry({
+      revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+      targetId: rootAuth.keyId,
+      reason: 'MALICIOUS_ROOT_REVOCATION'
+    }, {
+      ...opts,
+      signerPrivateKey: delegatedAuthK.privateKey,
+      signerKeyId: delegatedAuthK.keyId
+    }),
+    /\[ROOT_REVOCATION_REJECTED\]/
+  );
+
+  // Scenario 4: R31-B02 Registry revoking Root is strictly rejected by validateTrustRegistry
+  const regRevokingRoot = {
+    ...validV2Hist,
+    registryVersion: 3,
+    activeKeyId: delegatedAuthK.keyId,
+    activeKeyFingerprint: delegatedAuthK.fp,
+    activePublicKeyPem: delegatedAuthK.pem,
+    revokedKeyIds: [rootAuth.keyId]
+  };
+  const valResult = validateTrustRegistry(regRevokingRoot, opts);
+  assert.strictEqual(valResult.valid, false);
+  assert.match(valResult.error, /\[ROOT_REVOCATION_REJECTED\]/);
+
   // 4. Truly Independent Cold-Start Rollback Test with External System Witness
   const independentSystemWitnessDir = createTempDir('independent-sys-witness-');
   process.env.THREE_LENS_SYSTEM_WITNESS_DIR = independentSystemWitnessDir;
