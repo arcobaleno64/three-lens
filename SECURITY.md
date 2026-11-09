@@ -74,14 +74,14 @@ In security audit contexts, no single security perimeter can protect against all
    - **Failure Modes & Defenses**: If target code attempts malicious binary execution or reverse shells, Layer 1 denies kernel-level syscalls and network egress fail-closed.
 
 2. **Layer 2: Permission Engine (`recommended-security-audit-permissions.json`)**
-   - **Boundary**: AGY CLI runtime tool dispatch engine evaluated in strict `deny > ask > allow` order.
+   - **Boundary**: AGY CLI runtime tool dispatch engine evaluated in strict `deny > ask > allow` order, configured via recommended role profile templates in Antigravity operator settings.
    - **Objective**: Restricts available agent tools by assigned role (`coordinator`, `discovery`, `verifiers`, `remediation`) under Default-Deny.
-   - **Failure Modes & Defenses**: If a subagent attempts privilege escalation or unauthorized actions (e.g. discovery agent attempting code edits or network access), Layer 2 blocks tool dispatch before model execution.
+   - **Failure Modes & Defenses**: When the recommended profile is configured into Antigravity operator settings, if a subagent attempts privilege escalation or unauthorized actions (e.g. discovery agent attempting code edits or network access), Layer 2 blocks tool dispatch before model execution.
 
 3. **Layer 3: Shadow Context Guard (`hooks/shadow-context-guard.mjs`, PreToolUse Hook)**
    - **Boundary**: Workspace application layer intercepting file read operations (`view_file`, `grep_search`, `list_dir`, `find_by_name`).
-   - **Objective**: Intercepts direct access to raw workspace files, transparently redirects agents to the sanitized shadow context (`scratch/context/`), and blocks symlink directory traversal escaping repository roots (CWE-59).
-   - **Failure Modes & Defenses**: If an agent attempts direct inspection of unsanitized or traversing files, Layer 3 intercepts and emits a fail-closed denial directing the agent to the shadow replica.
+   - **Objective**: Intercepts direct access to raw workspace files during active security audit sessions, transparently redirects agents to the sanitized shadow context (`scratch/context/`), and blocks symlink directory traversal escaping repository roots (CWE-59). Command-line regex matching serves to reduce accidental egress misuse.
+   - **Failure Modes & Defenses**: During an active audit session with initialized shadow context, direct inspection of raw or escaping files is intercepted and denied fail-closed. In the absence of an active audit context, or in the event of an unhandled hook exception/timeout, Layer 3 fails open to avoid breaking general, non-audit `agy` developer workflows. Hard isolation, persistent write protection, and complete outbound network blocking fundamentally rely on **Layer 1 (`agy --sandbox`)**.
 
 4. **Layer 4: Deterministic Path Containment & TOCTOU-Resistant TCB (`path-containment.mjs`)**
    - **Boundary**: Trusted Computing Base (TCB) atomic filesystem I/O boundary.

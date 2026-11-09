@@ -3,7 +3,7 @@
   "name": "three-lens",
   "displayName": "Three-Lens (3lens)",
   "version": "1.11.0",
-  "description": "Evidence-backed, multi-stage security assurance and vulnerability verification plugin for Antigravity, featuring double-blind 3-lens consensus and PreToolUse shadow-context confinement.",
+  "description": "Evidence-backed security assurance and vulnerability verification plugin for Antigravity, featuring double-blind 3-lens consensus and runtime confinement.",
   "logo": "assets/logo.svg",
   "author": {
     "name": "SatenVision",

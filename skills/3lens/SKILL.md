@@ -4,7 +4,7 @@ description: >-
   Conducts evidence-backed, multi-stage security assurance reviews, vulnerability verification, and patch analysis on codebases or git diffs, informed by NIST SSDF (SP 800-218), OWASP ASVS 5.0.0, OWASP SAMM, and frontier defensive frameworks (Anthropic's Claude Security and OpenAI's Codex Security research). Employs elastic subagent voting under Default-Deny on authority claims, double-blind 3-lens verification, CVSS v4.0 metrics, and SARIF 2.1.0 report generation. Use when the user asks to review code for security flaws, audit vulnerabilities, run security scans, or patch vulnerabilities.
 ---
 
-# Three-Lens Security Skill (/3lens v1.10.0)
+# Three-Lens Security Skill (/3lens v1.11.0)
 
 An evidence-driven security assurance workflow for Google Antigravity (AGY), aligned with NIST SSDF (SP 800-218), OWASP ASVS 5.0.0, OWASP SAMM, CWE taxonomy, and CVSS v4.0, incorporating defensive architectural concepts from frontier agent security frameworks including Anthropic's Claude Security and OpenAI's Codex Security research.
 
