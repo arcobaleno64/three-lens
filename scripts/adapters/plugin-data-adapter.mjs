@@ -1445,62 +1445,78 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
   }
   const journalPath = path.join(dir, '.irv-revocation-journal.jsonl');
   const checkpointPath = path.join(dir, 'supervisor-revocation-checkpoint.json');
+  const witnessPath = path.join(dir, '.irv-monotonic-witness.json');
+  const histDir = path.join(dir, 'history');
 
-  if (!fs.existsSync(journalPath)) {
-    // Check if checkpoint records established revocations in dir
-    if (fs.existsSync(checkpointPath)) {
-      try {
-        const cp = JSON.parse(fs.readFileSync(checkpointPath, 'utf8'));
-        if (typeof cp?.headIndex === 'number' && cp.headIndex >= 0) {
-          throw new Error(`[JOURNAL_ROLLBACK_DETECTED] Journal file missing but checkpoint records headIndex ${cp.headIndex}`);
-        }
-      } catch (cpErr) {
-        if (cpErr.message?.includes('JOURNAL_ROLLBACK_DETECTED')) throw cpErr;
-        throw new Error(`[CHECKPOINT_READ_FAILURE] Failed to read checkpoint at '${checkpointPath}': ${cpErr.message}`);
+  // R23-B01 & R23-B02: Check all physical anchors in dir to detect established revocation HWM.
+  // Any read/parse failure in these anchors MUST fail closed with specific errors instead of being swallowed.
+  let expectedMinHeadIndex = -1;
+
+  // 1. Checkpoint
+  if (fs.existsSync(checkpointPath)) {
+    try {
+      const cp = JSON.parse(fs.readFileSync(checkpointPath, 'utf8'));
+      if (typeof cp?.headIndex === 'number' && cp.headIndex >= 0) {
+        expectedMinHeadIndex = Math.max(expectedMinHeadIndex, cp.headIndex);
       }
+    } catch (cpErr) {
+      throw new Error(`[CHECKPOINT_READ_FAILURE] Failed to read checkpoint at '${checkpointPath}': ${cpErr.message}`);
     }
-    // Check if on-disk registry in dir records established revocations
-    const onDiskRegPath = path.join(dir, 'trust-registry.json');
-    if (fs.existsSync(onDiskRegPath)) {
+  }
+
+  // 2. On-disk registries: check both supervisor-trust-registry.json AND trust-registry.json (R23-B02)
+  for (const regName of ['supervisor-trust-registry.json', 'trust-registry.json']) {
+    const regPath = path.join(dir, regName);
+    if (fs.existsSync(regPath)) {
       try {
-        const reg = JSON.parse(fs.readFileSync(onDiskRegPath, 'utf8'));
+        const reg = JSON.parse(fs.readFileSync(regPath, 'utf8'));
         if (reg?.revocationHighWaterMark && typeof reg.revocationHighWaterMark.headIndex === 'number' && reg.revocationHighWaterMark.headIndex >= 0) {
-          throw new Error(`[JOURNAL_ROLLBACK_DETECTED] Journal file missing but on-disk registry records revocation high-water mark headIndex ${reg.revocationHighWaterMark.headIndex}`);
+          expectedMinHeadIndex = Math.max(expectedMinHeadIndex, reg.revocationHighWaterMark.headIndex);
         }
       } catch (rErr) {
-        if (rErr.message?.includes('JOURNAL_ROLLBACK_DETECTED')) throw rErr;
-        throw new Error(`[REGISTRY_READ_FAILURE] Failed to read on-disk registry at '${onDiskRegPath}': ${rErr.message}`);
+        throw new Error(`[REGISTRY_READ_FAILURE] Failed to read on-disk registry at '${regPath}': ${rErr.message}`);
       }
     }
-    // Check if monotonic witness in dir records established revocations
-    const witnessPath = path.join(dir, '.irv-monotonic-witness.json');
-    if (fs.existsSync(witnessPath)) {
-      try {
-        const wit = JSON.parse(fs.readFileSync(witnessPath, 'utf8'));
-        if (typeof wit?.maxSeenHwmHeadIndex === 'number' && wit.maxSeenHwmHeadIndex >= 0) {
-          throw new Error(`[JOURNAL_ROLLBACK_DETECTED] Journal file missing but monotonic witness records headIndex ${wit.maxSeenHwmHeadIndex}`);
-        }
-      } catch (wErr) {
-        if (wErr.message?.includes('JOURNAL_ROLLBACK_DETECTED')) throw wErr;
-        throw new Error(`[WITNESS_READ_FAILURE] Failed to read witness at '${witnessPath}': ${wErr.message}`);
+  }
+
+  // 3. Monotonic witness
+  if (fs.existsSync(witnessPath)) {
+    try {
+      const wit = JSON.parse(fs.readFileSync(witnessPath, 'utf8'));
+      if (typeof wit?.maxSeenHwmHeadIndex === 'number' && wit.maxSeenHwmHeadIndex >= 0) {
+        expectedMinHeadIndex = Math.max(expectedMinHeadIndex, wit.maxSeenHwmHeadIndex);
       }
+    } catch (wErr) {
+      throw new Error(`[WITNESS_READ_FAILURE] Failed to read witness at '${witnessPath}': ${wErr.message}`);
     }
-    // Check if any historical registry in dir records established revocations
-    const histDir = path.join(dir, 'history');
-    if (fs.existsSync(histDir)) {
-      try {
-        const histFiles = fs.readdirSync(histDir);
-        for (const hf of histFiles) {
-          if (/^trust-registry\.v\d+\.json$/.test(hf)) {
-            const hReg = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
-            if (hReg?.revocationHighWaterMark && typeof hReg.revocationHighWaterMark.headIndex === 'number' && hReg.revocationHighWaterMark.headIndex >= 0) {
-              throw new Error(`[JOURNAL_ROLLBACK_DETECTED] Journal file missing in established installation with historical high-water mark (${hf})`);
-            }
+  }
+
+  // 4. Historical registries in history/
+  if (fs.existsSync(histDir)) {
+    let histFiles;
+    try {
+      histFiles = fs.readdirSync(histDir);
+    } catch (hdErr) {
+      throw new Error(`[HISTORY_READ_FAILURE] Failed to read history directory at '${histDir}': ${hdErr.message}`);
+    }
+    for (const hf of histFiles) {
+      if (/^trust-registry\.v\d+\.json$/.test(hf)) {
+        try {
+          const hReg = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
+          if (hReg?.revocationHighWaterMark && typeof hReg.revocationHighWaterMark.headIndex === 'number' && hReg.revocationHighWaterMark.headIndex >= 0) {
+            expectedMinHeadIndex = Math.max(expectedMinHeadIndex, hReg.revocationHighWaterMark.headIndex);
           }
+        } catch (hfErr) {
+          throw new Error(`[HISTORY_READ_FAILURE] Failed to read historical registry at '${hf}': ${hfErr.message}`);
         }
-      } catch (hErr) {
-        if (hErr.message?.includes('JOURNAL_ROLLBACK_DETECTED')) throw hErr;
       }
+    }
+  }
+
+  // Now inspect the journal file
+  if (!fs.existsSync(journalPath)) {
+    if (expectedMinHeadIndex >= 0) {
+      throw new Error(`[JOURNAL_ROLLBACK_DETECTED] Journal file missing in established installation with recorded high-water mark headIndex ${expectedMinHeadIndex}`);
     }
     return revokedMap;
   }
@@ -1513,6 +1529,16 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
   }
 
   const lines = content.split(/\r?\n/).filter(l => l.trim().length > 0);
+
+  // R23-B01: If journal exists but is empty or truncated below expectedMinHeadIndex, FAIL CLOSED!
+  if (lines.length === 0) {
+    if (expectedMinHeadIndex >= 0) {
+      throw new Error(`[JOURNAL_ROLLBACK_DETECTED] [JOURNAL_TRUNCATION_DETECTED] Journal file is empty (0 entries) in established installation with recorded high-water mark headIndex ${expectedMinHeadIndex}`);
+    }
+    return revokedMap;
+  }
+
+  let maxJournalIndex = -1;
   for (let i = 0; i < lines.length; i++) {
     let parsed;
     try {
@@ -1526,13 +1552,22 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
     if (typeof parsed.targetId !== 'string' || !parsed.targetId.trim()) {
       throw new Error(`[JOURNAL_CORRUPTION_DETECTED] Missing targetId in revocation journal '${journalPath}' at line ${i + 1}`);
     }
+    const entryIdx = typeof parsed.entryIndex === 'number' ? parsed.entryIndex : i;
+    if (entryIdx > maxJournalIndex) {
+      maxJournalIndex = entryIdx;
+    }
     if (parsed.revocationType === REVOCATION_TYPES.KEY_REVOCATION || parsed.revocationType === 'KEY_REVOCATION') {
       if (!revokedMap.has(parsed.targetId)) {
-        const idx = typeof parsed.entryIndex === 'number' ? parsed.entryIndex : i;
-        revokedMap.set(parsed.targetId, idx);
+        revokedMap.set(parsed.targetId, entryIdx);
       }
     }
   }
+
+  // R23-B01: Truncation check against recorded physical anchors
+  if (expectedMinHeadIndex >= 0 && maxJournalIndex < expectedMinHeadIndex) {
+    throw new Error(`[JOURNAL_ROLLBACK_DETECTED] [JOURNAL_TRUNCATION_DETECTED] Journal file truncated: contains entries up to index ${maxJournalIndex} but established installation recorded high-water mark headIndex ${expectedMinHeadIndex}`);
+  }
+
   return revokedMap;
 }
 

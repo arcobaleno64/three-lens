@@ -6246,6 +6246,10 @@ test('R22-B01: Journal read failure / corruption enforces strict Default-Deny Fa
     { ...opts, signerKeyId: rootAuth.keyId, signerPrivateKey: rootAuth.privateKey }
   );
 
+  const supRegPath = path.join(tempDir, 'supervisor-trust-registry.json');
+  const legacyRegPath = path.join(tempDir, 'trust-registry.json');
+  const v2WithHwm = JSON.parse(fs.readFileSync(supRegPath, 'utf8'));
+
   const journalPath = path.join(tempDir, '.irv-revocation-journal.jsonl');
   const validJournalContent = fs.readFileSync(journalPath, 'utf8');
 
@@ -6270,6 +6274,23 @@ test('R22-B01: Journal read failure / corruption enforces strict Default-Deny Fa
     /\[JOURNAL_CORRUPTION_DETECTED\].*Missing targetId/
   );
 
+  // --- Sub-test 2.5 (R23-B01): Journal truncated to 0 bytes / empty string triggers JOURNAL_ROLLBACK_DETECTED ---
+  fs.writeFileSync(journalPath, '', 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[JOURNAL_ROLLBACK_DETECTED\]/
+  );
+  assert.throws(
+    () => createAuthorizedRegistryUpdate(v2Reg, { activeKeyId: rogueAuthB.keyId }, delegatedAuthA.keyId, delegatedAuthA.privateKey, opts),
+    /\[REVOCATION_STATUS_UNVERIFIABLE\]/
+  );
+  const emptyValidation = validateTrustRegistry(v2Reg, opts);
+  assert.strictEqual(emptyValidation.valid, false);
+  assert.match(emptyValidation.error, /\[REVOCATION_STATUS_UNVERIFIABLE\]/);
+
+  // Restore journal to valid state
+  fs.writeFileSync(journalPath, validJournalContent, 'utf8');
+
   // --- Sub-test 3: Deleted journal in established directory triggers JOURNAL_ROLLBACK_DETECTED ---
   fs.unlinkSync(journalPath);
   assert.throws(
@@ -6288,6 +6309,14 @@ test('R22-B01: Journal read failure / corruption enforces strict Default-Deny Fa
   // Construct candidate v3 signed by revoked key A attempting to grant ACTIVE authority to B
   const journalEntry0 = JSON.parse(validJournalContent.trim());
   const entry0Digest = sha256Digest(canonicalJsonStringify(journalEntry0));
+  const hwmUpdatedAt = new Date().toISOString();
+  const hwmSignPayload = Buffer.from(canonicalJsonStringify({
+    headIndex: 0,
+    headDigest: entry0Digest,
+    updatedAt: hwmUpdatedAt,
+    authorizedBy: rootAuth.keyId
+  }), 'utf8');
+  const hwmSignature = crypto.sign(null, hwmSignPayload, rootAuth.privateKey).toString('hex');
 
   const updatePayload = {
     schemaVersion: '1.0.0',
@@ -6306,14 +6335,16 @@ test('R22-B01: Journal read failure / corruption enforces strict Default-Deny Fa
       headIndex: 0,
       headDigest: entry0Digest,
       authorizedBy: rootAuth.keyId,
-      updatedAt: new Date().toISOString()
+      updatedAt: hwmUpdatedAt,
+      signature: hwmSignature
     }
   };
+  const authPayload = computeRegistryAuthorizationPayload(updatePayload);
   updatePayload.authorizationProof = {
     authorizedBy: delegatedAuthA.keyId,
     signature: crypto.sign(
       null,
-      Buffer.from(computeRegistryNonHwmDigest(updatePayload), 'utf8'),
+      Buffer.from(authPayload, 'utf8'),
       delegatedAuthA.privateKey
     ).toString('hex')
   };
@@ -6332,8 +6363,9 @@ test('R22-B01: Journal read failure / corruption enforces strict Default-Deny Fa
   );
 
   // Ensure disk injection of forged v3 is strictly rejected by loadTrustRegistry
-  const regPath = path.join(tempDir, 'trust-registry.json');
-  fs.writeFileSync(regPath, JSON.stringify(updatePayload, null, 2), 'utf8');
+  // Write to both supervisor-trust-registry.json and trust-registry.json (R23-B02 & R23-B03)
+  fs.writeFileSync(supRegPath, JSON.stringify(updatePayload, null, 2), 'utf8');
+  fs.writeFileSync(legacyRegPath, JSON.stringify(updatePayload, null, 2), 'utf8');
   assert.throws(
     () => loadTrustRegistry(opts),
     /\[REVOCATION_STATUS_UNVERIFIABLE\]|Corrupt trust registry/
@@ -6348,9 +6380,12 @@ test('R22-B01: Journal read failure / corruption enforces strict Default-Deny Fa
     /Failed to read trust registry|\[REVOCATION_STATUS_UNVERIFIABLE\]|\[TRUST_REGISTRY_INVALID\]|Cannot load revocation journal/
   );
 
-  // Restore valid journal and registry
+  // Restore valid journal and registry matching history/trust-registry.v2.json
+  const histV2Path = path.join(tempDir, 'history', 'trust-registry.v2.json');
+  const validV2Hist = fs.readFileSync(histV2Path, 'utf8');
   fs.writeFileSync(journalPath, validJournalContent, 'utf8');
-  fs.writeFileSync(regPath, JSON.stringify(v2Reg, null, 2), 'utf8');
+  fs.writeFileSync(supRegPath, validV2Hist, 'utf8');
+  fs.writeFileSync(legacyRegPath, validV2Hist, 'utf8');
 
   // Verify historical chain v1/v2 remains valid
   const cleanLoad = loadTrustRegistry(opts);
