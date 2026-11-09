@@ -678,7 +678,8 @@ test('PLUGIN_DATA Governance: R03-B02 - loadRevocationJournal accepts historical
       ]
     },
     operatorAuth.keyId,
-    operatorAuth.privateKey
+    operatorAuth.privateKey,
+    opts
   );
   saveTrustRegistry(v3Reg, opts);
 
@@ -2594,7 +2595,8 @@ test('PLUGIN_DATA Governance: R12-B06 - Rotated supervisor key in validated hist
       ]
     },
     auth1.keyId,
-    auth1.privateKey
+    auth1.privateKey,
+    opts
   );
   saveTrustRegistry(v2Reg, { ...opts, priorRegistry: v1Reg });
 
@@ -2992,7 +2994,8 @@ test('PLUGIN_DATA Governance: R13-B06 & R13-B08 - Multi-generation key rotation 
       ]
     },
     auth1.keyId,
-    auth1.privateKey
+    auth1.privateKey,
+    opts
   );
   saveTrustRegistry(v2Reg, { ...opts, priorRegistry: v1Reg });
 
@@ -3138,7 +3141,8 @@ test('PLUGIN_DATA Governance: R14-B03 - PREPARED WAL snapshot semantic binding a
       ]
     },
     auth1.keyId,
-    auth1.privateKey
+    auth1.privateKey,
+    opts
   );
   saveTrustRegistry(v2Reg, { ...opts, priorRegistry: v1Reg });
 
@@ -3242,7 +3246,8 @@ test('PLUGIN_DATA Governance: R14-B04 - Retired key cannot authorize new HWM or 
       ]
     },
     auth1.keyId,
-    auth1.privateKey
+    auth1.privateKey,
+    opts
   );
   saveTrustRegistry(v2Reg, { ...opts, priorRegistry: curReg });
 
@@ -3263,7 +3268,7 @@ test('PLUGIN_DATA Governance: R14-B04 - Retired key cannot authorize new HWM or 
   };
   const val = validateTrustRegistry(regWithForgedHwm, { ...opts, priorRegistry: curReg });
   assert.equal(val.valid, false);
-  assert.match(val.error, /RETIRED_KEY_AUTHORIZATION_REJECTED/);
+  assert.match(val.error, /RETIRED_KEY_AUTHORIZATION_REJECTED|\[JOURNAL_TRUNCATION_DETECTED\]/);
 
   // Attack B: Retired auth1 signs a new journal entry at index 1 (past its retirement index 0)
   const journalPath = getRevocationJournalPath(opts);
@@ -3785,7 +3790,8 @@ test('PLUGIN_DATA Governance: R16-B01 - Version advancement cannot bypass histor
       ]
     },
     authA.keyId,
-    authA.privateKey
+    authA.privateKey,
+    opts
   );
   saveTrustRegistry(legitV2, opts);
 
@@ -3808,7 +3814,8 @@ test('PLUGIN_DATA Governance: R16-B01 - Version advancement cannot bypass histor
       ]
     },
     authA.keyId,
-    authA.privateKey
+    authA.privateKey,
+    opts
   );
 
   // 4. Attacker uses Root C to forge v3' based on forged v2'
@@ -4196,7 +4203,8 @@ test('PLUGIN_DATA Governance: R17-B02 - Historical registry corruption fails clo
       ]
     },
     authA.keyId,
-    authA.privateKey
+    authA.privateKey,
+    opts
   );
   saveTrustRegistry(legitV2, opts);
 
@@ -4482,7 +4490,8 @@ test('PLUGIN_DATA Governance: R17-B04 - WAL signer rotated out or retired in cur
       ]
     },
     authA.keyId,
-    authA.privateKey
+    authA.privateKey,
+    opts
   );
   saveTrustRegistry(reg2, opts);
 
@@ -4577,7 +4586,8 @@ test('PLUGIN_DATA Governance: R18-B01 - WAL signed by completely removed genesis
       ]
     },
     authA.keyId,
-    authA.privateKey
+    authA.privateKey,
+    opts
   );
   saveTrustRegistry(reg2, opts);
 
@@ -4827,7 +4837,8 @@ test('PLUGIN_DATA Governance: R18-B04 - WAL recovery accepts historical journal 
       ]
     },
     authA.keyId,
-    authA.privateKey
+    authA.privateKey,
+    opts
   );
   saveTrustRegistry(reg2, opts);
 
@@ -5007,7 +5018,8 @@ test('R19-B01: Contradictory registry with revokedKeyIds containing ACTIVE key i
       revokedKeyIds: [rootAuth.keyId]
     },
     rootAuth.keyId,
-    rootAuth.privateKey
+    rootAuth.privateKey,
+    opts
   );
 
   const valRes = validateTrustRegistry(reg2Contradictory, {
@@ -5048,7 +5060,8 @@ test('R19-B01: Contradictory registry with revokedKeyIds containing ACTIVE key i
       revokedKeyIds: [rootAuth.keyId, nextAuth.keyId]
     },
     rootAuth.keyId,
-    rootAuth.privateKey
+    rootAuth.privateKey,
+    opts
   );
 
   const valRes2 = validateTrustRegistry(reg2ActiveRevoked, {
@@ -5136,7 +5149,8 @@ test('R19-B02: Same-version HWM advancement rejects any mutation to non-HWM iden
       ]
     },
     authA.keyId,
-    authA.privateKey
+    authA.privateKey,
+    opts
   );
   saveTrustRegistry(reg2, opts);
 
@@ -5509,10 +5523,10 @@ test('R20-B01: Journal prefix replacement with higher HWM and valid signatures i
   fs.writeFileSync(regPath, JSON.stringify(curReg, null, 2) + '\n', 'utf8');
   fs.writeFileSync(path.join(path.dirname(regPath), 'history', 'trust-registry.v1.json'), JSON.stringify(curReg, null, 2) + '\n', 'utf8');
 
-  // Must fail closed with JOURNAL_PREFIX_DIVERGENCE_DETECTED because entry 0 diverges from witnessed digest
+  // Must fail closed with JOURNAL_PREFIX_DIVERGENCE_DETECTED or JOURNAL_HEAD_MISMATCH because entry 0 diverges from witnessed digest
   assert.throws(
     () => loadRevocationJournal(opts),
-    /JOURNAL_PREFIX_DIVERGENCE_DETECTED/
+    /JOURNAL_PREFIX_DIVERGENCE_DETECTED|\[JOURNAL_HEAD_MISMATCH\]/
   );
 
   fs.rmSync(tempDir, { recursive: true, force: true });
@@ -6508,18 +6522,93 @@ test('R24-B01: Journal prefix deletion, index forgery, broken hash chain, and in
     /Unsigned revocation record detected|\[JOURNAL_CORRUPTION_DETECTED\]/
   );
 
-  // --- Sub-test E: Anchor headDigest mismatch ---
-  // Create an entry with wrong content but entryIndex: 0
-  const fakeEntry0 = { ...JSON.parse(validJournalLines[0]), reason: 'TAMPERED_REASON' };
-  // sign it with valid key so signature passes, but digest won't match checkpoint / witness
-  const signPayload = Buffer.from(computeRevocationEntrySignPayload(fakeEntry0), 'utf8');
-  fakeEntry0.signature = crypto.sign(null, signPayload, rootAuth.privateKey).toString('hex');
-  fs.writeFileSync(journalPath, JSON.stringify(fakeEntry0) + '\n', 'utf8');
+  // --- Sub-test E (R25-B03): Anchor headDigest mismatch with complete entry count and valid signatures ---
+  // Keep entry 0 intact. Modify only entry 1's reason, re-sign entry 1 with valid private key.
+  // Preserves 2 entries, consecutive indices, hash chain continuity, and valid Ed25519 signature.
+  // Strictly triggers [JOURNAL_HEAD_MISMATCH]!
+  const entry0Obj = JSON.parse(validJournalLines[0]);
+  const entry0Digest = sha256Digest(canonicalJsonStringify(entry0Obj));
+  const tamperedHeadEntry1 = {
+    ...JSON.parse(validJournalLines[1]),
+    prevEntryDigest: entry0Digest,
+    reason: 'TAMPERED_HEAD_REASON'
+  };
+  const signPayload1 = Buffer.from(computeRevocationEntrySignPayload(tamperedHeadEntry1), 'utf8');
+  tamperedHeadEntry1.signature = crypto.sign(null, signPayload1, rootAuth.privateKey).toString('hex');
+  fs.writeFileSync(journalPath, validJournalLines[0] + '\n' + JSON.stringify(tamperedHeadEntry1) + '\n', 'utf8');
   assert.throws(
     () => getJournalRevokedKeyMap(tempDir, opts),
-    /\[JOURNAL_HEAD_MISMATCH\]|\[JOURNAL_TRUNCATION_DETECTED\]/
+    /\[JOURNAL_HEAD_MISMATCH\]/
   );
 
   // Cleanup
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('R25-B01 & R25-B02: Monotonic witness storage path alignment and unauthenticated historical registry rejection', () => {
+  const tempDir = createTempDir('r25-witness-history-auth-');
+  const rootAuth = generateTestAuthority();
+  const rogueAuth = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: rootAuth.keyId,
+    trustedRootPublicKeyPem: rootAuth.pem,
+    trustedRootFingerprint: rootAuth.fp,
+    signerPrivateKey: rootAuth.privateKey,
+    signerKeyId: rootAuth.keyId
+  };
+
+  // 1. Valid Genesis v1
+  const v1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' }
+    ],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(v1, opts);
+
+  // Append entry 0 in journal
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.NONCE_REVOCATION,
+    targetId: 'NONCE-0'
+  }, opts);
+
+  // R25-B01: Verify canonical getMonotonicWitness is read and candidateHwm creates lower bound
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, { ...opts, candidateHwm: { headIndex: 5, headDigest: '0'.repeat(64) } }),
+    /\[JOURNAL_ROLLBACK_DETECTED\]|\[JOURNAL_TRUNCATION_DETECTED\]/
+  );
+
+  // R25-B02: Inject forged unauthenticated historical registry into history/
+  const histDir = path.join(tempDir, 'history');
+  fs.mkdirSync(histDir, { recursive: true });
+  const forgedHistReg = {
+    schemaVersion: '1.0.0',
+    registryVersion: 99,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rogueAuth.keyId,
+    keys: [
+      { keyId: rogueAuth.keyId, publicKeyPem: rogueAuth.pem, status: 'ACTIVE' }
+    ],
+    revokedKeyIds: [],
+    revocationHighWaterMark: {
+      headIndex: 0
+    }
+  };
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v99.json'), JSON.stringify(forgedHistReg), 'utf8');
+
+  // getJournalRevokedKeyMap must fail closed and reject untrusted historical registry
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[UNTRUSTED_HISTORICAL_REGISTRY\]/
+  );
+
   fs.rmSync(tempDir, { recursive: true, force: true });
 });

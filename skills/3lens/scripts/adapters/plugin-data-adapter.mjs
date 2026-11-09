@@ -450,7 +450,7 @@ export function withFileLock(targetFile, fn, options = {}) {
       fs.writeFileSync(lockFd, info, 'utf8');
       break;
     } catch (err) {
-      if (err.code === 'EEXIST') {
+      if (err.code === 'EEXIST' || (process.platform === 'win32' && (err.code === 'EPERM' || err.code === 'EBUSY'))) {
         try {
           const stats = fs.statSync(lockFile);
           if (Date.now() - stats.mtimeMs > staleTimeoutMs) {
@@ -689,6 +689,11 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
       const vB = parseInt(b.match(/^trust-registry\.v(\d+)\.json$/)[1], 10);
       return vA - vB;
     });
+
+    let priorVerifiedReg = null;
+    const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
+    const rootPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
+
     for (const hf of histFiles) {
       hasHistoryFiles = true;
       let hReg = null;
@@ -700,6 +705,50 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
         }
         continue;
       }
+
+      // R25-B02: Authenticate historical registry against Root / priorRegistry before trusting its keys
+      if (hReg.registryVersion === 1) {
+        const rootKey = hReg.keys?.find(k => k.keyId === rootId && k.status === 'ACTIVE_PINNED_ROOT');
+        if (!rootKey || rootKey.publicKeyPem !== rootPem) {
+          if (options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] Historical genesis v1 in ${hf} is not authorized by trusted root key`);
+          }
+          continue;
+        }
+        priorVerifiedReg = hReg;
+      } else if (priorVerifiedReg && hReg.registryVersion === priorVerifiedReg.registryVersion + 1) {
+        const proof = hReg.authorizationProof;
+        if (!proof || typeof proof.signature !== 'string' || typeof proof.authorizedBy !== 'string') {
+          if (options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] Historical registry ${hf} lacks valid authorizationProof`);
+          }
+          continue;
+        }
+        const signerInPrior = priorVerifiedReg.keys?.find(
+          k => k.keyId === proof.authorizedBy && ['ACTIVE_PINNED_ROOT', 'ACTIVE'].includes(k.status)
+        );
+        if (!signerInPrior) {
+          if (options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] Signer '${proof.authorizedBy}' for historical registry ${hf} was not active in prior version`);
+          }
+          continue;
+        }
+        const payload = Buffer.from(computeRegistryAuthorizationPayload(hReg), 'utf8');
+        const isSigValid = crypto.verify(null, payload, signerInPrior.publicKeyPem, Buffer.from(proof.signature, 'hex'));
+        if (!isSigValid) {
+          if (options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] Cryptographic authorization verification failed for historical registry ${hf}`);
+          }
+          continue;
+        }
+        priorVerifiedReg = hReg;
+      } else {
+        if (options.failClosed !== false) {
+          throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] Historical registry ${hf} has broken version ancestry (expected ${priorVerifiedReg ? priorVerifiedReg.registryVersion + 1 : 1})`);
+        }
+        continue;
+      }
+
       const hHwmIdx = typeof hReg?.revocationHighWaterMark?.headIndex === 'number'
         ? hReg.revocationHighWaterMark.headIndex
         : -1;
@@ -1445,7 +1494,6 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
   }
   const journalPath = path.join(dir, '.irv-revocation-journal.jsonl');
   const checkpointPath = path.join(dir, 'supervisor-revocation-checkpoint.json');
-  const witnessPath = path.join(dir, '.irv-monotonic-witness.json');
   const histDir = path.join(dir, 'history');
 
   // R23-B01, R23-B02 & R24-B01: Check all physical anchors in dir to detect established revocation HWM.
@@ -1490,18 +1538,26 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
     }
   }
 
-  // 3. Monotonic witness
-  if (fs.existsSync(witnessPath)) {
-    try {
-      const wit = JSON.parse(fs.readFileSync(witnessPath, 'utf8'));
-      if (typeof wit?.maxSeenHwmHeadIndex === 'number' && wit.maxSeenHwmHeadIndex >= 0) {
-        expectedMinHeadIndex = Math.max(expectedMinHeadIndex, wit.maxSeenHwmHeadIndex);
-        if (typeof wit.maxSeenHwmHeadDigest === 'string' && wit.maxSeenHwmHeadDigest) {
-          physicalAnchors.push({ headIndex: wit.maxSeenHwmHeadIndex, headDigest: wit.maxSeenHwmHeadDigest, source: 'witness' });
-        }
+  // 3. Monotonic witness via canonical getMonotonicWitness (R25-B01: reads both local and system witness)
+  try {
+    const wit = getMonotonicWitness(dir, options);
+    if (typeof wit?.maxSeenHwmHeadIndex === 'number' && wit.maxSeenHwmHeadIndex >= 0) {
+      expectedMinHeadIndex = Math.max(expectedMinHeadIndex, wit.maxSeenHwmHeadIndex);
+      if (typeof wit.maxSeenHwmHeadDigest === 'string' && wit.maxSeenHwmHeadDigest) {
+        physicalAnchors.push({ headIndex: wit.maxSeenHwmHeadIndex, headDigest: wit.maxSeenHwmHeadDigest, source: 'witness' });
       }
-    } catch (wErr) {
-      throw new Error(`[WITNESS_READ_FAILURE] Failed to read witness at '${witnessPath}': ${wErr.message}`);
+    }
+  } catch (wErr) {
+    throw new Error(`[WITNESS_READ_FAILURE] Failed to read monotonic witness for '${dir}': ${wErr.message}`);
+  }
+
+  // 3b. Caller-supplied candidate HWM (R25-B01: enforces candidate boundary)
+  if (options.candidateHwm && typeof options.candidateHwm === 'object') {
+    if (typeof options.candidateHwm.headIndex === 'number' && options.candidateHwm.headIndex >= 0) {
+      expectedMinHeadIndex = Math.max(expectedMinHeadIndex, options.candidateHwm.headIndex);
+      if (typeof options.candidateHwm.headDigest === 'string' && options.candidateHwm.headDigest) {
+        physicalAnchors.push({ headIndex: options.candidateHwm.headIndex, headDigest: options.candidateHwm.headDigest, source: 'candidateHwm' });
+      }
     }
   }
 
@@ -1949,6 +2005,36 @@ export function validateTrustRegistry(registry, options = {}) {
     };
   }
 
+  // High-water mark structural and signature validation if present (R05-B01)
+  if (registry.revocationHighWaterMark !== undefined && registry.revocationHighWaterMark !== null) {
+    const hwm = registry.revocationHighWaterMark;
+    if (
+      typeof hwm !== 'object' ||
+      typeof hwm.headIndex !== 'number' ||
+      hwm.headIndex < 0 ||
+      typeof hwm.headDigest !== 'string' ||
+      !/^[0-9a-f]{64}$/i.test(hwm.headDigest)
+    ) {
+      return {
+        valid: false,
+        error: 'Malformed revocationHighWaterMark in trust registry',
+        cryptographicValidity: false,
+        monotonicValidity: true,
+        ancestryContinuity: true
+      };
+    }
+
+    if (typeof hwm.signature !== 'string' || !hwm.signature.trim() || typeof hwm.authorizedBy !== 'string' || !hwm.authorizedBy.trim()) {
+      return {
+        valid: false,
+        error: '[HIGH_WATER_MARK_SIGNATURE_MISSING] revocationHighWaterMark requires authorizedBy and cryptographic signature',
+        cryptographicValidity: false,
+        monotonicValidity: true,
+        ancestryContinuity: true
+      };
+    }
+  }
+
   let journalRevoked = new Map();
   if (registryDir && options.skipJournalRevocationCheck !== true) {
     try {
@@ -1999,34 +2085,9 @@ export function validateTrustRegistry(registry, options = {}) {
     }
   }
 
-  // High-water mark validation if present (R05-B01)
+  // High-water mark signer lifecycle validation against priorReg (R08-B05)
   if (registry.revocationHighWaterMark !== undefined && registry.revocationHighWaterMark !== null) {
     const hwm = registry.revocationHighWaterMark;
-    if (
-      typeof hwm !== 'object' ||
-      typeof hwm.headIndex !== 'number' ||
-      hwm.headIndex < 0 ||
-      typeof hwm.headDigest !== 'string' ||
-      !/^[0-9a-f]{64}$/i.test(hwm.headDigest)
-    ) {
-      return {
-        valid: false,
-        error: 'Malformed revocationHighWaterMark in trust registry',
-        cryptographicValidity: false,
-        monotonicValidity: true,
-        ancestryContinuity: true
-      };
-    }
-
-    if (typeof hwm.signature !== 'string' || !hwm.signature.trim() || typeof hwm.authorizedBy !== 'string' || !hwm.authorizedBy.trim()) {
-      return {
-        valid: false,
-        error: '[HIGH_WATER_MARK_SIGNATURE_MISSING] revocationHighWaterMark requires authorizedBy and cryptographic signature',
-        cryptographicValidity: false,
-        monotonicValidity: true,
-        ancestryContinuity: true
-      };
-    }
 
     // R08-B05: Signer must not have been already revoked in priorRegistry.
     // However, if the key was active when it signed the historical HWM and only revoked in this version,
