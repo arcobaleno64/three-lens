@@ -76,13 +76,18 @@
     "test:operator-metrics": "node scripts/test-operator-metrics.mjs"
   },
   "keywords": [
+    "three-lens",
+    "3lens",
     "antigravity",
     "agy",
     "security-audit",
-    "claude-security",
-    "codex-security",
+    "vulnerability-verification",
     "sarif",
-    "cvss-v4",
+    "nist-ssdf",
+    "owasp-asvs",
+    "cvss",
+    "appsec",
+    "devsecops",
     "subagents",
     "code-review"
   ]

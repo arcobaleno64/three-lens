@@ -664,17 +664,19 @@ test('PLUGIN_DATA Governance: R03-B02 - loadRevocationJournal accepts historical
     { ...opts, signerPrivateKey: operatorAuth.privateKey, signerKeyId: operatorAuth.keyId }
   );
 
-  // Rotate to v3 retiring operatorAuth
+  // Rotate to v3 retiring operatorAuth and activating operator2Auth (Root remains RETIRED, immutable under delegated signing)
+  const operator2Auth = generateTestAuthority();
   const currentReg = loadTrustRegistry(opts).registry;
   const v3Reg = createAuthorizedRegistryUpdate(
     currentReg,
     {
-      activeKeyId: rootAuth.keyId,
-      activeKeyFingerprint: rootAuth.fp,
-      activePublicKeyPem: rootAuth.pem,
+      activeKeyId: operator2Auth.keyId,
+      activeKeyFingerprint: operator2Auth.fp,
+      activePublicKeyPem: operator2Auth.pem,
       keys: [
-        { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' },
-        { keyId: operatorAuth.keyId, keyFingerprint: operatorAuth.fp, publicKeyPem: operatorAuth.pem, status: 'RETIRED', issuedAt: '2026-10-16T06:55:39.565Z' }
+        { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'RETIRED', issuedAt: '2026-10-16T06:55:39.565Z' },
+        { keyId: operatorAuth.keyId, keyFingerprint: operatorAuth.fp, publicKeyPem: operatorAuth.pem, status: 'RETIRED', issuedAt: '2026-10-16T06:55:39.565Z' },
+        { keyId: operator2Auth.keyId, keyFingerprint: operator2Auth.fp, publicKeyPem: operator2Auth.pem, status: 'ACTIVE', issuedAt: '2026-10-16T06:55:39.565Z' }
       ]
     },
     operatorAuth.keyId,
@@ -7288,6 +7290,212 @@ test('PLUGIN_DATA Governance: R33-B01 - Delegated signer cannot mutate or retire
       opts
     );
   }, /\[REVOKED_KEY_AUTHORIZATION_REJECTED\]/);
+
+  // Scenario 6 (R35-B01): Delegated key K attempts to omit RETIRED Root from keys[] with valid Ed25519 signature
+  const tempDirRetired = createTempDir('retired-root-omission-');
+  const optsRetired = {
+    pluginDataDir: tempDirRetired,
+    allowInWorkspace: true,
+    trustedRootKeyId: rootAuth.keyId,
+    trustedRootPublicKeyPem: rootAuth.pem,
+    trustedRootFingerprint: rootAuth.fp
+  };
+  saveTrustRegistry(v1, optsRetired);
+  const v2RetiredRoot = createAuthorizedRegistryUpdate(
+    v1,
+    {
+      activeKeyId: delegatedK.keyId,
+      activeKeyFingerprint: delegatedK.fp,
+      activePublicKeyPem: delegatedK.pem,
+      keys: [
+        { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'RETIRED', issuedAt: '2026-01-01T00:00:00.000Z' },
+        { keyId: delegatedK.keyId, keyFingerprint: delegatedK.fp, publicKeyPem: delegatedK.pem, status: 'ACTIVE', issuedAt: '2026-01-02T00:00:00.000Z' }
+      ]
+    },
+    rootAuth.keyId,
+    rootAuth.privateKey,
+    optsRetired
+  );
+  saveTrustRegistry(v2RetiredRoot, optsRetired);
+
+  // 6a: K attempts to create update omitting RETIRED Root
+  assert.throws(() => {
+    createAuthorizedRegistryUpdate(
+      v2RetiredRoot,
+      {
+        activeKeyId: delegatedK.keyId,
+        activeKeyFingerprint: delegatedK.fp,
+        activePublicKeyPem: delegatedK.pem,
+        keys: [
+          { keyId: delegatedK.keyId, keyFingerprint: delegatedK.fp, publicKeyPem: delegatedK.pem, status: 'ACTIVE', issuedAt: '2026-01-02T00:00:00.000Z' }
+        ]
+      },
+      delegatedK.keyId,
+      delegatedK.privateKey,
+      optsRetired
+    );
+  }, /\[DELEGATED_ROOT_MUTATION_REJECTED\]/);
+
+  // 6b: External forged v3 signed by K with valid Ed25519 signature omitting RETIRED Root
+  const forgedV3OmitRetiredRoot = {
+    ...v2RetiredRoot,
+    registryVersion: 3,
+    keys: v2RetiredRoot.keys.filter(k => k.keyId !== rootAuth.keyId)
+  };
+  forgedV3OmitRetiredRoot.authorizationProof = {
+    authorizedBy: delegatedK.keyId,
+    signature: crypto.sign(
+      null,
+      Buffer.from(computeRegistryAuthorizationPayload(forgedV3OmitRetiredRoot), 'utf8'),
+      delegatedK.privateKey
+    ).toString('hex'),
+    timestamp: new Date().toISOString()
+  };
+  const valResOmitRetired = validateTrustRegistry(forgedV3OmitRetiredRoot, { ...optsRetired, priorRegistry: v2RetiredRoot });
+  assert.strictEqual(valResOmitRetired.valid, false);
+  assert.match(valResOmitRetired.error, /\[DELEGATED_ROOT_MUTATION_REJECTED\]/);
+  assert.throws(
+    () => saveTrustRegistry(forgedV3OmitRetiredRoot, { ...optsRetired, priorRegistry: v2RetiredRoot }),
+    /\[DELEGATED_ROOT_MUTATION_REJECTED\]/
+  );
+  const forgedV3RetiredPath = getTrustRegistryPath(optsRetired);
+  fs.writeFileSync(forgedV3RetiredPath, JSON.stringify(forgedV3OmitRetiredRoot, null, 2), 'utf8');
+  assert.throws(
+    () => loadTrustRegistry({ ...optsRetired, failClosed: true }),
+    /\[DELEGATED_ROOT_MUTATION_REJECTED\]/
+  );
+  fs.writeFileSync(forgedV3RetiredPath, JSON.stringify(v2RetiredRoot, null, 2) + '\n', 'utf8');
+
+  // Scenario 7 (R35-B01): Delegated key K attempts to resurrect RETIRED Root to ACTIVE_PINNED_ROOT
+  assert.throws(() => {
+    createAuthorizedRegistryUpdate(
+      v2RetiredRoot,
+      {
+        activeKeyId: rootAuth.keyId,
+        activeKeyFingerprint: rootAuth.fp,
+        activePublicKeyPem: rootAuth.pem,
+        keys: [
+          { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-01-01T00:00:00.000Z' },
+          { keyId: delegatedK.keyId, keyFingerprint: delegatedK.fp, publicKeyPem: delegatedK.pem, status: 'RETIRED', issuedAt: '2026-01-02T00:00:00.000Z' }
+        ]
+      },
+      delegatedK.keyId,
+      delegatedK.privateKey,
+      optsRetired
+    );
+  }, /\[DELEGATED_ROOT_MUTATION_REJECTED\]/);
+
+  const forgedV3ResurrectRoot = {
+    ...v2RetiredRoot,
+    registryVersion: 3,
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-01-01T00:00:00.000Z' },
+      { keyId: delegatedK.keyId, keyFingerprint: delegatedK.fp, publicKeyPem: delegatedK.pem, status: 'RETIRED', issuedAt: '2026-01-02T00:00:00.000Z' }
+    ]
+  };
+  forgedV3ResurrectRoot.authorizationProof = {
+    authorizedBy: delegatedK.keyId,
+    signature: crypto.sign(
+      null,
+      Buffer.from(computeRegistryAuthorizationPayload(forgedV3ResurrectRoot), 'utf8'),
+      delegatedK.privateKey
+    ).toString('hex'),
+    timestamp: new Date().toISOString()
+  };
+  const valResResurrect = validateTrustRegistry(forgedV3ResurrectRoot, { ...optsRetired, priorRegistry: v2RetiredRoot });
+  assert.strictEqual(valResResurrect.valid, false);
+  assert.match(valResResurrect.error, /\[DELEGATED_ROOT_MUTATION_REJECTED\]/);
+  assert.throws(
+    () => saveTrustRegistry(forgedV3ResurrectRoot, { ...optsRetired, priorRegistry: v2RetiredRoot }),
+    /\[DELEGATED_ROOT_MUTATION_REJECTED\]/
+  );
+  fs.writeFileSync(forgedV3RetiredPath, JSON.stringify(forgedV3ResurrectRoot, null, 2), 'utf8');
+  assert.throws(
+    () => loadTrustRegistry({ ...optsRetired, failClosed: true }),
+    /\[DELEGATED_ROOT_MUTATION_REJECTED\]/
+  );
+  fs.rmSync(tempDirRetired, { recursive: true, force: true });
+
+  // Scenario 8 (R35-B02): Delegated key K attempts to mutate Root keyFingerprint
+  const tempDirFp = createTempDir('fp-mutation-');
+  const optsFp = {
+    pluginDataDir: tempDirFp,
+    allowInWorkspace: true,
+    trustedRootKeyId: rootAuth.keyId,
+    trustedRootPublicKeyPem: rootAuth.pem,
+    trustedRootFingerprint: rootAuth.fp
+  };
+  saveTrustRegistry(v1, optsFp);
+  const v2Fp = createAuthorizedRegistryUpdate(
+    v1,
+    {
+      activeKeyId: delegatedK.keyId,
+      activeKeyFingerprint: delegatedK.fp,
+      activePublicKeyPem: delegatedK.pem,
+      keys: [
+        { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-01-01T00:00:00.000Z' },
+        { keyId: delegatedK.keyId, keyFingerprint: delegatedK.fp, publicKeyPem: delegatedK.pem, status: 'ACTIVE', issuedAt: '2026-01-02T00:00:00.000Z' }
+      ]
+    },
+    rootAuth.keyId,
+    rootAuth.privateKey,
+    optsFp
+  );
+  saveTrustRegistry(v2Fp, optsFp);
+
+  const forgedFp = sha256Digest('ROGUE_ROOT_FINGERPRINT_FORGERY');
+  assert.throws(() => {
+    createAuthorizedRegistryUpdate(
+      v2Fp,
+      {
+        activeKeyId: delegatedK.keyId,
+        activeKeyFingerprint: delegatedK.fp,
+        activePublicKeyPem: delegatedK.pem,
+        keys: [
+          { keyId: rootAuth.keyId, keyFingerprint: forgedFp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-01-01T00:00:00.000Z' },
+          { keyId: delegatedK.keyId, keyFingerprint: delegatedK.fp, publicKeyPem: delegatedK.pem, status: 'ACTIVE', issuedAt: '2026-01-02T00:00:00.000Z' }
+        ]
+      },
+      delegatedK.keyId,
+      delegatedK.privateKey,
+      optsFp
+    );
+  }, /\[DELEGATED_ROOT_MUTATION_REJECTED\]/);
+
+  const forgedV3MutateFp = {
+    ...v2Fp,
+    registryVersion: 3,
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: forgedFp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-01-01T00:00:00.000Z' },
+      { keyId: delegatedK.keyId, keyFingerprint: delegatedK.fp, publicKeyPem: delegatedK.pem, status: 'ACTIVE', issuedAt: '2026-01-02T00:00:00.000Z' }
+    ]
+  };
+  forgedV3MutateFp.authorizationProof = {
+    authorizedBy: delegatedK.keyId,
+    signature: crypto.sign(
+      null,
+      Buffer.from(computeRegistryAuthorizationPayload(forgedV3MutateFp), 'utf8'),
+      delegatedK.privateKey
+    ).toString('hex'),
+    timestamp: new Date().toISOString()
+  };
+  const valResMutateFp = validateTrustRegistry(forgedV3MutateFp, { ...optsFp, priorRegistry: v2Fp });
+  assert.strictEqual(valResMutateFp.valid, false);
+  assert.match(valResMutateFp.error, /\[ROOT_KEY_SUBSTITUTION_REJECTED\]/);
+  assert.throws(
+    () => saveTrustRegistry(forgedV3MutateFp, { ...optsFp, priorRegistry: v2Fp }),
+    /\[ROOT_KEY_SUBSTITUTION_REJECTED\]/
+  );
+  const forgedV3FpPath = getTrustRegistryPath(optsFp);
+  fs.writeFileSync(forgedV3FpPath, JSON.stringify(forgedV3MutateFp, null, 2), 'utf8');
+  assert.throws(
+    () => loadTrustRegistry({ ...optsFp, failClosed: true }),
+    /\[ROOT_KEY_SUBSTITUTION_REJECTED\]/
+  );
+  fs.rmSync(tempDirFp, { recursive: true, force: true });
 
   fs.rmSync(tempDir, { recursive: true, force: true });
 });

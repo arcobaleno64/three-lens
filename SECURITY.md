@@ -98,10 +98,10 @@ In security audit contexts, no single security perimeter can protect against all
 
 ## 3. Reporting Vulnerabilities
 
-If you discover a potential security vulnerability within `agy-security-audit`, please **do not** open a public GitHub issue.
+If you discover a potential security vulnerability within `three-lens`, please **do not** open a public GitHub issue.
 
 Instead, report it responsibly via either of:
-- **Private Security Disclosure** (preferred): Submit via [GitHub Security Advisories](https://github.com/arcobaleno64/agy-security-audit/security/advisories/new). It keeps the report, the discussion, and the eventual advisory in one place.
+- **Private Security Disclosure** (preferred): Submit via [GitHub Security Advisories](https://github.com/arcobaleno64/three-lens/security/advisories/new). It keeps the report, the discussion, and the eventual advisory in one place.
 - **Email**: <arcobaleno830623@gmail.com>, for anyone who cannot or would rather not use GitHub. This address is monitored by the maintainer; it is not a team inbox, so expect one person's response times.
 
 ### Response Expectations

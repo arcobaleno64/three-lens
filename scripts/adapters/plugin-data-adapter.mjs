@@ -664,6 +664,7 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
 
   const rootId = options.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
   const rootPem = options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM;
+  const rootFp = options.trustedRootFingerprint || (options.trustedRootPublicKeyPem ? sha256Digest(rootPem) : DEFAULT_SUPERVISOR_FINGERPRINT);
 
   let hasHistoryFiles = false;
   let priorVerifiedReg = null;
@@ -770,8 +771,8 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           continue;
         }
         const rootKey = hReg.keys[0];
-        // R27-B01: Bound strictly to trusted root key (custom option or default embedded root); self-proclaimed root rejected
-        if (rootKey.keyId !== rootId || rootKey.publicKeyPem !== rootPem) {
+        // R27-B01 & R35-B02: Bound strictly to trusted root key (custom option or default embedded root); self-proclaimed root or modified fingerprint rejected
+        if (rootKey.keyId !== rootId || rootKey.publicKeyPem !== rootPem || rootKey.keyFingerprint !== rootFp) {
           if (options.failClosed !== false) {
             throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] Historical genesis v1 in ${hf} is not authorized by trusted root key (expected '${rootId}', found '${rootKey.keyId}')`);
           }
@@ -800,14 +801,14 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           continue;
         }
 
-        // R31-B01: Root keyId, PEM, and status binding invariant in historical registry
+        // R31-B01 & R35-B02: Root keyId, PEM, and fingerprint binding invariant in historical registry
         let hasRogueRootInHist = false;
         let rogueRootReason = '';
         for (const hk of hReg.keys || []) {
           if (hk && hk.keyId === rootId) {
-            if (hk.publicKeyPem !== rootPem || hk.status === 'REVOKED') {
+            if (hk.publicKeyPem !== rootPem || hk.keyFingerprint !== rootFp || hk.status === 'REVOKED') {
               hasRogueRootInHist = true;
-              rogueRootReason = `Historical registry ${hf} attempts to substitute or revoke trusted root key '${rootId}'`;
+              rogueRootReason = `Historical registry ${hf} attempts to substitute, modify fingerprint of, or revoke trusted root key '${rootId}'`;
               break;
             }
           } else if (hk && hk.keyId !== rootId) {
@@ -853,14 +854,14 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           continue;
         }
 
-        // R33-B01 & R34-B01: If historical update is signed by a delegated key, root must remain present and ACTIVE_PINNED_ROOT
+        // R33-B01 & R34-B01 & R35-B01: If historical update is signed by a delegated key, root must remain present and retain identical status
         if (proof.authorizedBy !== rootId) {
           const rootInPrior = priorVerifiedReg.keys?.find(k => k.keyId === rootId);
           const rootInHist = hReg.keys?.find(k => k.keyId === rootId);
-          if (rootInPrior && rootInPrior.status === 'ACTIVE_PINNED_ROOT') {
-            if (!rootInHist || rootInHist.status !== 'ACTIVE_PINNED_ROOT') {
+          if (rootInPrior) {
+            if (!rootInHist || rootInHist.status !== rootInPrior.status) {
               if (options.failClosed !== false) {
-                const cause = !rootInHist ? 'omit sovereign root' : `set sovereign root to non-active status '${rootInHist.status}'`;
+                const cause = !rootInHist ? 'omit sovereign root' : `mutate sovereign root status from '${rootInPrior.status}' to '${rootInHist.status}'`;
                 throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] [DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${proof.authorizedBy}' cannot ${cause} '${rootId}'`);
               }
             }
@@ -957,14 +958,14 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           }
         }
 
-        // R31-B01: Root keyId, PEM, and status binding invariant in current registry
+        // R31-B01 & R35-B02: Root keyId, PEM, and fingerprint binding invariant in current registry
         let hasRogueRootInCur = false;
         let rogueRootCurReason = '';
         for (const ck of currentRegistry.keys || []) {
           if (ck && ck.keyId === rootId) {
-            if (ck.publicKeyPem !== rootPem || ck.status === 'REVOKED') {
+            if (ck.publicKeyPem !== rootPem || ck.keyFingerprint !== rootFp || ck.status === 'REVOKED') {
               hasRogueRootInCur = true;
-              rogueRootCurReason = `Current registry attempts to substitute or revoke trusted root key '${rootId}'`;
+              rogueRootCurReason = `Current registry attempts to substitute, modify fingerprint of, or revoke trusted root key '${rootId}'`;
               break;
             }
           } else if (ck && ck.keyId !== rootId) {
@@ -983,14 +984,14 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
 
         const proof = currentRegistry.authorizationProof;
         if (proof && typeof proof.signature === 'string' && typeof proof.authorizedBy === 'string') {
-          // R33-B01 & R34-B01: If signer is delegated, root must remain present and ACTIVE_PINNED_ROOT
+          // R33-B01 & R34-B01 & R35-B01: If signer is delegated, root must remain present and retain identical status
           if (proof.authorizedBy !== rootId) {
             const rootInPrior = priorVerifiedReg.keys?.find(k => k.keyId === rootId);
             const rootInCur = currentRegistry.keys?.find(k => k.keyId === rootId);
-            if (rootInPrior && rootInPrior.status === 'ACTIVE_PINNED_ROOT') {
-              if (!rootInCur || rootInCur.status !== 'ACTIVE_PINNED_ROOT') {
+            if (rootInPrior) {
+              if (!rootInCur || rootInCur.status !== rootInPrior.status) {
                 if (options.failClosed !== false) {
-                  const cause = !rootInCur ? 'omit sovereign root' : `set sovereign root to non-active status '${rootInCur.status}'`;
+                  const cause = !rootInCur ? 'omit sovereign root' : `mutate sovereign root status from '${rootInPrior.status}' to '${rootInCur.status}'`;
                   throw new Error(`[UNTRUSTED_CURRENT_REGISTRY] [DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${proof.authorizedBy}' cannot ${cause} '${rootId}'`);
                 }
               }
@@ -2425,10 +2426,10 @@ export function validateTrustRegistry(registry, options = {}) {
 
   if (rootKeyMatches.length === 1) {
     const rootKey = rootKeyMatches[0];
-    if (rootKey.publicKeyPem !== rootPem || rootKey.status === 'REVOKED') {
+    if (rootKey.publicKeyPem !== rootPem || rootKey.keyFingerprint !== rootFp || rootKey.status === 'REVOKED') {
       return {
         valid: false,
-        error: `[ROOT_KEY_SUBSTITUTION_REJECTED] Pinned root key '${rootId}' cannot have modified public key PEM or revoked status in keys[]`,
+        error: `[ROOT_KEY_SUBSTITUTION_REJECTED] Pinned root key '${rootId}' cannot have modified public key PEM, mismatched key fingerprint, or revoked status in keys[]`,
         cryptographicValidity: false,
         monotonicValidity: true,
         ancestryContinuity: true
@@ -2954,16 +2955,16 @@ export function validateTrustRegistry(registry, options = {}) {
       }
       signerPem = priorKey.publicKeyPem;
 
-      // R33-B01 & R34-B01: Delegated key cannot omit sovereign Root or mutate Root away from ACTIVE_PINNED_ROOT
+      // R33-B01 & R34-B01 & R35-B01: Delegated key cannot omit sovereign Root or mutate Root status / identity
       if (proof.authorizedBy !== rootId) {
         const rootInPrior = priorReg.keys?.find(k => k.keyId === rootId);
-        if (rootInPrior && rootInPrior.status === 'ACTIVE_PINNED_ROOT') {
+        if (rootInPrior) {
           const rootInCur = registry.keys?.find(k => k.keyId === rootId);
-          if (!rootInCur || rootInCur.status !== 'ACTIVE_PINNED_ROOT') {
-            const cause = !rootInCur ? 'omit sovereign root' : `set sovereign root to non-active status '${rootInCur.status}'`;
+          if (!rootInCur || rootInCur.status !== rootInPrior.status) {
+            const cause = !rootInCur ? 'omit sovereign root' : `mutate sovereign root status from '${rootInPrior.status}' to '${rootInCur.status}'`;
             return {
               valid: false,
-              error: `[DELEGATED_ROOT_MUTATION_REJECTED] Delegated authorization by '${proof.authorizedBy}' cannot ${cause} '${rootId}'; root status must remain ACTIVE_PINNED_ROOT`,
+              error: `[DELEGATED_ROOT_MUTATION_REJECTED] Delegated authorization by '${proof.authorizedBy}' cannot ${cause} '${rootId}'`,
               cryptographicValidity: false,
               monotonicValidity: true,
               ancestryContinuity: true
@@ -3027,17 +3028,25 @@ export function createAuthorizedRegistryUpdate(currentRegistry, updates, signerK
   // Fail-Closed: if revocation status cannot be verified due to journal read/corruption errors, reject.
   const effectiveOpts = options && typeof options === 'object' ? options : {};
 
-  // R33-B01: Delegated keys cannot mutate, retire, or revoke sovereign root anchor
+  // R33-B01 & R35-B01 & R35-B02: Delegated keys cannot mutate, retire, omit, or modify fingerprint of sovereign root anchor
   const effectiveRootId = effectiveOpts.trustedRootKeyId || DEFAULT_SUPERVISOR_KEY_ID;
   if (signerKeyId !== effectiveRootId) {
     if (Array.isArray(updates.keys)) {
       const rootInCur = Array.isArray(currentRegistry.keys) ? currentRegistry.keys.find(k => k.keyId === effectiveRootId) : null;
       const rootInUpdates = updates.keys.find(k => k.keyId === effectiveRootId);
-      if (rootInUpdates && rootInUpdates.status !== 'ACTIVE_PINNED_ROOT') {
-        throw new Error(`[DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${signerKeyId}' cannot modify or retire sovereign root key '${effectiveRootId}' (attempted status '${rootInUpdates.status}')`);
-      }
-      if (!rootInUpdates && rootInCur) {
-        throw new Error(`[DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${signerKeyId}' cannot omit sovereign root key '${effectiveRootId}' from keys[]`);
+      if (rootInCur) {
+        if (!rootInUpdates) {
+          throw new Error(`[DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${signerKeyId}' cannot omit sovereign root key '${effectiveRootId}' from keys[]`);
+        }
+        if (rootInUpdates.status !== rootInCur.status) {
+          throw new Error(`[DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${signerKeyId}' cannot modify sovereign root key '${effectiveRootId}' status from '${rootInCur.status}' to '${rootInUpdates.status}'`);
+        }
+        if (rootInUpdates.keyFingerprint && rootInCur.keyFingerprint && rootInUpdates.keyFingerprint !== rootInCur.keyFingerprint) {
+          throw new Error(`[DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${signerKeyId}' cannot modify sovereign root key '${effectiveRootId}' fingerprint`);
+        }
+        if (rootInUpdates.publicKeyPem && rootInCur.publicKeyPem && rootInUpdates.publicKeyPem !== rootInCur.publicKeyPem) {
+          throw new Error(`[DELEGATED_ROOT_MUTATION_REJECTED] Delegated signer '${signerKeyId}' cannot modify sovereign root key '${effectiveRootId}' public key PEM`);
+        }
       }
     }
     if (Array.isArray(updates.revokedKeyIds) && updates.revokedKeyIds.includes(effectiveRootId)) {
