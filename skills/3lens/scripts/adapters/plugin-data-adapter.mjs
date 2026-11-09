@@ -690,8 +690,13 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
       const signerPem = trustedKeys.get(entry.signedBy);
       if (!signerPem) break;
 
-      const maxIdx = maxActiveIndexPerKey.get(entry.signedBy);
-      if (typeof maxIdx === 'number' && maxIdx !== Infinity && entry.entryIndex > maxIdx) break;
+      // R29-B01: Root anchor key is the sovereign authority; historical HWM=-1 must not suppress
+      // authentic Root-signed revocations. Delegated keys remain strictly bounded by maxActiveIndexPerKey.
+      const isRootSigner = entry.signedBy === rootId && signerPem === rootPem;
+      if (!isRootSigner) {
+        const maxIdx = maxActiveIndexPerKey.get(entry.signedBy);
+        if (typeof maxIdx === 'number' && maxIdx !== Infinity && entry.entryIndex > maxIdx) break;
+      }
 
       const payload = Buffer.from(computeRevocationEntrySignPayload(entry), 'utf8');
       let validSig = false;
@@ -703,6 +708,8 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
       if (entry.revocationType === REVOCATION_TYPES.KEY_REVOCATION || entry.revocationType === 'KEY_REVOCATION') {
         if (typeof entry.targetId === 'string' && entry.targetId) {
           journalRevokedKeyIds.add(entry.targetId);
+          const curMax = maxActiveIndexPerKey.get(entry.targetId);
+          maxActiveIndexPerKey.set(entry.targetId, Math.min(curMax ?? Infinity, entry.entryIndex));
         }
       }
       expectedPrevDigest = sha256Digest(canonicalJsonStringify(entry));
@@ -836,7 +843,11 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
             if (!isRevokedInHist && (hk.status === 'ACTIVE' || hk.status === 'ACTIVE_PINNED_ROOT')) {
               const cur = maxActiveIndexPerKey.get(hk.keyId);
               if (cur !== Infinity) {
-                maxActiveIndexPerKey.set(hk.keyId, Math.max(cur ?? -1, hHwmIdx));
+                if (hk.status === 'ACTIVE_PINNED_ROOT' || hk.keyId === rootId) {
+                  maxActiveIndexPerKey.set(hk.keyId, Infinity);
+                } else {
+                  maxActiveIndexPerKey.set(hk.keyId, Math.max(cur ?? -1, hHwmIdx));
+                }
               }
             }
           }
@@ -879,11 +890,15 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
         // Next version after history: must have valid authorizationProof from priorVerifiedReg
         const proof = currentRegistry.authorizationProof;
         if (proof && typeof proof.signature === 'string' && typeof proof.authorizedBy === 'string') {
-          // R27-B02: Signer must not be revoked in prior registry or in verified journal records
+          // R27-B02 & R29-B01: Signer must not be revoked in prior registry or in verified journal records
           const isSignerRevokedInPrior = Array.isArray(priorVerifiedReg.revokedKeyIds) && priorVerifiedReg.revokedKeyIds.includes(proof.authorizedBy);
           const isSignerRevokedInJournal = journalRevokedKeyIds.has(proof.authorizedBy);
 
-          if (!isSignerRevokedInPrior && !isSignerRevokedInJournal) {
+          if (isSignerRevokedInPrior || isSignerRevokedInJournal) {
+            if (options.failClosed !== false) {
+              throw new Error(`[UNTRUSTED_CURRENT_REGISTRY] [REVOKED_SIGNER_AUTHORIZATION_REJECTED] Signer '${proof.authorizedBy}' for current registry was revoked in revocation journal or prior registry`);
+            }
+          } else {
             const signerInPrior = priorVerifiedReg.keys?.find(
               k => k.keyId === proof.authorizedBy && ['ACTIVE_PINNED_ROOT', 'ACTIVE'].includes(k.status)
             );
@@ -2236,6 +2251,15 @@ export function validateTrustRegistry(registry, options = {}) {
         candidateHwm: registry.revocationHighWaterMark
       });
     } catch (jErr) {
+      if (jErr.message.includes('[REVOKED_SIGNER_AUTHORIZATION_REJECTED]') || jErr.message.includes('REVOKED_KEY_AUTHORIZATION_REJECTED')) {
+        return {
+          valid: false,
+          error: `[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key was revoked in revocation journal or prior registry: ${jErr.message}`,
+          cryptographicValidity: false,
+          monotonicValidity: false,
+          ancestryContinuity: false
+        };
+      }
       return {
         valid: false,
         error: `[REVOCATION_STATUS_UNVERIFIABLE] Cannot verify signer revocation status: ${jErr.message}`,
@@ -2703,6 +2727,9 @@ export function createAuthorizedRegistryUpdate(currentRegistry, updates, signerK
         candidateHwm: currentRegistry.revocationHighWaterMark
       });
     } catch (jErr) {
+      if (jErr.message.includes('[REVOKED_SIGNER_AUTHORIZATION_REJECTED]') || jErr.message.includes('REVOKED_KEY_AUTHORIZATION_REJECTED')) {
+        throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key was revoked in revocation journal or prior registry: ${jErr.message}`);
+      }
       throw new Error(`[REVOCATION_STATUS_UNVERIFIABLE] Cannot verify signer revocation status for registry update: ${jErr.message}`);
     }
     if (journalRevoked.has(signerKeyId)) {
@@ -4126,6 +4153,9 @@ export function saveTrustRegistry(registry, options = {}) {
           candidateHwm: registry.revocationHighWaterMark
         });
       } catch (jErr) {
+        if (jErr.message.includes('[REVOKED_SIGNER_AUTHORIZATION_REJECTED]')) {
+          throw new Error(`[REVOKED_KEY_AUTHORIZATION_REJECTED] Signer key '${registry.authorizationProof.authorizedBy}' was revoked in revocation journal or prior registry; cannot authorize registry`);
+        }
         throw new Error(`[REVOCATION_STATUS_UNVERIFIABLE] Cannot verify signer revocation status before saving registry: ${jErr.message}`);
       }
       if (journalRevoked.has(registry.authorizationProof.authorizedBy)) {

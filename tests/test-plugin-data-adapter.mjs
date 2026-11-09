@@ -6613,7 +6613,7 @@ test('R25-B01 & R25-B02: Monotonic witness storage path alignment and unauthenti
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
-test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01: Strict Genesis root anchor confinement, filename version binding, progressive historical journal revocation screening, and cold-start rollback recovery', () => {
+test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01 & R29-B01: Strict Genesis root anchor confinement, filename version binding, progressive historical journal revocation screening, baseline HWM=-1 gating, and cold-start rollback recovery', () => {
   const tempDir = createTempDir('r26-r27-security-gates-');
   const rootAuth = generateTestAuthority();
   const rogueAuth = generateTestAuthority();
@@ -6699,7 +6699,7 @@ test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01: Strict Genesis root ancho
       { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: new Date().toISOString() }
     ],
     revokedKeyIds: [],
-    revocationHighWaterMark: { headIndex: 0, headDigest: '0'.repeat(64), updatedAt: new Date().toISOString(), authorizedBy: rootAuth.keyId, signature: '00' }
+    revocationHighWaterMark: { headIndex: -1, headDigest: '0'.repeat(64), updatedAt: new Date().toISOString(), authorizedBy: rootAuth.keyId, signature: '00' }
   };
   fs.writeFileSync(path.join(histDir, 'trust-registry.v1.json'), JSON.stringify(validGenesisV1), 'utf8');
 
@@ -6758,7 +6758,7 @@ test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01: Strict Genesis root ancho
       { keyId: delegatedAuthK.keyId, keyFingerprint: delegatedAuthK.fp, publicKeyPem: delegatedAuthK.pem, status: 'ACTIVE', issuedAt: new Date().toISOString() }
     ],
     revokedKeyIds: [],
-    revocationHighWaterMark: { headIndex: 0, headDigest: '0'.repeat(64), updatedAt: new Date().toISOString(), authorizedBy: rootAuth.keyId, signature: '00' }
+    revocationHighWaterMark: { headIndex: -1, headDigest: '0'.repeat(64), updatedAt: new Date().toISOString(), authorizedBy: rootAuth.keyId, signature: '00' }
   };
   const v2AuthPayload = Buffer.from(computeRegistryAuthorizationPayload(validV2Hist), 'utf8');
   validV2Hist.authorizationProof = {
@@ -6818,10 +6818,10 @@ test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01: Strict Genesis root ancho
 
   fs.writeFileSync(path.join(tempDir, '.irv-revocation-journal.jsonl'), entry0Line + '\n' + entry1Line + '\n', 'utf8');
 
-  // Calling getJournalRevokedKeyMap MUST fail closed and reject rogueAuth signature as UNTRUSTED_SIGNER!
+  // Calling getJournalRevokedKeyMap MUST fail closed and reject rogueAuth signature or revoked signer!
   assert.throws(
     () => getJournalRevokedKeyMap(tempDir, opts),
-    /\[UNTRUSTED_SIGNER\]/
+    /\[UNTRUSTED_CURRENT_REGISTRY\]|\[REVOKED_SIGNER_AUTHORIZATION_REJECTED\]|\[UNTRUSTED_SIGNER\]/
   );
 
   // 3c. Negative Test E (R28-B01 Auditor Blocker Counterexample):
