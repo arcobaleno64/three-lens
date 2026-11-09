@@ -12,7 +12,7 @@ tools:
   - list_dir
   - run_command
 skills:
-  - security-audit
+  - 3lens
 ---
 
 # Role: Security Audit Coordinator & Master Orchestrator

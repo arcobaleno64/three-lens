@@ -47,7 +47,7 @@ Or run with non-interactive scope flags:
 - **Git diff review**: `/three-lens:3lens --scope changes` (or `/3lens --scope changes`)
 
 ### Expected Outputs
-Upon completion of the 4-stage pipeline, findings and evidence are generated under:
+Upon completion of the 5-stage orchestration pipeline (Stages 1–4, with Stage 5 IRV replay), findings and evidence are generated under:
 - `reports/scan.md` (or `reports/review.md`): Structured, evidence-bound executive Markdown report.
 - `reports/scan.sarif`: OASIS SARIF 2.1.0 standard log for IDE, GitHub Advanced Security, or CI ingestion.
 - `scratch/context/`: Sanitized, secret-redacted shadow inspection artifacts.
@@ -99,6 +99,11 @@ Auditing untrusted source code requires multi-layered defense to prevent prompt 
 | **Layer 3** | **Shadow Context Guard**<br>`hooks/shadow-context-guard.mjs` | PreToolUse lifecycle hook | Transparently redirects file reads to sanitized shadow copies under `scratch/context/`, blocking symlink traversal (CWE-59) escaping repository boundaries. |
 | **Layer 4** | **Deterministic TCB**<br>`path-containment.mjs` | Atomic file descriptor verification (`fs.openSync` + `fs.fstatSync`) | Eliminates filesystem race conditions (TOCTOU) and sibling-prefix path collisions (e.g. `scratch/context-evil`). |
 
+> [!NOTE]
+> **Boundary & Failure Semantics**:
+> - **Layer 3 Failure Semantics**: The PreToolUse hook activates only during an active security audit session (when `scratch/context/` is present). In the absence of an active audit context, or if the hook encounters an unexpected runtime error or timeout, it fails-open to prevent disrupting the user's unrelated, general `agy` developer workflows. Complete isolation, network blocking, and filesystem write protection fundamentally rely on **Layer 1 (`agy --sandbox`)**.
+> - **Command Interception Scope**: The shell command matching regex in Layer 3 (`curl`, `wget`, etc.) is designed as a guardrail to **reduce accidental tool misuse**, rather than an ironclad OS-level network boundary. Complete outbound network isolation requires Layer 1 sandbox execution.
+
 ### Recommended Permission Profile Usage
 
 To run security audits under production-grade least privilege, launch Antigravity with the terminal sandbox enabled:
@@ -108,7 +113,7 @@ To run security audits under production-grade least privilege, launch Antigravit
 agy --sandbox "audit this repository for security vulnerabilities"
 ```
 
-The role permissions defined in `recommended-security-audit-permissions.json` enforce:
+The role permissions defined in `recommended-security-audit-permissions.json` provide a recommended configuration template for operators configuring Antigravity role-based permissions (`settings.json` / profile import). When configured, they establish:
 - **`coordinator`**: Allowed orchestration tools (`invoke_subagent`, `send_message`, `run_command:node skills/3lens/scripts/*`); asked on `run_command:git *`; strictly denied network egress (`read_url_content`, `search_web`, `curl`, `wget`) and write operations.
 - **`discovery`**: Read-only exploration (`view_file`, `list_dir`, `grep_search`, `find_by_name`); strictly denied all write tools, network tools, and command executions.
 - **`verifiers`**: Read-only 3-Lens verification panel; strictly denied all write tools, command executions, and network access.

@@ -28,8 +28,8 @@
       "artifacts": [
         {
           "path": "skills/3lens/scripts/render-sarif.mjs",
-          "sha256": "3b1c42cbe75cab0a86766ea688b0b5ae11e317f1ae1c9a6460d3e61891abaa00",
-          "description": "Canonical SARIF renderer and 121 automated release invariants test suite"
+          "sha256": "75096ae91df3591a6d80af73e9fbbd232005c664d65af802282412cbe4ecf890",
+          "description": "Canonical SARIF renderer and automated test runner delegation"
         },
         {
           "path": "skills/3lens/scripts/check-release-invariants.mjs",
@@ -38,13 +38,23 @@
         },
         {
           "path": "skills/3lens/tool-integrity-manifest.json",
-          "sha256": "47ff7eb3ef994e74ff3f735578f341bf1affe468609c28ced3c89b211b9b1f49",
+          "sha256": "488c834928f332aadd8db5319b2e707a505207a9ffe92f54203130f29add5192",
           "description": "Cryptographic TCB integrity manifest pinning critical script hashes"
         },
         {
           "path": "skills/3lens/scripts/adapters/cloudflare-adapter.mjs",
           "sha256": "36c3eac48d828b2d582ac411db35c7bab4522d679d7d7a855de12fa6ef0ef2a0",
           "description": "Cloudflare Finding Producer Adapter (lossless canonical translation, quarantine boundary, zero external dependencies)"
+        },
+        {
+          "path": "skills/3lens/scripts/adapters/plugin-data-adapter.mjs",
+          "sha256": "70d1ce8a3380ecab4af86c5252a1d71e4f706078198c73a46cd286f37709e65c",
+          "description": "Persistent Plugin Data Storage and Trust Registry Adapter (atomic mutual exclusion, root authorization chain)"
+        },
+        {
+          "path": "skills/3lens/scripts/compact-guard.mjs",
+          "sha256": "170aacd1b3cb5843c9d06dcd2eaf4bbe99d66f2c2f9e531b5ca1d0af8379f785",
+          "description": "Compacted Audit State Envelope (CASE) Guard and Context Invariant Preservation"
         },
         {
           "path": "scripts/test-runtime-confinement.mjs",

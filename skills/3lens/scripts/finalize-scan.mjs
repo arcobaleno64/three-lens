@@ -36,6 +36,12 @@ import {
   persistBaselineContext
 } from './project-context.mjs';
 import { validateThreatModel } from './build-threat-model.mjs';
+import {
+  validateCompactedStateEnvelope,
+  extractCompactedAuditHeader,
+  assertCompactSafe,
+  serializeCompactedAuditHeader
+} from './compact-guard.mjs';
 export {
   loadProjectSecurityContext,
   detectContextDrift,
@@ -44,7 +50,11 @@ export {
   initProjectContext,
   loadBaselineContext,
   persistBaselineContext,
-  validateThreatModel
+  validateThreatModel,
+  validateCompactedStateEnvelope,
+  extractCompactedAuditHeader,
+  assertCompactSafe,
+  serializeCompactedAuditHeader
 };
 
 
@@ -2913,7 +2923,12 @@ export function finalizeScan({
   contextPrep = null,
   scanRunId = null,
   nonce = null,
-  cloudflareCoverage = null
+  cloudflareCoverage = null,
+  compactedAuditEnvelope = null,
+  compactedAuditContent = null,
+  compactOptions = null,
+  preCompactionState = null,
+  isCompactedSession = false
 } = {}) {
   const effectiveToolProvenance = toolProvenance || getToolProvenance(toolRoot);
   const safeVotes = Array.isArray(votes) ? votes : [];
@@ -2938,6 +2953,127 @@ export function finalizeScan({
     executionRunId === manifestRunId
   );
   let effectiveNonce = nonce || (isManifestRunBound ? (manifest?.taskCorrelationNonce || manifest?.nonce || null) : null);
+
+  // M54-P2-F06: CASE Compacted Audit State Envelope verification
+  const isCompactedSessionEffective = Boolean(
+    isCompactedSession ||
+    compactOptions?.requireCompactEnvelope ||
+    manifest?.isCompacted === true ||
+    preCompactionState
+  );
+
+  let compactGuardResult = null;
+  if (compactedAuditContent || compactedAuditEnvelope || isCompactedSessionEffective) {
+    let env = compactedAuditEnvelope;
+    if (!env && compactedAuditContent) {
+      const extracted = extractCompactedAuditHeader(compactedAuditContent, {
+        failClosed: false,
+        verifierPublicKey: compactOptions?.verifierPublicKey,
+        requireSignature: compactOptions?.requireSignature
+      });
+      if (!extracted.valid) {
+        compactGuardResult = { valid: false, error: extracted.error, status: 'UNCHECKABLE' };
+      } else {
+        env = extracted.envelope;
+      }
+    }
+
+    if (!compactGuardResult && env) {
+      const expectedRepoRootFp = repoRoot ? crypto.createHash('sha256').update(path.resolve(repoRoot), 'utf8').digest('hex') : null;
+      // R08-B03: Runtime tool provenance is authoritative under Default-Deny.
+      // Expected tool digest passed via compactOptions cannot override runtime provenance;
+      // any divergence between caller expectation and runtime provenance is a conflict failure.
+      const runtimeToolDigest = effectiveToolProvenance?.toolIntegrityDigest || null;
+      const expectedCallerDigest = compactOptions?.expectedToolManifestDigest || null;
+      if (runtimeToolDigest && expectedCallerDigest && runtimeToolDigest !== expectedCallerDigest) {
+        compactGuardResult = {
+          valid: false,
+          error: `[TOOL_DIGEST_AUTHORITY_CONFLICT] Caller expectedToolManifestDigest (${expectedCallerDigest}) conflicts with authoritative runtime tool provenance (${runtimeToolDigest})`,
+          status: 'UNCHECKABLE',
+          envelope: env
+        };
+      }
+      const trustedToolDigest = runtimeToolDigest || expectedCallerDigest || null;
+      if (!compactGuardResult && preCompactionState?.toolManifestDigest && trustedToolDigest && preCompactionState.toolManifestDigest !== trustedToolDigest) {
+        compactGuardResult = {
+          valid: false,
+          error: `Pre-compaction state toolManifestDigest (${preCompactionState.toolManifestDigest}) does not match trusted runtime tool provenance (${trustedToolDigest})`,
+          status: 'UNCHECKABLE',
+          envelope: env
+        };
+      }
+
+      const expectedContext = {
+        scanRunId: executionRunId || manifestRunId || preCompactionState?.scanRunId || null,
+        executionNonce: effectiveNonce || preCompactionState?.executionNonce || null,
+        toolManifestDigest: trustedToolDigest || preCompactionState?.toolManifestDigest || null,
+        repoRootFingerprint: compactOptions?.requireRepoRootFingerprint
+          ? expectedRepoRootFp
+          : (env?.repoRootFingerprint ? expectedRepoRootFp : (preCompactionState?.repoRootFingerprint || null))
+      };
+      if (preCompactionState?.persistedState !== undefined) {
+        expectedContext.persistedState = preCompactionState.persistedState;
+      }
+
+      // R04-B04 & R05-B05: In a compacted session, binding context is mandatory under Default-Deny
+      if (isCompactedSessionEffective) {
+        if (!expectedContext.scanRunId || !expectedContext.executionNonce || !expectedContext.toolManifestDigest) {
+          compactGuardResult = {
+            valid: false,
+            error: 'Compacted session requires authoritative scanRunId, executionNonce, and toolManifestDigest context bindings (R04-B04)',
+            status: 'UNCHECKABLE',
+            envelope: env
+          };
+        }
+      }
+
+      if (!compactGuardResult) {
+        const validation = validateCompactedStateEnvelope(env, expectedContext, compactOptions || {});
+        if (!validation.valid) {
+          compactGuardResult = { valid: false, error: validation.error, status: 'UNCHECKABLE', envelope: env };
+        } else if (preCompactionState) {
+          // Enforce end-to-end assertCompactSafe check
+          const rawContent = compactedAuditContent || serializeCompactedAuditHeader(env);
+          const safeCheck = assertCompactSafe(preCompactionState, rawContent, compactOptions || {});
+          if (!safeCheck.safe) {
+            compactGuardResult = { valid: false, error: safeCheck.error, status: 'UNCHECKABLE', envelope: env };
+          } else {
+            // Round 07 F-06: Under Default-Deny, VERIFIED status requires verified cryptographic signature
+            const hasVerifiedSig = (validation.signatureValid === true) || (env?.signature && compactOptions?.verifierPublicKey);
+            if (hasVerifiedSig) {
+              compactGuardResult = { valid: true, error: null, status: 'VERIFIED', envelope: env };
+            } else if (compactOptions?.requireSignature) {
+              compactGuardResult = {
+                valid: false,
+                error: 'Compacted state envelope requires verified cryptographic signature under Default-Deny (F-06)',
+                status: 'UNCHECKABLE',
+                envelope: env
+              };
+            } else {
+              compactGuardResult = { valid: true, error: null, status: 'UNAUTHENTICATED', envelope: env };
+            }
+          }
+        } else if (env?.signature && compactOptions?.verifierPublicKey) {
+          compactGuardResult = { valid: true, error: null, status: 'VERIFIED', envelope: env };
+        } else {
+          // R05-B05: Without authenticated preCompactionState or verified cryptographic signature,
+          // internal mathematical consistency alone cannot prove continuity relative to pre-compaction state.
+          compactGuardResult = {
+            valid: false,
+            error: 'Compacted state envelope lacks authoritative integrity basis: must carry either verified cryptographic signature or authenticated preCompactionState (R05-B05)',
+            status: 'UNCHECKABLE',
+            envelope: env
+          };
+        }
+      }
+    } else if (!compactGuardResult && isCompactedSessionEffective && !env) {
+      compactGuardResult = {
+        valid: false,
+        error: 'Mandatory compacted audit state envelope missing in compacted session (F06)',
+        status: 'UNCHECKABLE'
+      };
+    }
+  }
   const validIntents = ['DISCOVERY', 'VALIDATION', 'REGRESSION'];
   const safeAuditIntent = validIntents.includes(String(auditIntent).toUpperCase())
     ? String(auditIntent).toUpperCase()
@@ -3430,8 +3566,12 @@ export function finalizeScan({
     (contextDrift && contextDrift.hasDrift && ['THREAT_MODEL_REVIEW_REQUIRED', 'CONTEXT_DRIFT'].includes(contextDrift.status))
   );
 
-  // R6-P0-01 & R11-P0-01: Six-Pillar Assurance Gates
-  const coverageGate = (coverageStatus === 'COMPLETE');
+  // R6-P0-01 & R11-P0-01: Six-Pillar Assurance Gates (extended with M54-P2-F06 compactGate & R08-B06)
+  // In compacted sessions, continuity requires VERIFIED status under Default-Deny; UNAUTHENTICATED fails compactGate
+  const compactGate = !isCompactedSessionEffective
+    ? (!compactGuardResult || compactGuardResult.valid === true)
+    : Boolean(compactGuardResult && compactGuardResult.valid === true && compactGuardResult.status === 'VERIFIED');
+  const coverageGate = (coverageStatus === 'COMPLETE') && compactGate;
   const matrixGate = Boolean(matrixValidation.valid && isMatrixComplete);
   const findingGate = (confirmedCount === 0 && deferredCount === 0 && acceptedRiskCount === 0);
   const contextGate = Boolean(
@@ -3460,12 +3600,17 @@ export function finalizeScan({
     && contextGate
     && executionGate
     && toolIntegrityGate
+    && compactGate
   );
 
-  const canDeclareClean = Boolean(baseCleanEligible && !driftBlocksClean);
+  let canDeclareClean = Boolean(baseCleanEligible && !driftBlocksClean);
 
   let assuranceLabel = 'NON_CLEAN';
-  if (canDeclareClean) {
+  if (!compactGate) {
+    assuranceLabel = 'UNCHECKABLE';
+    coverageStatus = 'UNCHECKABLE';
+    canDeclareClean = false;
+  } else if (canDeclareClean) {
     if (toolIntegrity.status === 'SELF_AUDIT_MODE') {
       assuranceLabel = 'SELF_AUDIT_BOUNDED_CLEAN';
     } else if (!hasConfirmedProjectContext) {
@@ -3581,8 +3726,10 @@ export function finalizeScan({
       findingGate,
       contextGate,
       executionGate,
-      toolIntegrityGate
+      toolIntegrityGate,
+      compactGate
     },
+    compactGuard: compactGuardResult || { valid: true, status: 'NOT_APPLICABLE' },
     discoveryMatrixValid: matrixValidation.valid,
     discoveryCellsSummary: {
       total: safeMatrix.length,
@@ -3634,6 +3781,7 @@ export function finalizeScan({
     summary,
     coverageStatus,
     coverageMode,
+    compactGuard: compactGuardResult || { valid: true, status: 'NOT_APPLICABLE' },
     manifest: updatedManifest,
     manifestValidation: coverageReconciliation,
     provenance: provenance || getHardenedGitProvenance(repoRoot),
@@ -4562,6 +4710,8 @@ export function renderMarkdownFromCanonical({
  */
 export const REQUIRED_CRITICAL_SCRIPTS = [
   'scripts/adapters/cloudflare-adapter.mjs',
+  'scripts/adapters/plugin-data-adapter.mjs',
+  'scripts/compact-guard.mjs',
   'scripts/safe-git.mjs',
   'scripts/finalize-scan.mjs',
   'scripts/build-inventory.mjs',
@@ -4981,6 +5131,13 @@ if (isDirectExecution) {
   const intentArg = getArg('--intent') || getArg('--audit-intent') || 'DISCOVERY';
   const scanRunIdArg = getArg('--run-id') || getArg('--scan-run-id');
   const nonceArg = getArg('--nonce') || getArg('--task-correlation-nonce');
+  const isCompactedSessionArg = args.includes('--compacted-session') || args.includes('--is-compacted');
+  const compactContentPathArg = getArg('--compact-content');
+  const compactEnvelopePathArg = getArg('--compact-envelope');
+  const preCompactionStatePathArg = getArg('--pre-compaction-state');
+  const requireCompactSignatureArg = args.includes('--require-compact-signature');
+  const requireCompactEnvelopeArg = args.includes('--require-compact-envelope');
+  const compactVerifierKeyArg = getArg('--compact-verifier-key');
   const outputJsonPath = getArg('--output') || getArg('--output-json');
   const outputSarifPath = getArg('--output-sarif');
   const outputMdPath = getArg('--output-md');
@@ -5139,6 +5296,62 @@ if (isDirectExecution) {
         executedStages = executedStagesArg.split(',').map(s => s.trim()).filter(Boolean);
       }
 
+      let compactedAuditContent = null;
+      if (compactContentPathArg && fs.existsSync(compactContentPathArg)) {
+        compactedAuditContent = fs.readFileSync(compactContentPathArg, 'utf8');
+      }
+
+      let compactedAuditEnvelope = null;
+      if (compactEnvelopePathArg) {
+        if (!fs.existsSync(compactEnvelopePathArg)) {
+          console.error(`[COMPACT-GUARD] Specified --compact-envelope file does not exist: ${compactEnvelopePathArg}`);
+          process.exit(1);
+        }
+        try {
+          compactedAuditEnvelope = JSON.parse(fs.readFileSync(compactEnvelopePathArg, 'utf8'));
+        } catch (err) {
+          console.error(`[COMPACT-GUARD] Specified --compact-envelope failed to parse as JSON: ${err.message}`);
+          process.exit(1);
+        }
+      } else if (fs.existsSync(path.resolve(repoRoot, 'scratch/compacted-audit-envelope.json'))) {
+        try {
+          compactedAuditEnvelope = JSON.parse(fs.readFileSync(path.resolve(repoRoot, 'scratch/compacted-audit-envelope.json'), 'utf8'));
+        } catch (err) {
+          console.error(`[COMPACT-GUARD] Scratch compacted-audit-envelope.json failed to parse as JSON: ${err.message}`);
+          process.exit(1);
+        }
+      }
+
+      let preCompactionState = null;
+      if (preCompactionStatePathArg) {
+        if (!fs.existsSync(preCompactionStatePathArg)) {
+          console.error(`[COMPACT-GUARD] Specified --pre-compaction-state file does not exist: ${preCompactionStatePathArg}`);
+          process.exit(1);
+        }
+        try {
+          preCompactionState = JSON.parse(fs.readFileSync(preCompactionStatePathArg, 'utf8'));
+        } catch (err) {
+          console.error(`[COMPACT-GUARD] Specified --pre-compaction-state failed to parse as JSON: ${err.message}`);
+          process.exit(1);
+        }
+      } else if (fs.existsSync(path.resolve(repoRoot, 'scratch/pre-compaction-state.json'))) {
+        try {
+          preCompactionState = JSON.parse(fs.readFileSync(path.resolve(repoRoot, 'scratch/pre-compaction-state.json'), 'utf8'));
+        } catch (err) {
+          console.error(`[COMPACT-GUARD] Scratch pre-compaction-state.json failed to parse as JSON: ${err.message}`);
+          process.exit(1);
+        }
+      }
+
+      let compactVerifierPublicKey = null;
+      if (compactVerifierKeyArg) {
+        if (fs.existsSync(compactVerifierKeyArg)) {
+          compactVerifierPublicKey = fs.readFileSync(compactVerifierKeyArg, 'utf8');
+        } else {
+          compactVerifierPublicKey = compactVerifierKeyArg;
+        }
+      }
+
       const finalization = finalizeScan({
         candidates,
         manifest,
@@ -5152,7 +5365,16 @@ if (isDirectExecution) {
         executionAttestation,
         scanRunId: scanRunIdArg,
         nonce: nonceArg,
-        cloudflareCoverage
+        cloudflareCoverage,
+        compactedAuditEnvelope,
+        compactedAuditContent,
+        preCompactionState,
+        isCompactedSession: isCompactedSessionArg,
+        compactOptions: {
+          requireSignature: requireCompactSignatureArg,
+          requireCompactEnvelope: requireCompactEnvelopeArg,
+          verifierPublicKey: compactVerifierPublicKey
+        }
       });
 
       if (outputJsonPath) {

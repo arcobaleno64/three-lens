@@ -1,17 +1,19 @@
 {
   "schemaVersion": "1.0.0",
   "toolVersion": "1.11.0",
-  "generatedAt": "2026-11-07T15:26:40.682Z",
-  "manifestDigest": "c0c693ce1d0b21c954ad9706026be754405434c8e3c5c78d1610f5923ca5638f",
+  "generatedAt": "2026-11-09T13:10:58.091Z",
+  "manifestDigest": "e9a52d301c3054bc4ff525a59f504e8df8fa655b5a114793c0ce19e4c6e0466e",
   "criticalScripts": {
     "scripts/adapters/cloudflare-adapter.mjs": "36c3eac48d828b2d582ac411db35c7bab4522d679d7d7a855de12fa6ef0ef2a0",
+    "scripts/adapters/plugin-data-adapter.mjs": "70d1ce8a3380ecab4af86c5252a1d71e4f706078198c73a46cd286f37709e65c",
     "scripts/build-inventory.mjs": "3b9e80a194c774aef53c8f7d410d50a4ed6cc514d64fa893233cc8190073844a",
     "scripts/build-threat-model.mjs": "b71c553f1bd61da374753d9f05891c839ae684f80103716afce1e6fbc4bae9e2",
-    "scripts/finalize-scan.mjs": "7c032e1a328c86aba19d16ce01edd8680f7805b82b250c04e740a51ecf63327a",
+    "scripts/compact-guard.mjs": "170aacd1b3cb5843c9d06dcd2eaf4bbe99d66f2c2f9e531b5ca1d0af8379f785",
+    "scripts/finalize-scan.mjs": "42baec940710ffcb81da6863beb00a4d54147349f7d4e7b20cd28aff96a830bc",
     "scripts/path-containment.mjs": "8044a629e15bc113998417823359e5fdf1286e228ae1c384220c006559ffcbf8",
     "scripts/prepare-review-context.mjs": "ddbf271d330963d8b70ce6bc0c6dd585a468da7a6bf35c01a151276ea77fa2c8",
     "scripts/project-context.mjs": "63ffb3d89f3df1ff247e98b6a42b6cd618f0e74a23c468ad3df5995af3773929",
-    "scripts/render-sarif.mjs": "3b1c42cbe75cab0a86766ea688b0b5ae11e317f1ae1c9a6460d3e61891abaa00",
+    "scripts/render-sarif.mjs": "75096ae91df3591a6d80af73e9fbbd232005c664d65af802282412cbe4ecf890",
     "scripts/safe-git.mjs": "4136727311736b5d388fa6250cf30a91dc6675c6abe87909e572b692acdbb5c0",
     "scripts/validate-attack-path.mjs": "b7a1c3ae4be60e386ade21c578958da6467aafbc2cd3c2c561cbafb5e5e64e87",
     "scripts/validate-patch.mjs": "aa8aab1b7854225047b003cc395061a2d21a28ecb61c7d2a63a94e9bb2d9b156"

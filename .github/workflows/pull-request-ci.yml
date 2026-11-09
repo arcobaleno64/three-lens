@@ -21,6 +21,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
         with:
           node-version: 20
@@ -38,6 +40,9 @@ jobs:
       - run: npm run test:reproducibility
       - run: npm run test:micro-corpus
       - run: npm run test:operator-metrics
+      - run: npm run test:plugin-data
+      - run: npm run test:compact
+      - run: npm run validate:v2-corpus
       - run: npm run check:docs
       - run: node scripts/bundle-release-evidence.mjs --check
       - run: npm run check:release

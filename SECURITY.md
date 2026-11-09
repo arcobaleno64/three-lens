@@ -74,28 +74,34 @@ In security audit contexts, no single security perimeter can protect against all
    - **Failure Modes & Defenses**: If target code attempts malicious binary execution or reverse shells, Layer 1 denies kernel-level syscalls and network egress fail-closed.
 
 2. **Layer 2: Permission Engine (`recommended-security-audit-permissions.json`)**
-   - **Boundary**: AGY CLI runtime tool dispatch engine evaluated in strict `deny > ask > allow` order.
+   - **Boundary**: AGY CLI runtime tool dispatch engine evaluated in strict `deny > ask > allow` order, configured via recommended role profile templates in Antigravity operator settings.
    - **Objective**: Restricts available agent tools by assigned role (`coordinator`, `discovery`, `verifiers`, `remediation`) under Default-Deny.
-   - **Failure Modes & Defenses**: If a subagent attempts privilege escalation or unauthorized actions (e.g. discovery agent attempting code edits or network access), Layer 2 blocks tool dispatch before model execution.
+   - **Failure Modes & Defenses**: When the recommended profile is configured into Antigravity operator settings, if a subagent attempts privilege escalation or unauthorized actions (e.g. discovery agent attempting code edits or network access), Layer 2 blocks tool dispatch before model execution.
 
 3. **Layer 3: Shadow Context Guard (`hooks/shadow-context-guard.mjs`, PreToolUse Hook)**
    - **Boundary**: Workspace application layer intercepting file read operations (`view_file`, `grep_search`, `list_dir`, `find_by_name`).
-   - **Objective**: Intercepts direct access to raw workspace files, transparently redirects agents to the sanitized shadow context (`scratch/context/`), and blocks symlink directory traversal escaping repository roots (CWE-59).
-   - **Failure Modes & Defenses**: If an agent attempts direct inspection of unsanitized or traversing files, Layer 3 intercepts and emits a fail-closed denial directing the agent to the shadow replica.
+   - **Objective**: Intercepts direct access to raw workspace files during active security audit sessions, transparently redirects agents to the sanitized shadow context (`scratch/context/`), and blocks symlink directory traversal escaping repository roots (CWE-59). Command-line regex matching serves to reduce accidental egress misuse.
+   - **Failure Modes & Defenses**: During an active audit session with initialized shadow context, direct inspection of raw or escaping files is intercepted and denied fail-closed. In the absence of an active audit context, or in the event of an unhandled hook exception/timeout, Layer 3 fails open to avoid breaking general, non-audit `agy` developer workflows. Hard isolation, persistent write protection, and complete outbound network blocking fundamentally rely on **Layer 1 (`agy --sandbox`)**.
 
 4. **Layer 4: Deterministic Path Containment & TOCTOU-Resistant TCB (`path-containment.mjs`)**
    - **Boundary**: Trusted Computing Base (TCB) atomic filesystem I/O boundary.
    - **Objective**: Centralizes containment algebra and uses dedicated file descriptor inspection (`fs.openSync` + `fs.fstatSync` + `fs.readSync`) to prevent filesystem race conditions (TOCTOU) and sibling-prefix path collisions (e.g. `scratch/context-evil`).
    - **Failure Modes & Defenses**: If a symlink or file swap occurs between validation and read, Layer 4 descriptor binding guarantees containment against race conditions and out-of-boundary access.
 
+### 2.9 Monotonic State & Anti-Rollback Threat Boundary (Milestone 5.4 Governance)
+- **Local Multi-Anchor Defense**: Anti-rollback for cryptographic trust registries and revocation journals relies on multi-anchor monotonic witnesses persisted across separate local storage locations (`PLUGIN_DATA` + user home directory `~/.three-lens/witness/`) combined with in-process memory tracking and unbroken historical digest commitment (`registryDigests`).
+- **Threat Model & Bounded Guarantee**:
+  - *Covered Scenarios*: Detects single-anchor rollback, uncoordinated file deletion or corruption, intermediate historical divergence, transaction crash interruption (via signed COMMITTED and PREPARED WAL), and concurrent multi-process race conditions under standard POSIX/Windows DAC permissions (0o600).
+  - *Boundary & Non-Claim*: For adversaries possessing simultaneous arbitrary write access across all separate local storage locations who also restart the host process (full state wipeout and snapshot restore), local storage locations alone cannot mathematically provide external wall-clock freshness. Full state rollbacks under full-host compromise require external hardware trust anchors or append-only transparency log endpoints. Absent an active external witness, local anti-rollback guarantees are bounded to multi-anchor local consistency, continuous ancestor history verification, and atomic WAL crash recovery.
+
 ---
 
 ## 3. Reporting Vulnerabilities
 
-If you discover a potential security vulnerability within `agy-security-audit`, please **do not** open a public GitHub issue.
+If you discover a potential security vulnerability within `three-lens`, please **do not** open a public GitHub issue.
 
 Instead, report it responsibly via either of:
-- **Private Security Disclosure** (preferred): Submit via [GitHub Security Advisories](https://github.com/arcobaleno64/agy-security-audit/security/advisories/new). It keeps the report, the discussion, and the eventual advisory in one place.
+- **Private Security Disclosure** (preferred): Submit via [GitHub Security Advisories](https://github.com/arcobaleno64/three-lens/security/advisories/new). It keeps the report, the discussion, and the eventual advisory in one place.
 - **Email**: <arcobaleno830623@gmail.com>, for anyone who cannot or would rather not use GitHub. This address is monitored by the maintainer; it is not a team inbox, so expect one person's response times.
 
 ### Response Expectations

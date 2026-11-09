@@ -3,7 +3,7 @@
   "name": "three-lens",
   "displayName": "Three-Lens (3lens)",
   "version": "1.11.0",
-  "description": "Evidence-backed, multi-stage security assurance and vulnerability verification plugin for Antigravity, featuring double-blind 3-lens consensus and PreToolUse shadow-context confinement.",
+  "description": "Evidence-backed security assurance and vulnerability verification plugin for Antigravity, featuring double-blind 3-lens consensus and runtime confinement.",
   "logo": "assets/logo.svg",
   "author": {
     "name": "SatenVision",
@@ -11,6 +11,18 @@
   },
   "repository": "https://github.com/arcobaleno64/three-lens",
   "license": "MIT",
+  "keywords": [
+    "three-lens",
+    "3lens",
+    "security-audit",
+    "vulnerability-verification",
+    "sarif",
+    "nist-ssdf",
+    "owasp-asvs",
+    "cvss",
+    "appsec",
+    "devsecops"
+  ],
   "suggestedPrompts": [
     "Audit the current Git workspace for vulnerabilities and security posture",
     "Perform a 3-lens adversarial verification review on pending git diffs",

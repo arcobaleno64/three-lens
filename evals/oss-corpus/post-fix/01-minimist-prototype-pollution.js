@@ -1,17 +1,17 @@
 /**
- * Remediated slice of minimist (CVE-2020-7598)
- * Fixed in minimist 1.2.2 by checking for __proto__ in setKey.
+ * Remediated slice of minimist (CVE-2020-7598 & CVE-2021-44906)
+ * Remediated by checking for __proto__, constructor, and prototype in setKey.
  */
 export function setKey(obj, keys, value) {
   let o = obj;
   for (let i = 0; i < keys.length - 1; i++) {
     const key = keys[i];
-    if (key === '__proto__') return; // CVE-2020-7598 mitigation
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') return; // Mitigation
     if (o[key] === undefined) o[key] = {};
     o = o[key];
   }
   const lastKey = keys[keys.length - 1];
-  if (lastKey === '__proto__') return; // CVE-2020-7598 mitigation
+  if (lastKey === '__proto__' || lastKey === 'constructor' || lastKey === 'prototype') return; // Mitigation
   o[lastKey] = value;
 }
 

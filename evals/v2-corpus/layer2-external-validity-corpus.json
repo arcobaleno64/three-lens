@@ -1,0 +1,382 @@
+{
+  "$schema": "https://antigravity.google/schemas/security-audit/external-validity-corpus.schema.json",
+  "schemaVersion": "2.0.0",
+  "corpusId": "LAYER-2-EXTERNAL-VALIDITY-CORPUS-V2",
+  "protocolReference": "evals/protocols/v2.0-three-layer-evaluation-framework.md",
+  "acceptanceCriteriaReference": "evals/protocols/v2.0-acceptance-criteria.json",
+  "status": "AUTHORITATIVE_FROZEN",
+  "frozenAt": "2026-11-07T10:49:35Z",
+  "governance": {
+    "authority": "Antigravity Security Governance & Assurance Directorate",
+    "nonEquivalencePrinciple": "Sample sufficiency != evaluation success",
+    "dispositionConjunctiveContract": "Unanimous 3-Lens panel required for REPORTABLE; decisive counterevidence suppresses to FALSE_POSITIVE",
+    "provenanceDiscipline": "All in-repo benchmark fixtures are transparently classified as SYNTHETIC_REGRESSION or SYNTHETIC_CLEAN_CONTROL physically pinned to arcobaleno64/three-lens commit eddd0c38875c356fd20530b2e19cd12734d50155 (R03-B07 Closure)"
+  },
+  "metricsSummary": {
+    "totalCases": 14,
+    "vulnerableCasesCount": 7,
+    "fixedCounterpartsCount": 4,
+    "cleanControlsCount": 3,
+    "vulnerabilityFamiliesCount": 7,
+    "conformance": {
+      "totalCasesRange": [
+        12,
+        16
+      ],
+      "vulnerableCasesRange": [
+        6,
+        8
+      ],
+      "fixedCounterpartsRange": [
+        3,
+        4
+      ],
+      "cleanControlsRange": [
+        3,
+        4
+      ],
+      "minFamiliesRequired": 7,
+      "passed": true
+    }
+  },
+  "vulnerabilityFamilies": [
+    "injection-and-validation",
+    "auth-and-tenancy",
+    "path-and-filesystem",
+    "parser-and-deserialization",
+    "concurrency-and-lifecycle",
+    "secrets-and-configuration",
+    "dependency-and-supply-chain"
+  ],
+  "cases": [
+    {
+      "caseId": "L2-01-VULN-INJECTION",
+      "provenanceType": "SYNTHETIC_REGRESSION",
+      "family": "injection-and-validation",
+      "role": "VULNERABLE",
+      "cwe": "CWE-1333",
+      "title": "ReDoS in String Trimming via Catastrophic Regex Backtracking (CWE-1333 Benchmark Reproduction)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "modeledAfterCve": "CVE-2020-28500",
+      "targetFile": "evals/oss-corpus/pre-fix/02-lodash-redos.js",
+      "targetSink": "toNumber(value) at line 13",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "HIGH",
+      "cvssVector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N",
+      "technicalProof": "Input string with thousands of whitespace characters causes quadratic/exponential backtracking in trim regex, hanging the Node.js event loop.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Authentic benchmark reproduction modeled after CWE-1333 and inspired by CVE-2020-28500; unanchored greedy whitespace repetition."
+      },
+      "blobSha256": "15cd80f2270fee66680e80238e93e83bed24cfee0ad7878d3ca3ad0a428c33cf"
+    },
+    {
+      "caseId": "L2-02-FIX-INJECTION",
+      "provenanceType": "SYNTHETIC_REGRESSION",
+      "family": "injection-and-validation",
+      "role": "FIXED_COUNTERPART",
+      "cwe": "CWE-1333",
+      "title": "Linear Loop-Based Trimming Neutralizing ReDoS (CWE-1333 Fixed Benchmark)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "modeledAfterCve": "CVE-2020-28500",
+      "targetFile": "evals/oss-corpus/post-fix/02-lodash-redos.js",
+      "targetSink": "linearTrim(str) at line 24",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "Linear index traversal for whitespace stripping eliminates regex engine invocation entirely; execution time strictly bounded O(N).",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Fixed benchmark counterpart validates complete elimination of regex backtracking mechanism."
+      },
+      "blobSha256": "2ae7d22114cb97e9186632467fb12fee70273c80bf98e3725bc506218d1a835f"
+    },
+    {
+      "caseId": "L2-03-VULN-AUTHZ",
+      "provenanceType": "SYNTHETIC_REGRESSION",
+      "family": "auth-and-tenancy",
+      "role": "VULNERABLE",
+      "cwe": "CWE-863",
+      "title": "Cross-Tenant Authorization Bypass in Organization Settings API (CWE-863 Benchmark Reproduction)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "targetFile": "evals/semantic-benchmark/01-authz-bypass.js",
+      "targetSink": "updateOrgSettings() at line 22",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "HIGH",
+      "cvssVector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N",
+      "technicalProof": "Authenticated user of Tenant A supplies targetOrgId of Tenant B; controller checks session validity but omits tenant membership assertion.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Confirms missing multi-tenant membership validation boundary before data mutation in internal benchmark fixture."
+      },
+      "blobSha256": "806b85ed9eceda54b0896d7ec65f8e10305a17f1881e5766ca55a4c7a23e5ded"
+    },
+    {
+      "caseId": "L2-04-FIX-AUTHZ",
+      "provenanceType": "SYNTHETIC_REGRESSION",
+      "family": "auth-and-tenancy",
+      "role": "FIXED_COUNTERPART",
+      "cwe": "CWE-863",
+      "title": "Cross-Tenant Authorization Remediated with Scoped Tenancy Guard (CWE-863 Fixed Benchmark)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "targetFile": "evals/semantic-benchmark/safe/01-authz-bypass.js",
+      "targetSink": "assertTenantMembership(req.user, targetOrgId) at line 18",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "Security middleware strictly asserts user tenancy membership and rejects cross-tenant requests with 403 Forbidden.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Validates that defenses lens correctly identifies the decisive authorization gate."
+      },
+      "blobSha256": "5127ebd45ba57edbad8d2c28eb9057180f9c3050018bfe8f0c12d86be1dbd0a2"
+    },
+    {
+      "caseId": "L2-05-VULN-PATHTRAVERSAL",
+      "provenanceType": "SYNTHETIC_REGRESSION",
+      "family": "path-and-filesystem",
+      "role": "VULNERABLE",
+      "cwe": "CWE-22",
+      "title": "Arbitrary File Overwrite via Unsanitized Archive Entry Extraction (CWE-22 Benchmark Reproduction)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "modeledAfterCve": "CVE-2021-32803",
+      "targetFile": "evals/oss-corpus/pre-fix/04-tar-path-traversal.js",
+      "targetSink": "fs.writeFileSync(entryPath) at line 10",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "HIGH",
+      "cvssVector": "CVSS:4.0/AV:L/AC:L/AT:N/PR:N/UI:R/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+      "technicalProof": "Tarball containing entry '../../etc/cron.d/evil' escapes destination root and overwrites host cron table.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Benchmark reproduction of path traversal and zip-slip directory escape."
+      },
+      "blobSha256": "7179c8411d4efb13390655639b23d4ba862bfca1d8cfadf8212ac38fd4d7cf0c"
+    },
+    {
+      "caseId": "L2-06-FIX-PATHTRAVERSAL",
+      "provenanceType": "SYNTHETIC_REGRESSION",
+      "family": "path-and-filesystem",
+      "role": "FIXED_COUNTERPART",
+      "cwe": "CWE-22",
+      "title": "Path Traversal Remediated with Canonical Directory Containment Assertion (CWE-22 Fixed Benchmark)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "modeledAfterCve": "CVE-2021-32803",
+      "targetFile": "evals/oss-corpus/post-fix/04-tar-path-traversal.js",
+      "targetSink": "assertWithinRoot(targetDir, entryPath) at line 15",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "Path containment assertion rejects any path whose relative resolution starts with '..' or resolves outside targetDir.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Confirms strict directory boundary verification suppressing false positives."
+      },
+      "blobSha256": "adba843ce35fcaea9a37b5877d25455af3999067e02fb2bc138b111e0171ecd6"
+    },
+    {
+      "caseId": "L2-07-VULN-PROTOTYPEPOLLUTION",
+      "provenanceType": "SYNTHETIC_REGRESSION",
+      "family": "parser-and-deserialization",
+      "role": "VULNERABLE",
+      "cwe": "CWE-1321",
+      "title": "Prototype Pollution via Recursive Object Property Assignment (CWE-1321 Benchmark Reproduction)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "modeledAfterCve": "CVE-2020-7598",
+      "targetFile": "evals/oss-corpus/pre-fix/01-minimist-prototype-pollution.js",
+      "targetSink": "setKey(obj, keys, value) at line 13",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "HIGH",
+      "cvssVector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N",
+      "technicalProof": "Command argument '--__proto__.polluted=true' injects property directly onto Object.prototype across the Node process.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Missing key sanitizer on recursive property setter allows prototype modification."
+      },
+      "blobSha256": "eb8c0889e0327885868d9bc967b3c1a5f1563bb59319fa9bc4de72374889ba63"
+    },
+    {
+      "caseId": "L2-08-FIX-PROTOTYPEPOLLUTION",
+      "provenanceType": "SYNTHETIC_REGRESSION",
+      "family": "parser-and-deserialization",
+      "role": "FIXED_COUNTERPART",
+      "cwe": "CWE-1321",
+      "title": "Prototype Pollution Remediated with Comprehensive Key Filtering (CWE-1321 Fixed Benchmark)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "80eeec495f1ce19509d27009720b753b09210221",
+      "blobSha256": "937061c37bfa8277ed0074888c427db176e78db058c1bcbedc5ce0c369f060cc",
+      "cveId": null,
+      "modeledAfterCve": "CVE-2020-7598",
+      "targetFile": "evals/oss-corpus/post-fix/01-minimist-prototype-pollution.js",
+      "targetSink": "if (key === '__proto__' || key === 'constructor' || key === 'prototype') return; at lines 9 and 14",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "Key filtering immediately drops __proto__, constructor, and prototype keys before navigation, neutralizing injection.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Fixed benchmark counterpart validates effective key sanitization against __proto__ and constructor.prototype bypass."
+      }
+    },
+    {
+      "caseId": "L2-09-VULN-CONCURRENCY",
+      "provenanceType": "SYNTHETIC_REGRESSION",
+      "family": "concurrency-and-lifecycle",
+      "role": "VULNERABLE",
+      "cwe": "CWE-367",
+      "title": "TOCTOU Race Condition in Asynchronous Wallet Withdrawal (CWE-367 Benchmark Reproduction)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "targetFile": "evals/semantic-benchmark/10-toctou-race-condition.js",
+      "targetSink": "account.balance >= amount check then balance -= amount across async delay at lines 14-18",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "HIGH",
+      "cvssVector": "CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:N/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N",
+      "technicalProof": "Concurrent withdrawal requests bypass balance check during the async delay before balance is decremented, allowing balance overdraft.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Unsynchronized check-then-act across async I/O delay creates exploitable TOCTOU race condition in benchmark fixture."
+      },
+      "blobSha256": "bc518e858fb4db0e3fdcfa2af405db39fb7e255cf51e9aae2dd4082ff06fe90b"
+    },
+    {
+      "caseId": "L2-10-VULN-SECRETS",
+      "provenanceType": "SYNTHETIC_REGRESSION",
+      "family": "secrets-and-configuration",
+      "role": "VULNERABLE",
+      "cwe": "CWE-798",
+      "title": "Hardcoded Production AWS Access Key & Secret in S3 Upload Utility (CWE-798 Benchmark Reproduction)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "targetFile": "evals/vulnerable/08-hardcoded-credential.js",
+      "targetSink": "AWS_SECRET_ACCESS_KEY assignment at line 6",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "CRITICAL",
+      "cvssVector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+      "technicalProof": "Static secret extractor retrieves high-entropy credential without runtime environment injection.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "High-entropy production credential committed directly in source code within internal benchmark."
+      },
+      "blobSha256": "f58f23698b0da651529cd7226340ad4652cc6fa6a479eaf2a65c989eead3ce6d"
+    },
+    {
+      "caseId": "L2-11-VULN-SUPPLYCHAIN",
+      "provenanceType": "SYNTHETIC_REGRESSION",
+      "family": "dependency-and-supply-chain",
+      "role": "VULNERABLE",
+      "cwe": "CWE-200",
+      "title": "Confidential Authorization Header Leakage on Cross-Origin Redirect (CWE-200 / CWE-918 Benchmark Reproduction)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "modeledAfterCve": "CVE-2020-28168",
+      "targetFile": "evals/oss-corpus/pre-fix/05-axios-ssrf-header-leak.js",
+      "targetSink": "forwardHeaders(redirectUrl) at line 10",
+      "expectedDisposition": "REPORTABLE",
+      "expectedSeverity": "MEDIUM",
+      "cvssVector": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:R/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N",
+      "technicalProof": "Attacker triggers redirect from trusted api.example.com to evil.com; Authorization Bearer token is leaked to evil.com.",
+      "humanOracle": {
+        "status": "CONFIRMED_VALID",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Supply-chain HTTP client benchmark reproduction blindly forwarding confidential headers across origin boundaries."
+      },
+      "blobSha256": "04c4d8089bcebd493b2d8f56ceba484961a9b6c1b8b907f04f9f177dc74c6bc7"
+    },
+    {
+      "caseId": "L2-12-CLEAN-LODASH-CLAMP",
+      "provenanceType": "SYNTHETIC_CLEAN_CONTROL",
+      "family": "injection-and-validation",
+      "role": "CLEAN_CONTROL",
+      "cwe": "CWE-1333",
+      "title": "Clean Negative Control: Mathematical Clamp Utility Function (Synthetic Control Fixture)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "targetFile": "evals/oss-corpus/clean-controls/01-lodash-clamp.js",
+      "targetSink": "clamp(number, lower, upper) at line 8",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "Non-vulnerable mathematical bounding function from mature open-source codebase; contains no regex, eval, or side effects.",
+      "humanOracle": {
+        "status": "CONFIRMED_CLEAN",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Synthetic negative control fixture verifying false-positive suppression on clean code (F08 Closure)."
+      },
+      "blobSha256": "7cc85f6b6b349a38f61f1278bb94fab69970a68c492899fe6e5a4c6238e2e03e"
+    },
+    {
+      "caseId": "L2-13-CLEAN-MINIMIST-PARSE",
+      "provenanceType": "SYNTHETIC_CLEAN_CONTROL",
+      "family": "parser-and-deserialization",
+      "role": "CLEAN_CONTROL",
+      "cwe": "CWE-1321",
+      "title": "Clean Negative Control: Option Parsing with Sanitized Prototype (Synthetic Control Fixture)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "targetFile": "evals/oss-corpus/clean-controls/02-minimist-clean-parse.js",
+      "targetSink": "parseCleanArgs(args) at line 8",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "Pure null-prototype map accumulator that discards prototype keys before navigation; completely impervious to prototype pollution.",
+      "humanOracle": {
+        "status": "CONFIRMED_CLEAN",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Synthetic negative control fixture verifying parser lens recognizes Object.create(null) sanitization (F08 Closure)."
+      },
+      "blobSha256": "735db08614ba6622c61db083db54f386024e356b7cfc961d0001a1c525094a90"
+    },
+    {
+      "caseId": "L2-14-CLEAN-TAR-HEADER",
+      "provenanceType": "SYNTHETIC_CLEAN_CONTROL",
+      "family": "path-and-filesystem",
+      "role": "CLEAN_CONTROL",
+      "cwe": "CWE-22",
+      "title": "Clean Negative Control: Numeric Octal Header Parser (Synthetic Control Fixture)",
+      "upstreamRepo": "https://github.com/arcobaleno64/three-lens.git",
+      "commitSha": "eddd0c38875c356fd20530b2e19cd12734d50155",
+      "cveId": null,
+      "targetFile": "evals/oss-corpus/clean-controls/03-node-tar-clean-header.js",
+      "targetSink": "parseNumeric(buf, offset, length) at line 8",
+      "expectedDisposition": "SUPPRESSED",
+      "expectedSeverity": "NONE",
+      "cvssVector": null,
+      "technicalProof": "Strictly bounded buffer slice iteration parsing ascii octal values into integers; performs zero filesystem calls.",
+      "humanOracle": {
+        "status": "CONFIRMED_CLEAN",
+        "adjudicatedBy": "AppSec Audit Panel",
+        "rationale": "Synthetic negative control fixture ensuring filesystem lens does not flag purely in-memory buffer operations as path risks (F08 Closure)."
+      },
+      "blobSha256": "1efb0d48a85c0bf707d7765e3c76314645bd92091b5d61696b25d67dd50653fe"
+    }
+  ]
+}
