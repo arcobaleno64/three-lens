@@ -6394,3 +6394,132 @@ test('R22-B01: Journal read failure / corruption enforces strict Default-Deny Fa
 
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
+
+test('R24-B01: Journal prefix deletion, index forgery, broken hash chain, and invalid signature enforce strict Fail-Closed under Default-Deny', () => {
+  const tempDir = createTempDir('r24-b01-journal-integrity-');
+  const rootAuth = generateTestAuthority();
+  const delegatedAuthA = generateTestAuthority();
+  const opts = {
+    pluginDataDir: tempDir,
+    allowInWorkspace: true,
+    trustedRootKeyId: rootAuth.keyId,
+    trustedRootPublicKeyPem: rootAuth.pem,
+    trustedRootFingerprint: rootAuth.fp,
+    signerPrivateKey: rootAuth.privateKey,
+    signerKeyId: rootAuth.keyId
+  };
+
+  // 1. Genesis v1 (Root only)
+  const v1 = {
+    schemaVersion: '1.0.0',
+    registryVersion: 1,
+    authority: 'IRV_SUPERVISOR_ROOT_AUTHORITY',
+    activeKeyId: rootAuth.keyId,
+    activeKeyFingerprint: rootAuth.fp,
+    activePublicKeyPem: rootAuth.pem,
+    keys: [
+      { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' }
+    ],
+    revokedKeyIds: []
+  };
+  saveTrustRegistry(v1, opts);
+
+  // Rotate to v2 delegating authority to delegatedAuthA
+  const v2 = createAuthorizedRegistryUpdate(
+    v1,
+    {
+      activeKeyId: delegatedAuthA.keyId,
+      activeKeyFingerprint: delegatedAuthA.fp,
+      activePublicKeyPem: delegatedAuthA.pem,
+      keys: [
+        { keyId: rootAuth.keyId, keyFingerprint: rootAuth.fp, publicKeyPem: rootAuth.pem, status: 'ACTIVE_PINNED_ROOT', issuedAt: '2026-10-16T06:55:39.565Z' },
+        { keyId: delegatedAuthA.keyId, keyFingerprint: delegatedAuthA.fp, publicKeyPem: delegatedAuthA.pem, status: 'ACTIVE', issuedAt: '2026-10-16T06:55:39.565Z' }
+      ]
+    },
+    rootAuth.keyId,
+    rootAuth.privateKey,
+    opts
+  );
+  saveTrustRegistry(v2, opts);
+
+  // 2. Append entry 0: KEY_REVOCATION(A)
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.KEY_REVOCATION,
+    targetId: delegatedAuthA.keyId,
+    reason: 'TEST_REVOCATION_A'
+  }, opts);
+
+  // 3. Append entry 1: NONCE_REVOCATION(X)
+  appendRevocationEntry({
+    revocationType: REVOCATION_TYPES.NONCE_REVOCATION,
+    targetId: 'NONCE-X',
+    reason: 'TEST_NONCE_X'
+  }, opts);
+
+  const journalPath = path.join(tempDir, '.irv-revocation-journal.jsonl');
+  const validJournalLines = fs.readFileSync(journalPath, 'utf8').trim().split('\n');
+  assert.strictEqual(validJournalLines.length, 2);
+
+  // Normal check: delegatedAuthA is revoked
+  const initialMap = getJournalRevokedKeyMap(tempDir, opts);
+  assert.strictEqual(initialMap.has(delegatedAuthA.keyId), true);
+
+  // --- Sub-test A (Auditor Counterexample A): Delete entry 0, keep entry 1 ---
+  fs.writeFileSync(journalPath, validJournalLines[1] + '\n', 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[JOURNAL_INDEX_CONTINUITY_VIOLATION\]|\[JOURNAL_HASH_CHAIN_BROKEN\]|\[JOURNAL_TRUNCATION_DETECTED\]|\[JOURNAL_CORRUPTION_DETECTED\]/
+  );
+  // Fail-closed across authorization entrypoints
+  assert.throws(
+    () => createAuthorizedRegistryUpdate(v2, { activeKeyId: rootAuth.keyId }, rootAuth.keyId, rootAuth.privateKey, opts),
+    /\[REVOCATION_STATUS_UNVERIFIABLE\]/
+  );
+  const valSubA = validateTrustRegistry(v2, opts);
+  assert.strictEqual(valSubA.valid, false);
+  assert.match(valSubA.error, /\[REVOCATION_STATUS_UNVERIFIABLE\]/);
+
+  // --- Sub-test B (Auditor Counterexample B): Forged high index 999999 ---
+  fs.writeFileSync(journalPath, JSON.stringify({
+    entryIndex: 999999,
+    targetId: 'DUMMY',
+    revocationType: 'NONCE_REVOCATION'
+  }) + '\n', 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[JOURNAL_INDEX_CONTINUITY_VIOLATION\]|\[JOURNAL_HASH_CHAIN_BROKEN\]|\[JOURNAL_CORRUPTION_DETECTED\]/
+  );
+
+  // --- Sub-test C: Broken hash chain (entry 1 has invalid prevEntryDigest) ---
+  const tamperedEntry1 = JSON.parse(validJournalLines[1]);
+  tamperedEntry1.prevEntryDigest = 'f'.repeat(64);
+  fs.writeFileSync(journalPath, validJournalLines[0] + '\n' + JSON.stringify(tamperedEntry1) + '\n', 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[JOURNAL_HASH_CHAIN_BROKEN\]|\[JOURNAL_CORRUPTION_DETECTED\]/
+  );
+
+  // --- Sub-test D: Unsigned or invalid signature entry ---
+  const unsignedEntry = JSON.parse(validJournalLines[0]);
+  delete unsignedEntry.signature;
+  fs.writeFileSync(journalPath, JSON.stringify(unsignedEntry) + '\n', 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /Unsigned revocation record detected|\[JOURNAL_CORRUPTION_DETECTED\]/
+  );
+
+  // --- Sub-test E: Anchor headDigest mismatch ---
+  // Create an entry with wrong content but entryIndex: 0
+  const fakeEntry0 = { ...JSON.parse(validJournalLines[0]), reason: 'TAMPERED_REASON' };
+  // sign it with valid key so signature passes, but digest won't match checkpoint / witness
+  const signPayload = Buffer.from(computeRevocationEntrySignPayload(fakeEntry0), 'utf8');
+  fakeEntry0.signature = crypto.sign(null, signPayload, rootAuth.privateKey).toString('hex');
+  fs.writeFileSync(journalPath, JSON.stringify(fakeEntry0) + '\n', 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[JOURNAL_HEAD_MISMATCH\]|\[JOURNAL_TRUNCATION_DETECTED\]/
+  );
+
+  // Cleanup
+  fs.rmSync(tempDir, { recursive: true, force: true });
+});

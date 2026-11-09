@@ -1,11 +1,11 @@
 {
   "schemaVersion": "1.0.0",
   "toolVersion": "1.11.0",
-  "generatedAt": "2026-11-09T03:26:34.616Z",
-  "manifestDigest": "a6cfe3ae5c4ffe0a8e16448789c627d996df124982b9fb65c5310f0f858e3422",
+  "generatedAt": "2026-11-09T04:21:16.640Z",
+  "manifestDigest": "1841c29a45a7dfb8658ea1a98d7cc994ecf2aebd1d3313cbb9c143678ebab118",
   "criticalScripts": {
     "scripts/adapters/cloudflare-adapter.mjs": "36c3eac48d828b2d582ac411db35c7bab4522d679d7d7a855de12fa6ef0ef2a0",
-    "scripts/adapters/plugin-data-adapter.mjs": "8702afc4af12471cdbc74dfd1dea53fee58a60b60aa8e226a581e511347b65d7",
+    "scripts/adapters/plugin-data-adapter.mjs": "3f16a89f9cf058a7cb15172e89f6f8a8abbbbdd4ca33d241a201fb0d6c4418ab",
     "scripts/build-inventory.mjs": "3b9e80a194c774aef53c8f7d410d50a4ed6cc514d64fa893233cc8190073844a",
     "scripts/build-threat-model.mjs": "b71c553f1bd61da374753d9f05891c839ae684f80103716afce1e6fbc4bae9e2",
     "scripts/compact-guard.mjs": "170aacd1b3cb5843c9d06dcd2eaf4bbe99d66f2c2f9e531b5ca1d0af8379f785",

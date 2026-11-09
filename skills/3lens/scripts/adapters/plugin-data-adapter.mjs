@@ -1448,9 +1448,10 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
   const witnessPath = path.join(dir, '.irv-monotonic-witness.json');
   const histDir = path.join(dir, 'history');
 
-  // R23-B01 & R23-B02: Check all physical anchors in dir to detect established revocation HWM.
+  // R23-B01, R23-B02 & R24-B01: Check all physical anchors in dir to detect established revocation HWM.
   // Any read/parse failure in these anchors MUST fail closed with specific errors instead of being swallowed.
   let expectedMinHeadIndex = -1;
+  const physicalAnchors = [];
 
   // 1. Checkpoint
   if (fs.existsSync(checkpointPath)) {
@@ -1458,6 +1459,9 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
       const cp = JSON.parse(fs.readFileSync(checkpointPath, 'utf8'));
       if (typeof cp?.headIndex === 'number' && cp.headIndex >= 0) {
         expectedMinHeadIndex = Math.max(expectedMinHeadIndex, cp.headIndex);
+        if (typeof cp.headDigest === 'string' && cp.headDigest) {
+          physicalAnchors.push({ headIndex: cp.headIndex, headDigest: cp.headDigest, source: 'checkpoint' });
+        }
       }
     } catch (cpErr) {
       throw new Error(`[CHECKPOINT_READ_FAILURE] Failed to read checkpoint at '${checkpointPath}': ${cpErr.message}`);
@@ -1465,13 +1469,20 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
   }
 
   // 2. On-disk registries: check both supervisor-trust-registry.json AND trust-registry.json (R23-B02)
+  let onDiskRegForKeys = null;
   for (const regName of ['supervisor-trust-registry.json', 'trust-registry.json']) {
     const regPath = path.join(dir, regName);
     if (fs.existsSync(regPath)) {
       try {
         const reg = JSON.parse(fs.readFileSync(regPath, 'utf8'));
+        if (!onDiskRegForKeys && reg && typeof reg === 'object') {
+          onDiskRegForKeys = reg;
+        }
         if (reg?.revocationHighWaterMark && typeof reg.revocationHighWaterMark.headIndex === 'number' && reg.revocationHighWaterMark.headIndex >= 0) {
           expectedMinHeadIndex = Math.max(expectedMinHeadIndex, reg.revocationHighWaterMark.headIndex);
+          if (typeof reg.revocationHighWaterMark.headDigest === 'string' && reg.revocationHighWaterMark.headDigest) {
+            physicalAnchors.push({ headIndex: reg.revocationHighWaterMark.headIndex, headDigest: reg.revocationHighWaterMark.headDigest, source: `registry (${regName})` });
+          }
         }
       } catch (rErr) {
         throw new Error(`[REGISTRY_READ_FAILURE] Failed to read on-disk registry at '${regPath}': ${rErr.message}`);
@@ -1485,6 +1496,9 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
       const wit = JSON.parse(fs.readFileSync(witnessPath, 'utf8'));
       if (typeof wit?.maxSeenHwmHeadIndex === 'number' && wit.maxSeenHwmHeadIndex >= 0) {
         expectedMinHeadIndex = Math.max(expectedMinHeadIndex, wit.maxSeenHwmHeadIndex);
+        if (typeof wit.maxSeenHwmHeadDigest === 'string' && wit.maxSeenHwmHeadDigest) {
+          physicalAnchors.push({ headIndex: wit.maxSeenHwmHeadIndex, headDigest: wit.maxSeenHwmHeadDigest, source: 'witness' });
+        }
       }
     } catch (wErr) {
       throw new Error(`[WITNESS_READ_FAILURE] Failed to read witness at '${witnessPath}': ${wErr.message}`);
@@ -1505,6 +1519,9 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
           const hReg = JSON.parse(fs.readFileSync(path.join(histDir, hf), 'utf8'));
           if (hReg?.revocationHighWaterMark && typeof hReg.revocationHighWaterMark.headIndex === 'number' && hReg.revocationHighWaterMark.headIndex >= 0) {
             expectedMinHeadIndex = Math.max(expectedMinHeadIndex, hReg.revocationHighWaterMark.headIndex);
+            if (typeof hReg.revocationHighWaterMark.headDigest === 'string' && hReg.revocationHighWaterMark.headDigest) {
+              physicalAnchors.push({ headIndex: hReg.revocationHighWaterMark.headIndex, headDigest: hReg.revocationHighWaterMark.headDigest, source: `history (${hf})` });
+            }
           }
         } catch (hfErr) {
           throw new Error(`[HISTORY_READ_FAILURE] Failed to read historical registry at '${hf}': ${hfErr.message}`);
@@ -1530,7 +1547,7 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
 
   const lines = content.split(/\r?\n/).filter(l => l.trim().length > 0);
 
-  // R23-B01: If journal exists but is empty or truncated below expectedMinHeadIndex, FAIL CLOSED!
+  // R23-B01 & R24-B01: If journal exists but is empty or truncated below expectedMinHeadIndex, FAIL CLOSED!
   if (lines.length === 0) {
     if (expectedMinHeadIndex >= 0) {
       throw new Error(`[JOURNAL_ROLLBACK_DETECTED] [JOURNAL_TRUNCATION_DETECTED] Journal file is empty (0 entries) in established installation with recorded high-water mark headIndex ${expectedMinHeadIndex}`);
@@ -1538,7 +1555,13 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
     return revokedMap;
   }
 
-  let maxJournalIndex = -1;
+  // R24-B01: Resolve trusted keys and active signing windows for cryptographic signature verification
+  const activeRegForKeys = options.registry || onDiskRegForKeys;
+  const { trustedKeys, maxActiveIndexPerKey } = resolveJournalTrustedKeyWindows(dir, activeRegForKeys, options);
+
+  let expectedPrevDigest = '0'.repeat(64);
+  const computedDigests = [];
+
   for (let i = 0; i < lines.length; i++) {
     let parsed;
     try {
@@ -1552,20 +1575,69 @@ export function getJournalRevokedKeyMap(dir, options = {}) {
     if (typeof parsed.targetId !== 'string' || !parsed.targetId.trim()) {
       throw new Error(`[JOURNAL_CORRUPTION_DETECTED] Missing targetId in revocation journal '${journalPath}' at line ${i + 1}`);
     }
-    const entryIdx = typeof parsed.entryIndex === 'number' ? parsed.entryIndex : i;
-    if (entryIdx > maxJournalIndex) {
-      maxJournalIndex = entryIdx;
+
+    // R24-B01: Strict sequential entryIndex starting at 0 (neutralizes prefix deletion and fake index injection)
+    if (parsed.entryIndex !== i) {
+      throw new Error(`[JOURNAL_CORRUPTION_DETECTED] [JOURNAL_INDEX_CONTINUITY_VIOLATION] Entry index mismatch in revocation journal '${journalPath}' at line ${i + 1}: expected ${i}, found ${parsed.entryIndex}`);
     }
-    if (parsed.revocationType === REVOCATION_TYPES.KEY_REVOCATION || parsed.revocationType === 'KEY_REVOCATION') {
+
+    // R24-B01: Strict cryptographic hash chaining (neutralizes intermediate omission)
+    if (parsed.prevEntryDigest !== expectedPrevDigest) {
+      throw new Error(`[JOURNAL_CORRUPTION_DETECTED] [JOURNAL_HASH_CHAIN_BROKEN] Broken hash chain in revocation journal '${journalPath}' at line ${i + 1}: expected ${expectedPrevDigest}, found ${parsed.prevEntryDigest}`);
+    }
+
+    // R24-B01: Mandatory cryptographic signature & signer verification
+    if (!parsed.signature || !parsed.signedBy) {
+      throw new Error(`[JOURNAL_CORRUPTION_DETECTED] Unsigned revocation record detected in '${journalPath}' at line ${i + 1} (targetId: ${parsed.targetId})`);
+    }
+
+    const signerPem = trustedKeys.get(parsed.signedBy);
+    if (!signerPem) {
+      throw new Error(`[JOURNAL_CORRUPTION_DETECTED] [UNTRUSTED_SIGNER] Signer '${parsed.signedBy}' in revocation journal '${journalPath}' at line ${i + 1} is not a trusted supervisor key`);
+    }
+
+    // Key lifecycle active index constraint
+    const maxIdxForSigner = maxActiveIndexPerKey.get(parsed.signedBy);
+    if (typeof maxIdxForSigner === 'number' && maxIdxForSigner !== Infinity && parsed.entryIndex > maxIdxForSigner) {
+      throw new Error(`[RETIRED_KEY_AUTHORIZATION_REJECTED] Signer '${parsed.signedBy}' was retired or revoked at index ${maxIdxForSigner} and cannot authorize revocation record at index ${parsed.entryIndex}`);
+    }
+
+    // Cryptographic Ed25519 verification
+    const signPayload = Buffer.from(computeRevocationEntrySignPayload(parsed), 'utf8');
+    const isSigValid = crypto.verify(null, signPayload, signerPem, Buffer.from(parsed.signature, 'hex'));
+    if (!isSigValid) {
+      throw new Error(`[JOURNAL_CORRUPTION_DETECTED] [SIGNATURE_VERIFICATION_FAILED] Signature verification failed for revocation record in '${journalPath}' at line ${i + 1} (targetId: ${parsed.targetId})`);
+    }
+
+    // Terminate signer lifecycle dynamically if this entry revokes a key
+    if (parsed.targetId && (parsed.revocationType === REVOCATION_TYPES.KEY_REVOCATION || parsed.revocationType === 'KEY_REVOCATION')) {
+      const existingMax = maxActiveIndexPerKey.get(parsed.targetId);
+      maxActiveIndexPerKey.set(parsed.targetId, Math.min(existingMax ?? Infinity, parsed.entryIndex));
       if (!revokedMap.has(parsed.targetId)) {
-        revokedMap.set(parsed.targetId, entryIdx);
+        revokedMap.set(parsed.targetId, i);
       }
     }
+
+    const curDigest = sha256Digest(canonicalJsonStringify(parsed));
+    computedDigests.push(curDigest);
+    expectedPrevDigest = curDigest;
   }
 
-  // R23-B01: Truncation check against recorded physical anchors
-  if (expectedMinHeadIndex >= 0 && maxJournalIndex < expectedMinHeadIndex) {
-    throw new Error(`[JOURNAL_ROLLBACK_DETECTED] [JOURNAL_TRUNCATION_DETECTED] Journal file truncated: contains entries up to index ${maxJournalIndex} but established installation recorded high-water mark headIndex ${expectedMinHeadIndex}`);
+  // R23-B01 & R24-B01: Truncation check against recorded physical anchors
+  if (expectedMinHeadIndex >= 0 && lines.length < expectedMinHeadIndex + 1) {
+    throw new Error(`[JOURNAL_ROLLBACK_DETECTED] [JOURNAL_TRUNCATION_DETECTED] Journal file truncated: contains ${lines.length} entries but established installation recorded high-water mark headIndex ${expectedMinHeadIndex}`);
+  }
+
+  // R24-B01: Verify computed entry digests against all physical anchor headDigests
+  for (const anchor of physicalAnchors) {
+    if (anchor.headIndex >= 0 && anchor.headDigest) {
+      if (anchor.headIndex >= computedDigests.length) {
+        throw new Error(`[JOURNAL_ROLLBACK_DETECTED] [JOURNAL_TRUNCATION_DETECTED] Journal line count (${computedDigests.length}) is less than required anchor headIndex (${anchor.headIndex}) from ${anchor.source}`);
+      }
+      if (computedDigests[anchor.headIndex] !== anchor.headDigest) {
+        throw new Error(`[JOURNAL_HEAD_MISMATCH] Journal entry digest at index ${anchor.headIndex} (${computedDigests[anchor.headIndex]}) does not match ${anchor.source} headDigest (${anchor.headDigest})`);
+      }
+    }
   }
 
   return revokedMap;
@@ -4674,9 +4746,16 @@ export function isRevoked(targetId, options = {}) {
 function _isRevokedInner(targetId, options = {}) {
   const regLoad = loadTrustRegistry({ ...options, failClosed: false, skipLock: true });
   if (!regLoad.valid) {
+    const isJournalErr = regLoad.error && (
+      regLoad.error.includes('JOURNAL_CORRUPT') ||
+      regLoad.error.includes('JOURNAL_') ||
+      regLoad.error.includes('REVOCATION_STATUS_UNVERIFIABLE')
+    );
     return {
       revoked: true,
-      reason: `REGISTRY_CORRUPTED_FAIL_CLOSED: ${regLoad.error || 'unknown error'}`,
+      reason: isJournalErr
+        ? `JOURNAL_CORRUPTED_FAIL_CLOSED: ${regLoad.error}`
+        : `REGISTRY_CORRUPTED_FAIL_CLOSED: ${regLoad.error || 'unknown error'}`,
       entry: null
     };
   }
