@@ -22,6 +22,26 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, '..');
 
+/**
+ * Resolves the real canonical filesystem path, resolving all symbolic links and junctions.
+ * @param {string} p
+ * @returns {string}
+ */
+export function getCanonicalRealPath(p) {
+  try {
+    return fs.realpathSync.native ? fs.realpathSync.native(p) : fs.realpathSync(p);
+  } catch {
+    const parent = path.dirname(p);
+    const base = path.basename(p);
+    try {
+      const realParent = fs.realpathSync.native ? fs.realpathSync.native(parent) : fs.realpathSync(parent);
+      return path.join(realParent, base);
+    } catch {
+      return path.resolve(p);
+    }
+  }
+}
+
 const DEFAULT_CORPUS_PATH = path.join(REPO_ROOT, 'evals', 'v2-corpus', 'layer2-external-validity-corpus.json');
 const DEFAULT_OUT_DIR = path.join(REPO_ROOT, 'evals', 'oss-checkouts');
 
@@ -135,19 +155,27 @@ export async function runHarness(options = {}) {
   let verifiedCount = 0;
   let failedCount = 0;
   const resolvedOutDir = path.resolve(outDir);
+  const canonicalRepoRoot = getCanonicalRealPath(REPO_ROOT);
+  const canonicalResolvedOutDir = getCanonicalRealPath(resolvedOutDir);
 
-  // R05-F05: Confine outDir strictly to dedicated repository harness sandbox paths
+  // R05-F05 & R06-F04: Confine outDir strictly to dedicated repository harness sandbox paths
+  // Validates both string lexical path and physical canonical realpath across symlinks/junctions
   const allowedBaseDirs = [
     path.join(REPO_ROOT, 'evals', 'oss-checkouts'),
     path.join(REPO_ROOT, 'evals', 'live-runs'),
     path.join(REPO_ROOT, 'scratch')
   ];
-  const isAllowedOutDir = allowedBaseDirs.some(base =>
+  const isStringAllowed = allowedBaseDirs.some(base =>
     resolvedOutDir === base || resolvedOutDir.startsWith(base + path.sep)
   );
-  if (!isAllowedOutDir) {
+  const canonicalAllowedBases = allowedBaseDirs.map(getCanonicalRealPath);
+  const isPhysicalAllowed = canonicalAllowedBases.some(base =>
+    canonicalResolvedOutDir === base || canonicalResolvedOutDir.startsWith(base + path.sep)
+  );
+
+  if (!isStringAllowed || !isPhysicalAllowed) {
     throw new Error(
-      `Security Exception (R05-F05): outDir '${resolvedOutDir}' must be confined to repository sandbox paths (${allowedBaseDirs.map(d => path.relative(REPO_ROOT, d)).join(', ')})`
+      `Security Exception (R06-F04): outDir '${resolvedOutDir}' physically escapes allowed sandbox roots (${allowedBaseDirs.map(d => path.relative(REPO_ROOT, d)).join(', ')})`
     );
   }
 
@@ -186,29 +214,52 @@ export async function runHarness(options = {}) {
       console.log(`  ✔ Dry-run format valid: ${commitSha.slice(0, 10)} from ${upstreamUrl}`);
       verifiedCount++;
     } else {
-      // Hermetic checkout logic with strict directory containment check
+      // Hermetic checkout logic with strict lexical and physical containment checks
       const safeRole = String(tc.role || 'role').toLowerCase().replace(/[^a-z0-9_-]/g, '_');
       const targetDir = path.resolve(resolvedOutDir, `${safePkg}-${safeRole}-${commitSha.slice(0, 7)}`);
+      const canonicalTarget = getCanonicalRealPath(targetDir);
 
-      if (!targetDir.startsWith(resolvedOutDir + path.sep)) {
-        throw new Error(`Path containment violation: ${targetDir} escapes outDir ${resolvedOutDir}`);
+      if (!targetDir.startsWith(resolvedOutDir + path.sep) || !canonicalTarget.startsWith(canonicalResolvedOutDir + path.sep)) {
+        throw new Error(`Path containment violation (R06-F04): ${targetDir} escapes outDir ${resolvedOutDir}`);
       }
 
-      // R04-F05 & R05-F03: Safe harness directory purger preventing recursive deletion of arbitrary directories
-      // Harness marker metadata is stored OUTSIDE the checkout directory to ensure Zero Workspace Pollution.
-      function safePurgeHarnessTarget(dir, baseOutDir, expectedRemote) {
-        if (!dir.startsWith(baseOutDir + path.sep)) {
-          throw new Error(`Security Exception: targetDir ${dir} escapes base outDir ${baseOutDir}`);
+      // R04-F05, R05-F03 & R06-F04: Safe harness directory purger with physical containment and identity binding
+      function safePurgeHarnessTarget(dir, baseOutDir, expectedRemote, expectedCaseId, expectedCommitSha) {
+        const canonicalDir = getCanonicalRealPath(dir);
+        const canonicalBase = getCanonicalRealPath(baseOutDir);
+        if (!canonicalDir.startsWith(canonicalBase + path.sep)) {
+          throw new Error(`Security Exception (R06-F04): targetDir ${dir} physically escapes base outDir ${baseOutDir}`);
         }
         if (!fs.existsSync(dir)) return;
+
+        // If target directory itself is a symlink or junction, unlink it without recursing into external target
+        const lstat = fs.lstatSync(dir);
+        if (lstat.isSymbolicLink()) {
+          fs.unlinkSync(dir);
+          return;
+        }
+
         const marker = path.join(baseOutDir, `.${path.basename(dir)}.harness-metadata.json`);
         const legacyInternalMarker = path.join(dir, '.three-lens-harness-checkout');
         const gitConfig = path.join(dir, '.git', 'config');
-        const isHarnessOwned = fs.existsSync(marker) ||
-          fs.existsSync(legacyInternalMarker) ||
-          (fs.existsSync(gitConfig) && fs.readFileSync(gitConfig, 'utf8').includes(expectedRemote));
+        let isHarnessOwned = false;
+
+        if (fs.existsSync(marker)) {
+          try {
+            const data = JSON.parse(fs.readFileSync(marker, 'utf8'));
+            if ((!expectedCaseId || data.caseId === expectedCaseId) &&
+                (!expectedCommitSha || data.upstreamCommitSha === expectedCommitSha)) {
+              isHarnessOwned = true;
+            }
+          } catch {}
+        }
+        if (fs.existsSync(legacyInternalMarker)) isHarnessOwned = true;
+        if (fs.existsSync(gitConfig) && fs.readFileSync(gitConfig, 'utf8').includes(expectedRemote)) {
+          isHarnessOwned = true;
+        }
+
         if (!isHarnessOwned && fs.readdirSync(dir).length > 0) {
-          throw new Error(`Safety Exception (R04-F05): Refusing to delete directory '${dir}' without verified harness ownership`);
+          throw new Error(`Safety Exception (R06-F04): Refusing to delete directory '${dir}' without verified identity binding`);
         }
         fs.rmSync(dir, { recursive: true, force: true });
         if (fs.existsSync(marker)) {
@@ -263,7 +314,7 @@ export async function runHarness(options = {}) {
         // If directory exists but failed validation, safely remove it before re-cloning
         if (fs.existsSync(targetDir)) {
           console.warn(`  ⚠ Partial or invalid checkout detected at: ${path.relative(REPO_ROOT, targetDir)}, cleaning up safely...`);
-          safePurgeHarnessTarget(targetDir, resolvedOutDir, upstreamUrl);
+          safePurgeHarnessTarget(targetDir, resolvedOutDir, upstreamUrl, caseId, commitSha);
         }
 
         console.log(`  Cloning to isolated sandbox: ${path.relative(REPO_ROOT, targetDir)}...`);
@@ -271,7 +322,7 @@ export async function runHarness(options = {}) {
         try {
           execFileSync('git', ['clone', '--no-checkout', upstreamUrl, targetDir], { stdio: 'pipe' });
           execFileSync('git', ['checkout', commitSha], { cwd: targetDir, stdio: 'pipe' });
-          // Stamp harness ownership marker OUTSIDE targetDir to prevent working tree pollution (R05-F03)
+          // Stamp harness ownership marker OUTSIDE targetDir to prevent working tree pollution (R05-F03 & R06-F04)
           const externalMarker = path.join(resolvedOutDir, `.${path.basename(targetDir)}.harness-metadata.json`);
           fs.writeFileSync(externalMarker, JSON.stringify({
             caseId: tc.caseId,
@@ -284,7 +335,7 @@ export async function runHarness(options = {}) {
           console.error(`  ✖ Checkout failed: ${err.message}`);
           // Ensure incomplete directory is safely deleted fail-closed
           if (fs.existsSync(targetDir)) {
-            try { safePurgeHarnessTarget(targetDir, resolvedOutDir, upstreamUrl); } catch {}
+            try { safePurgeHarnessTarget(targetDir, resolvedOutDir, upstreamUrl, caseId, commitSha); } catch {}
           }
           failedCount++;
         }

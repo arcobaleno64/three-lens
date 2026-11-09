@@ -35,6 +35,9 @@ test('ACP Adapter: mapSeverityToAcpDiagnostic severity mapping and Default-Deny 
 });
 
 test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata', () => {
+  const keyPair = crypto.generateKeyPairSync('ed25519');
+  const pubPem = keyPair.publicKey.export({ type: 'spki', format: 'pem' });
+
   const finding = {
     id: 'FIND-001',
     ruleId: 'CWE-89',
@@ -59,8 +62,9 @@ test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata'
     proofKind: 'STATIC_TRACE',
     remediation: 'Use parameterized queries'
   };
+  finding.authorityProof = signFindingAuthorityProof(finding, keyPair.privateKey, 'SUPERVISOR_ROOT', pubPem);
 
-  const diag = formatAcpDiagnostic(finding);
+  const diag = formatAcpDiagnostic(finding, { trustedRootPublicKeyPem: pubPem });
 
   assert.equal(diag.code, 'CWE-89');
   assert.equal(diag.source, 'Three-Lens');
@@ -76,7 +80,7 @@ test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata'
   assert.equal(diag.data.remediation, 'Use parameterized queries');
 });
 
-test('ACP Adapter: R04-F01 / R05-F01 Spoofed authority claims strictly fail closed to HINT', () => {
+test('ACP Adapter: R04-F01 / R05-F01 / R06-F01 Spoofed authority claims strictly fail closed to HINT', () => {
   // 1. ChatGPT explicit mandate: REPORTABLE + CRITICAL + lineageId: 'x'
   const spoofedLineage = {
     id: 'SPOOF-001',
@@ -164,9 +168,34 @@ test('ACP Adapter: R04-F01 / R05-F01 Spoofed authority claims strictly fail clos
   assert.equal(formatAcpDiagnostic(refutedCandidate).data.authorityConfirmed, false);
   assert.equal(formatAcpDiagnostic(refutedCandidate).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
 
-  // 7. Forged 32-char signature length string without real crypto verification (R05-F01)
+  // 7. R06-F01 MANDATORY NEGATIVE TEST: Three complete, valid SUPPORTS ballots without cryptographic authorityProof MUST FAIL CLOSED
+  const unproven3Ballots = {
+    id: 'SPOOF-007-UNPROVEN-BALLOTS',
+    ruleId: 'CWE-89',
+    title: 'Candidate with 3 complete SUPPORTS ballots but no cryptographic authorityProof',
+    severity: 'CRITICAL',
+    disposition: 'REPORTABLE',
+    ballots: [
+      { lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: ['http sink reachable'] },
+      { lens: 'DEFENSES', decision: 'SUPPORTS', evidence: ['no escaping applied'] },
+      { lens: 'IMPACT', decision: 'SUPPORTS', evidence: ['database compromise possible'] }
+    ],
+    location: { startLine: 10 }
+  };
+  assert.equal(
+    formatAcpDiagnostic(unproven3Ballots).data.authorityConfirmed,
+    false,
+    'R06-F01 Invariant: Ballots alone without cryptographic authorityProof MUST NEVER confer authority'
+  );
+  assert.equal(
+    formatAcpDiagnostic(unproven3Ballots).severity,
+    ACP_DIAGNOSTIC_SEVERITY.HINT,
+    'Unproven candidate with ballots must clamp to HINT (4)'
+  );
+
+  // 8. Forged 32-char signature length string without real crypto verification (R05-F01)
   const forgedSigCandidate = {
-    id: 'SPOOF-007',
+    id: 'SPOOF-008',
     ruleId: 'CWE-89',
     title: 'Candidate with mock 32-char string signature',
     severity: 'CRITICAL',
@@ -181,25 +210,7 @@ test('ACP Adapter: R04-F01 / R05-F01 Spoofed authority claims strictly fail clos
   assert.equal(formatAcpDiagnostic(forgedSigCandidate).data.authorityConfirmed, false);
   assert.equal(formatAcpDiagnostic(forgedSigCandidate).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
 
-  // 8. Positive counterpart A: Authentic 3-Lens panel (REACHABILITY, DEFENSES, IMPACT)
-  const authentic3LensCandidate = {
-    id: 'VALID-3LENS-001',
-    ruleId: 'CWE-89',
-    title: 'Candidate with authentic 3-lens quorum',
-    severity: 'CRITICAL',
-    disposition: 'REPORTABLE',
-    ballots: [
-      { lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: ['http sink reachable'] },
-      { lens: 'DEFENSES', decision: 'SUPPORTS', evidence: ['no escaping applied'] },
-      { lens: 'IMPACT', decision: 'SUPPORTS', evidence: ['database compromise possible'] }
-    ],
-    location: { startLine: 10 }
-  };
-  const diag3Lens = formatAcpDiagnostic(authentic3LensCandidate);
-  assert.equal(diag3Lens.data.authorityConfirmed, true);
-  assert.equal(diag3Lens.severity, ACP_DIAGNOSTIC_SEVERITY.ERROR);
-
-  // 9. Positive counterpart B: Authentic cryptographic Ed25519 signature verified
+  // 9. Positive counterpart: Authentic cryptographic Ed25519 signature verified
   const keyPair = crypto.generateKeyPairSync('ed25519');
   const pubPem = keyPair.publicKey.export({ type: 'spki', format: 'pem' });
   const validCryptoCandidate = {
@@ -322,6 +333,9 @@ test('ACP Adapter: serializeJsonRpcNotification single-line JSON with trailing L
 });
 
 test('ACP Adapter: formatPublishDiagnosticsNotification formats full notification', () => {
+  const keyPair = crypto.generateKeyPairSync('ed25519');
+  const pubPem = keyPair.publicKey.export({ type: 'spki', format: 'pem' });
+
   const findings = [
     {
       id: 'F-1',
@@ -338,8 +352,9 @@ test('ACP Adapter: formatPublishDiagnosticsNotification formats full notificatio
       location: { startLine: 10 }
     }
   ];
+  findings[0].authorityProof = signFindingAuthorityProof(findings[0], keyPair.privateKey, 'SUPERVISOR_ROOT', pubPem);
 
-  const raw = formatPublishDiagnosticsNotification('file:///path/to/app.js', findings);
+  const raw = formatPublishDiagnosticsNotification('file:///path/to/app.js', findings, { trustedRootPublicKeyPem: pubPem });
   const parsed = JSON.parse(raw.trim());
 
   assert.equal(parsed.jsonrpc, '2.0');
@@ -382,7 +397,7 @@ test('ACP Adapter: R01-F03 / R02-02 handleInitialize aligns with validateAcpHand
   assert.ok(resp.result._meta.supportedNotifications.includes('textDocument/publishDiagnostics'));
 });
 
-test('ACP Adapter: R03-F04 / R04-F02 / R05-F02 session cancellation, turn isolation, and ACP v1 payload', () => {
+test('ACP Adapter: R03-F04 / R04-F02 / R05-F02 / R06-F02 / R06-F03 session cancellation, turn isolation, and ACP v1 payload', () => {
   const chunks = [];
   const mockStream = {
     write(chunk) {
@@ -392,23 +407,25 @@ test('ACP Adapter: R03-F04 / R04-F02 / R05-F02 session cancellation, turn isolat
 
   const emitter = createAcpDiagnosticEmitter(mockStream);
 
-  // 1. Session-scoped cancellation: cancel sess-1
-  const notifCancel = emitter.handleMessage('{"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "sess-1"}}\n');
+  // 1. Session-scoped cancellation: cancel sess-1 turn 1
+  const notifCancel = emitter.handleMessage('{"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "sess-1", "turnId": 1}}\n');
   assert.equal(notifCancel.cancelled, true);
   assert.equal(notifCancel.sessionId, 'sess-1');
+  assert.equal(notifCancel.turnId, 1);
+  assert.equal(notifCancel.stopReason, 'cancelled');
   assert.equal(chunks.length, 0, 'Notification without id must not write a response to stream');
   assert.equal(emitter.isCancelled('sess-1'), true);
   assert.equal(emitter.isCancelled('sess-2'), false, 'sess-2 must remain uncancelled');
 
   // 2. Cancellation strictly drops subsequent emitDiagnostic and emitSessionUpdate calls for sess-1
-  const droppedDiag = emitter.emitDiagnostic('src/index.js', { id: 'F-DROPPED', severity: 'HIGH' }, { sessionId: 'sess-1' });
+  const droppedDiag = emitter.emitDiagnostic('src/index.js', { id: 'F-DROPPED', severity: 'HIGH' }, { sessionId: 'sess-1', turnId: 1 });
   assert.equal(droppedDiag, null);
-  const droppedUpdate = emitter.emitSessionUpdate('sess-1', { progress: 0.5 });
+  const droppedUpdate = emitter.emitSessionUpdate('sess-1', { progress: 0.5 }, { turnId: 1 });
   assert.equal(droppedUpdate, null);
   assert.equal(chunks.length, 0, 'Cancelled session must not write any diagnostic or update');
 
-  // 3. Uncancelled session sess-2 continues to emit and conforms to ACP v1 { sessionId, update: { sessionUpdate, ... } }
-  const liveUpdate = emitter.emitSessionUpdate('sess-2', { progress: 0.8 });
+  // 3. Uncancelled session sess-2 continues to emit and conforms to ACP v1 { sessionId, update: { sessionUpdate, content } }
+  const liveUpdate = emitter.emitSessionUpdate('sess-2', { message: 'analyzing workspace' });
   assert.ok(liveUpdate !== null);
   assert.equal(chunks.length, 1);
   const updateObj = JSON.parse(chunks[0].trim());
@@ -416,32 +433,42 @@ test('ACP Adapter: R03-F04 / R04-F02 / R05-F02 session cancellation, turn isolat
   assert.equal(updateObj.method, 'session/update');
   assert.equal(updateObj.params.sessionId, 'sess-2');
   assert.equal(updateObj.params.update.sessionUpdate, 'agent_message_chunk');
-  assert.equal(updateObj.params.update.progress, 0.8);
+  assert.deepEqual(updateObj.params.update.content, { type: 'text', text: 'analyzing workspace' });
 
-  // 4. New prompt turn for sess-1 resets cancellation state (R05-F02)
-  emitter.handleMessage('{"jsonrpc": "2.0", "method": "session/prompt", "params": {"sessionId": "sess-1"}}\n');
-  assert.equal(emitter.isCancelled('sess-1'), false, 'session/prompt must clear prior turn cancellation');
-  const restoredUpdate = emitter.emitSessionUpdate('sess-1', { progress: 0.1 });
-  assert.ok(restoredUpdate !== null);
+  // 4. New prompt turn for sess-1 increments turn generation and resets cancellation state (R05-F02 & R06-F03)
+  const promptResp = emitter.handleMessage('{"jsonrpc": "2.0", "id": 201, "method": "session/prompt", "params": {"sessionId": "sess-1"}}\n');
+  assert.equal(promptResp.result.status, 'completed');
+  assert.equal(promptResp.result.stopReason, 'end_turn');
+  assert.equal(promptResp.result.turnId, 2, 'New prompt must advance to turn generation 2');
+  assert.equal(emitter.isCancelled('sess-1'), false, 'session/prompt must clear prior session cancellation');
 
-  // 5. Request (with id) writes standard JSON-RPC response
+  // R06-F03 Invariant: Stale emission from old generation turn 1 is rejected, while current turn 2 is allowed
+  const staleTurnEmission = emitter.emitSessionUpdate('sess-1', { progress: 0.1 }, { turnId: 1 });
+  assert.equal(staleTurnEmission, null, 'Stale turn 1 emission must be rejected under Generation Token invariant');
+  const restoredUpdate = emitter.emitSessionUpdate('sess-1', { progress: 0.2 }, { turnId: 2 });
+  assert.ok(restoredUpdate !== null, 'Current generation turn 2 emission must be allowed');
+
+  // 5. Request (with id) writes standard JSON-RPC response with stopReason: 'cancelled'
   const freshChunks = [];
   const freshStream = { write(c) { freshChunks.push(c); } };
   const freshEmitter = createAcpDiagnosticEmitter(freshStream);
-  const cancelResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 101, "method": "session/cancel", "params": {"sessionId": "sess-101"}}\n');
+  const cancelResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 101, "method": "session/cancel", "params": {"sessionId": "sess-101", "turnId": 1}}\n');
   assert.equal(cancelResp.id, 101);
   assert.equal(cancelResp.result.cancelled, true);
+  assert.equal(cancelResp.result.stopReason, 'cancelled');
   assert.equal(freshChunks.length, 1);
   const respObj = JSON.parse(freshChunks[0].trim());
   assert.equal(respObj.id, 101);
   assert.equal(respObj.result.cancelled, true);
+  assert.equal(respObj.result.stopReason, 'cancelled');
 
-  // 6. $/cancel_request notification and request handling
+  // 6. $/cancel_request notification and request handling with requestId and stopReason
   freshEmitter.handleMessage('{"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": "req-99"}}\n');
   assert.equal(freshChunks.length, 1, 'Notification $/cancel_request must not write to stream');
   const cancelReqResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 103, "method": "$/cancel_request", "params": {"requestId": "req-103"}}\n');
   assert.equal(cancelReqResp.id, 103);
   assert.equal(cancelReqResp.result.cancelled, true);
+  assert.equal(cancelReqResp.result.stopReason, 'cancelled');
 
   // 7. Shutdown request handling
   const shutdownResp = freshEmitter.handleMessage('{"jsonrpc": "2.0", "id": 102, "method": "shutdown", "params": {}}\n');
@@ -469,6 +496,9 @@ test('ACP Adapter: parseJsonRpcMessage validation and error handling', () => {
 });
 
 test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting', () => {
+  const keyPair = crypto.generateKeyPairSync('ed25519');
+  const pubPem = keyPair.publicKey.export({ type: 'spki', format: 'pem' });
+
   const chunks = [];
   const mockStream = {
     write(chunk) {
@@ -477,7 +507,7 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting
   };
 
   const emitter = createAcpDiagnosticEmitter(mockStream);
-  emitter.emitDiagnostic('src/index.js', {
+  const finding = {
     id: 'F-1',
     ruleId: 'CWE-22',
     severity: 'CRITICAL',
@@ -489,8 +519,10 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting
     ],
     lineageId: 'lin-f1-crit',
     location: { startLine: 1 }
-  });
+  };
+  finding.authorityProof = signFindingAuthorityProof(finding, keyPair.privateKey, 'SUPERVISOR_ROOT', pubPem);
 
+  emitter.emitDiagnostic('src/index.js', finding, { trustedRootPublicKeyPem: pubPem });
   emitter.emitBallotProgress('CAND-01', 'DEFENSES', 'REFUTES', 'Sanitizer active');
 
   assert.equal(chunks.length, 2);

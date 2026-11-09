@@ -48,72 +48,48 @@ export function assertFindingDispositionAuthority(finding, options = {}) {
   const isReportableDisp = disp === 'CONFIRMED' || disp === 'REPORTABLE';
   if (!isReportableDisp) return false;
 
-  // R05-F01 Defense: Under Default-Deny, authorityConfirmed CANNOT be granted by mere field presence
-  // or self-asserted consensus/lineage/ballots. Spoofed inputs must strictly fail closed.
-
-  // 1. Genuine 3-Lens Ballot Panel
-  // Must have at least 3 distinct canonical lenses (REACHABILITY, DEFENSES, IMPACT).
-  // Two ballots with identical lens or unknown lens are strictly rejected.
-  if (Array.isArray(finding.ballots)) {
-    const requiredLenses = new Set(['REACHABILITY', 'DEFENSES', 'IMPACT']);
-    const supportingLenses = new Set();
-    let hasRefutation = false;
-
-    for (const b of finding.ballots) {
-      if (!b || typeof b !== 'object') continue;
-      const lens = String(b.lens || '').toUpperCase().trim();
-      const decision = String(b.decision || '').toUpperCase().trim();
-      if (decision === 'REFUTES' || decision === 'FALSE_POSITIVE') {
-        hasRefutation = true;
-      }
-      if (requiredLenses.has(lens) && (decision === 'SUPPORTS' || decision === 'CONFIRMED')) {
-        const hasEvidence = Array.isArray(b.evidence) ? b.evidence.length > 0 : Boolean(b.evidence);
-        if (hasEvidence) {
-          supportingLenses.add(lens);
-        }
-      }
-    }
-
-    // Decisive refutation decisively suppresses candidate under Default-Deny
-    if (hasRefutation) return false;
-
-    // All 3 distinct lenses must affirmatively support with evidence
-    if (supportingLenses.size >= 3) {
-      const allPresent = Array.from(requiredLenses).every(l => supportingLenses.has(l));
-      if (allPresent) return true;
-    }
+  // R06-F01 Defense: Under Default-Deny, authorityConfirmed CANNOT be granted by mere ballots,
+  // lineageId, or self-asserted consensus. ONLY authentic cryptographic proof signed by
+  // the trusted supervisor root key can confer authority. Ballots alone strictly fail closed.
+  if (!finding.authorityProof || typeof finding.authorityProof !== 'object') {
+    return false;
   }
 
-  // 2. Cryptographic Authority Attestation
-  // Must verify authentic digital signature against trusted supervisor public key.
-  // Mere string length checks or self-supplied keys without verification are strictly rejected.
-  if (finding.authorityProof && typeof finding.authorityProof === 'object') {
-    const ap = finding.authorityProof;
-    if (ap.finalizerAttestation === true && ap.signature) {
-      try {
-        const trustedKeyPem = (options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM).trim().replace(/\r\n/g, '\n');
-        // Verify key identity: verifierPublicKey (if supplied) must match trusted root key
-        if (ap.verifierPublicKey) {
-          const suppliedKeyPem = String(ap.verifierPublicKey).trim().replace(/\r\n/g, '\n');
-          if (suppliedKeyPem !== trustedKeyPem) {
-            return false;
-          }
-        }
-        const payload = Buffer.from(
-          `${finding.id || ''}:${finding.ruleId || ''}:${finding.severity || ''}:${disp}:${ap.signedBy || 'SUPERVISOR_ROOT'}`,
-          'utf8'
-        );
-        const sigBuf = Buffer.from(ap.signature, 'hex');
-        const isValid = crypto.verify(null, payload, trustedKeyPem, sigBuf);
-        if (isValid) return true;
-      } catch {
+  const ap = finding.authorityProof;
+  if (ap.finalizerAttestation !== true || !ap.signature) {
+    return false;
+  }
+
+  // If ballots are attached, any refutation decisively vetoes promotion
+  if (Array.isArray(finding.ballots)) {
+    for (const b of finding.ballots) {
+      if (!b || typeof b !== 'object') continue;
+      const dec = String(b.decision || '').toUpperCase().trim();
+      if (dec === 'REFUTES' || dec === 'FALSE_POSITIVE') {
         return false;
       }
     }
   }
 
-  // Default-Deny: Any other input (including lone lineageId: 'x', empty objects, or unverified consensus) is rejected.
-  return false;
+  try {
+    const trustedKeyPem = (options.trustedRootPublicKeyPem || DEFAULT_SUPERVISOR_PUBLIC_PEM).trim().replace(/\r\n/g, '\n');
+    // Verify key identity: verifierPublicKey (if supplied) must match trusted root key
+    if (ap.verifierPublicKey) {
+      const suppliedKeyPem = String(ap.verifierPublicKey).trim().replace(/\r\n/g, '\n');
+      if (suppliedKeyPem !== trustedKeyPem) {
+        return false;
+      }
+    }
+    const payload = Buffer.from(
+      `${finding.id || ''}:${finding.ruleId || ''}:${finding.severity || ''}:${disp}:${ap.signedBy || 'SUPERVISOR_ROOT'}`,
+      'utf8'
+    );
+    const sigBuf = Buffer.from(ap.signature, 'hex');
+    const isValid = crypto.verify(null, payload, trustedKeyPem, sigBuf);
+    return isValid === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -382,11 +358,53 @@ export function parseJsonRpcMessage(raw) {
 export function createAcpDiagnosticEmitter(stream = process.stdout) {
   const cancelledSessions = new Set();
   const cancelledRequests = new Set();
+  const sessionTurns = new Map(); // sessionId -> currentTurnId (monotonically increasing)
+  const cancelledTurns = new Set(); // Set of `${sessionId}:${turnId}`
   let isShutdown = false;
 
+  function isTurnCancelled(sessionId, turnId) {
+    if (isShutdown) return true;
+    if (cancelledSessions.has(sessionId)) return true;
+    if (turnId !== undefined && turnId !== null) {
+      if (cancelledTurns.has(`${sessionId}:${turnId}`)) return true;
+      const currentTurn = sessionTurns.get(sessionId);
+      if (currentTurn !== undefined && turnId < currentTurn) return true; // Stale turn generation (R06-F03)
+    }
+    return false;
+  }
+
+  function formatAcpUpdatePayload(update) {
+    if (!update || typeof update !== 'object') {
+      return {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: '' }
+      };
+    }
+    if (update.sessionUpdate === 'progress' || (update.progress !== undefined && !update.sessionUpdate)) {
+      return {
+        sessionUpdate: 'progress',
+        progress: Number(update.progress || 0)
+      };
+    }
+    const text = typeof update.content === 'string'
+      ? update.content
+      : (update.text || update.message || (typeof update.content?.text === 'string' ? update.content.text : ''));
+    return {
+      sessionUpdate: 'agent_message_chunk',
+      content: {
+        type: 'text',
+        text: String(text || '')
+      },
+      ...update
+    };
+  }
+
   return {
-    isCancelled(sessionId = '__default__') {
-      return cancelledSessions.has(sessionId);
+    isCancelled(sessionId = '__default__', turnId) {
+      return isTurnCancelled(sessionId, turnId);
+    },
+    getCurrentTurnId(sessionId = '__default__') {
+      return sessionTurns.get(sessionId) || 1;
     },
     isShutdown() {
       return isShutdown;
@@ -395,42 +413,46 @@ export function createAcpDiagnosticEmitter(stream = process.stdout) {
       cancelledSessions.delete(sessionId);
     },
     startPromptTurn(sessionId = '__default__') {
+      const nextTurn = (sessionTurns.get(sessionId) || 0) + 1;
+      sessionTurns.set(sessionId, nextTurn);
       cancelledSessions.delete(sessionId);
+      return nextTurn;
     },
     emitDiagnostic(uri, finding, options = {}) {
       const sid = options.sessionId || '__default__';
-      if (cancelledSessions.has(sid) || isShutdown) return null;
+      if (isTurnCancelled(sid, options.turnId) || isShutdown) return null;
+      if (options.requestId && cancelledRequests.has(options.requestId)) return null;
       const line = formatPublishDiagnosticsNotification(uri, [finding], options);
       stream.write(line);
       return line;
     },
     emitBatch(uri, findings, options = {}) {
       const sid = options.sessionId || '__default__';
-      if (cancelledSessions.has(sid) || isShutdown) return null;
+      if (isTurnCancelled(sid, options.turnId) || isShutdown) return null;
+      if (options.requestId && cancelledRequests.has(options.requestId)) return null;
       const line = formatPublishDiagnosticsNotification(uri, findings, options);
       stream.write(line);
       return line;
     },
     emitBallotProgress(candidateId, lens, vote, details = '', options = {}) {
       const sid = options.sessionId || '__default__';
-      if (cancelledSessions.has(sid) || isShutdown) return null;
+      if (isTurnCancelled(sid, options.turnId) || isShutdown) return null;
+      if (options.requestId && cancelledRequests.has(options.requestId)) return null;
       const line = formatBallotProgressNotification(candidateId, lens, vote, details);
       stream.write(line);
       return line;
     },
-    emitSessionUpdate(sessionId, update = {}) {
+    emitSessionUpdate(sessionId, update = {}, options = {}) {
       const sid = sessionId || '__default__';
-      if (cancelledSessions.has(sid) || isShutdown) return null;
-      // R05-F02: Official ACP v1 format: { sessionId, update: { sessionUpdate: ... } }
-      const updatePayload = (update && typeof update === 'object' && update.sessionUpdate !== undefined)
-        ? update
-        : { sessionUpdate: 'agent_message_chunk', ...update };
+      if (isTurnCancelled(sid, options.turnId) || isShutdown) return null;
+      if (options.requestId && cancelledRequests.has(options.requestId)) return null;
+      // R05-F02 & R06-F02: Official ACP v1 format with valid content structure
       const notif = {
         jsonrpc: '2.0',
         method: 'session/update',
         params: {
           sessionId: sid,
-          update: updatePayload
+          update: formatAcpUpdatePayload(update)
         }
       };
       const line = JSON.stringify(notif) + '\n';
@@ -448,52 +470,78 @@ export function createAcpDiagnosticEmitter(stream = process.stdout) {
       }
       if (parsed.method === 'session/prompt') {
         const sid = parsed.params?.sessionId || '__default__';
-        // R05-F02: New prompt turn clears prior turn cancellation for this session
+        // R06-F03: Monotonically increment turn generation token
+        const turnId = (sessionTurns.get(sid) || 0) + 1;
+        sessionTurns.set(sid, turnId);
         cancelledSessions.delete(sid);
         if (parsed.id !== undefined && parsed.id !== null) {
+          // R06-F02: ACP v1 compliant completion response with stopReason
           const response = {
             jsonrpc: '2.0',
             id: parsed.id,
-            result: { status: 'acknowledged', sessionId: sid }
+            result: {
+              status: 'completed',
+              sessionId: sid,
+              turnId,
+              stopReason: 'end_turn'
+            }
           };
           stream.write(JSON.stringify(response) + '\n');
           return response;
         }
-        return { acknowledged: true, sessionId: sid };
+        return { status: 'completed', sessionId: sid, turnId, stopReason: 'end_turn' };
       }
       if (parsed.method === 'session/cancel') {
         const sid = parsed.params?.sessionId || '__default__';
-        // R05-F02: Session-scoped cancellation
+        const currentTurn = sessionTurns.get(sid) || 1;
+        const targetTurn = parsed.params?.turnId || currentTurn;
+        sessionTurns.set(sid, Math.max(currentTurn, targetTurn));
+        // R06-F03: Cancel specific turn generation as well as session
+        cancelledTurns.add(`${sid}:${targetTurn}`);
         cancelledSessions.add(sid);
         if (parsed.id !== undefined && parsed.id !== null) {
           const response = {
             jsonrpc: '2.0',
             id: parsed.id,
-            result: { cancelled: true, sessionId: sid, stopReason: 'cancelled' }
+            result: {
+              cancelled: true,
+              sessionId: sid,
+              turnId: targetTurn,
+              stopReason: 'cancelled'
+            }
           };
           const respLine = JSON.stringify(response) + '\n';
           stream.write(respLine);
           return response;
         }
-        return { cancelled: true, sessionId: sid };
+        return { cancelled: true, sessionId: sid, turnId: targetTurn, stopReason: 'cancelled' };
       }
       if (parsed.method === '$/cancel_request' || parsed.method === '$/cancelRequest') {
         const reqId = parsed.params?.id ?? parsed.params?.requestId;
         if (reqId !== undefined && reqId !== null) {
           cancelledRequests.add(reqId);
         }
-        cancelledSessions.add('__default__');
+        const sid = parsed.params?.sessionId || '__default__';
+        const currentTurn = sessionTurns.get(sid) || 1;
+        cancelledTurns.add(`${sid}:${currentTurn}`);
+        cancelledSessions.add(sid);
         if (parsed.id !== undefined && parsed.id !== null) {
           const response = {
             jsonrpc: '2.0',
             id: parsed.id,
-            result: { cancelled: true, requestId: reqId }
+            result: {
+              cancelled: true,
+              requestId: reqId,
+              sessionId: sid,
+              turnId: currentTurn,
+              stopReason: 'cancelled'
+            }
           };
           const respLine = JSON.stringify(response) + '\n';
           stream.write(respLine);
           return response;
         }
-        return { cancelled: true, requestId: reqId };
+        return { cancelled: true, requestId: reqId, sessionId: sid, turnId: currentTurn, stopReason: 'cancelled' };
       }
       if (parsed.method === 'shutdown') {
         isShutdown = true;
