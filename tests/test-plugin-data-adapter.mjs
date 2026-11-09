@@ -6613,7 +6613,7 @@ test('R25-B01 & R25-B02: Monotonic witness storage path alignment and unauthenti
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
-test('R26-B01 & R26-B02 & R27-B01 & R27-B02: Strict Genesis root anchor confinement, filename version binding, revoked-signer rejection, and cold-start rollback recovery', () => {
+test('R26-B01 & R26-B02 & R27-B01 & R27-B02 & R28-B01: Strict Genesis root anchor confinement, filename version binding, progressive historical journal revocation screening, and cold-start rollback recovery', () => {
   const tempDir = createTempDir('r26-r27-security-gates-');
   const rootAuth = generateTestAuthority();
   const rogueAuth = generateTestAuthority();
@@ -6823,6 +6823,17 @@ test('R26-B01 & R26-B02 & R27-B01 & R27-B02: Strict Genesis root anchor confinem
     () => getJournalRevokedKeyMap(tempDir, opts),
     /\[UNTRUSTED_SIGNER\]/
   );
+
+  // 3c. Negative Test E (R28-B01 Auditor Blocker Counterexample):
+  // Attacker writes v3 signed by revoked K into BOTH history/trust-registry.v3.json AND supervisor-trust-registry.json.
+  // In R28-B01, attacker tried to bypass currentRegistry check by placing revoked-signer v3 into the historical chain.
+  // resolveJournalTrustedKeyWindows MUST reject history v3 with [UNTRUSTED_HISTORICAL_REGISTRY] [REVOKED_SIGNER_AUTHORIZATION_REJECTED]!
+  fs.writeFileSync(path.join(histDir, 'trust-registry.v3.json'), JSON.stringify(attackerV3Reg), 'utf8');
+  assert.throws(
+    () => getJournalRevokedKeyMap(tempDir, opts),
+    /\[UNTRUSTED_HISTORICAL_REGISTRY\]|\[REVOKED_SIGNER_AUTHORIZATION_REJECTED\]/
+  );
+  fs.rmSync(path.join(histDir, 'trust-registry.v3.json'), { force: true });
 
   // 4. Truly Independent Cold-Start Rollback Test with External System Witness
   const independentSystemWitnessDir = createTempDir('independent-sys-witness-');

@@ -668,6 +668,46 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
   let hasHistoryFiles = false;
   let priorVerifiedReg = null;
   const histDir = path.join(dir, 'history');
+  const journalPath = path.join(dir, '.irv-revocation-journal.jsonl');
+  let journalLines = [];
+  if (fs.existsSync(journalPath)) {
+    try {
+      journalLines = fs.readFileSync(journalPath, 'utf8').split('\n').filter(l => l.trim().length > 0);
+    } catch (_) {}
+  }
+
+  // R28-B01: State machine for progressive Journal revocation extraction
+  const journalRevokedKeyIds = new Set();
+  function advanceJournalRevocations() {
+    let expectedPrevDigest = '0'.repeat(64);
+    for (let i = 0; i < journalLines.length; i++) {
+      let entry = null;
+      try { entry = JSON.parse(journalLines[i]); } catch (_) { break; }
+      if (!entry || typeof entry !== 'object') break;
+      if (entry.entryIndex !== i || entry.prevEntryDigest !== expectedPrevDigest) break;
+      if (!entry.signature || !entry.signedBy) break;
+
+      const signerPem = trustedKeys.get(entry.signedBy);
+      if (!signerPem) break;
+
+      const maxIdx = maxActiveIndexPerKey.get(entry.signedBy);
+      if (typeof maxIdx === 'number' && maxIdx !== Infinity && entry.entryIndex > maxIdx) break;
+
+      const payload = Buffer.from(computeRevocationEntrySignPayload(entry), 'utf8');
+      let validSig = false;
+      try {
+        validSig = crypto.verify(null, payload, signerPem, Buffer.from(entry.signature, 'hex'));
+      } catch (_) {}
+      if (!validSig) break;
+
+      if (entry.revocationType === REVOCATION_TYPES.KEY_REVOCATION || entry.revocationType === 'KEY_REVOCATION') {
+        if (typeof entry.targetId === 'string' && entry.targetId) {
+          journalRevokedKeyIds.add(entry.targetId);
+        }
+      }
+      expectedPrevDigest = sha256Digest(canonicalJsonStringify(entry));
+    }
+  }
 
   // Step 1: Process and authenticate historical registry files in history/
   if (fs.existsSync(histDir)) {
@@ -727,6 +767,14 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           continue;
         }
         priorVerifiedReg = hReg;
+
+        // Register Genesis root key into trustedKeys immediately and advance revocations
+        const hHwmIdx = typeof hReg?.revocationHighWaterMark?.headIndex === 'number'
+          ? hReg.revocationHighWaterMark.headIndex
+          : -1;
+        trustedKeys.set(rootKey.keyId, rootKey.publicKeyPem);
+        maxActiveIndexPerKey.set(rootKey.keyId, hHwmIdx);
+        advanceJournalRevocations();
       } else {
         // Subsequent version must strictly increment by 1
         if (hReg.registryVersion !== priorVerifiedReg.registryVersion + 1) {
@@ -743,6 +791,17 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           }
           continue;
         }
+
+        // R28-B01: Check that authorizationProof signer was not revoked in prior registry or confirmed in Journal
+        const isSignerRevokedInPrior = Array.isArray(priorVerifiedReg.revokedKeyIds) && priorVerifiedReg.revokedKeyIds.includes(proof.authorizedBy);
+        const isSignerRevokedInJournal = journalRevokedKeyIds.has(proof.authorizedBy);
+        if (isSignerRevokedInPrior || isSignerRevokedInJournal) {
+          if (options.failClosed !== false) {
+            throw new Error(`[UNTRUSTED_HISTORICAL_REGISTRY] [REVOKED_SIGNER_AUTHORIZATION_REJECTED] Signer '${proof.authorizedBy}' for historical registry ${hf} was revoked in revocation journal or prior registry`);
+          }
+          continue;
+        }
+
         const signerInPrior = priorVerifiedReg.keys?.find(
           k => k.keyId === proof.authorizedBy && ['ACTIVE_PINNED_ROOT', 'ACTIVE'].includes(k.status)
         );
@@ -761,67 +820,34 @@ function resolveJournalTrustedKeyWindows(dir, currentRegistry, options = {}) {
           continue;
         }
         priorVerifiedReg = hReg;
-      }
 
-      // Accumulate trusted keys from authenticated historical registry
-      const hHwmIdx = typeof hReg?.revocationHighWaterMark?.headIndex === 'number'
-        ? hReg.revocationHighWaterMark.headIndex
-        : -1;
-      const hRevokedSet = new Set(Array.isArray(hReg?.revokedKeyIds) ? hReg.revokedKeyIds : []);
-      for (const hk of hReg?.keys || []) {
-        if (hk && hk.keyId && hk.publicKeyPem) {
-          if (!trustedKeys.has(hk.keyId)) {
-            trustedKeys.set(hk.keyId, hk.publicKeyPem);
-            maxActiveIndexPerKey.set(hk.keyId, -1);
-          }
-          const isRevokedInHist = hRevokedSet.has(hk.keyId) || hk.status === 'REVOKED';
-          if (!isRevokedInHist && (hk.status === 'ACTIVE' || hk.status === 'ACTIVE_PINNED_ROOT')) {
-            const cur = maxActiveIndexPerKey.get(hk.keyId);
-            if (cur !== Infinity) {
-              maxActiveIndexPerKey.set(hk.keyId, Math.max(cur ?? -1, hHwmIdx));
+        // Accumulate trusted keys from this newly authenticated historical registry
+        const hHwmIdx = typeof hReg?.revocationHighWaterMark?.headIndex === 'number'
+          ? hReg.revocationHighWaterMark.headIndex
+          : -1;
+        const hRevokedSet = new Set(Array.isArray(hReg?.revokedKeyIds) ? hReg.revokedKeyIds : []);
+        for (const hk of hReg?.keys || []) {
+          if (hk && hk.keyId && hk.publicKeyPem) {
+            if (!trustedKeys.has(hk.keyId)) {
+              trustedKeys.set(hk.keyId, hk.publicKeyPem);
+              maxActiveIndexPerKey.set(hk.keyId, -1);
+            }
+            const isRevokedInHist = hRevokedSet.has(hk.keyId) || hk.status === 'REVOKED';
+            if (!isRevokedInHist && (hk.status === 'ACTIVE' || hk.status === 'ACTIVE_PINNED_ROOT')) {
+              const cur = maxActiveIndexPerKey.get(hk.keyId);
+              if (cur !== Infinity) {
+                maxActiveIndexPerKey.set(hk.keyId, Math.max(cur ?? -1, hHwmIdx));
+              }
             }
           }
         }
+        advanceJournalRevocations();
       }
     }
   }
 
-  // Step 1.5: R27-B02 - Collect confirmed key revocations from verified journal entries signed by historical trusted keys
-  const journalRevokedKeyIds = new Set();
-  const journalPath = path.join(dir, '.irv-revocation-journal.jsonl');
-  if (fs.existsSync(journalPath)) {
-    try {
-      const rawLines = fs.readFileSync(journalPath, 'utf8').split('\n').filter(l => l.trim().length > 0);
-      let expectedPrevDigest = '0'.repeat(64);
-      for (let i = 0; i < rawLines.length; i++) {
-        let entry = null;
-        try { entry = JSON.parse(rawLines[i]); } catch (_) { break; }
-        if (!entry || typeof entry !== 'object') break;
-        if (entry.entryIndex !== i || entry.prevEntryDigest !== expectedPrevDigest) break;
-        if (!entry.signature || !entry.signedBy) break;
-
-        const signerPem = trustedKeys.get(entry.signedBy);
-        if (!signerPem) break;
-
-        const maxIdx = maxActiveIndexPerKey.get(entry.signedBy);
-        if (typeof maxIdx === 'number' && maxIdx !== Infinity && entry.entryIndex > maxIdx) break;
-
-        const payload = Buffer.from(computeRevocationEntrySignPayload(entry), 'utf8');
-        let validSig = false;
-        try {
-          validSig = crypto.verify(null, payload, signerPem, Buffer.from(entry.signature, 'hex'));
-        } catch (_) {}
-        if (!validSig) break;
-
-        if (entry.revocationType === REVOCATION_TYPES.KEY_REVOCATION || entry.revocationType === 'KEY_REVOCATION') {
-          if (typeof entry.targetId === 'string' && entry.targetId) {
-            journalRevokedKeyIds.add(entry.targetId);
-          }
-        }
-        expectedPrevDigest = sha256Digest(canonicalJsonStringify(entry));
-      }
-    } catch (_) {}
-  }
+  // Step 1.5: R27-B02 & R28-B01 - Ensure journal revocations are fully advanced
+  advanceJournalRevocations();
 
   // Step 2: R26-B02 & R27-B02 - Authenticate currentRegistry before trusting its keys
   if (currentRegistry && Array.isArray(currentRegistry.keys)) {
