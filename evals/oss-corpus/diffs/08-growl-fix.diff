@@ -1,0 +1,15 @@
+--- a/evals/oss-corpus/08-growl-command-injection.js
++++ b/evals/oss-corpus/08-growl-command-injection.js
+@@ -5,8 +5,9 @@
+-import { exec } from 'node:child_process';
++import { spawn } from 'node:child_process';
+
+ export function notify(msg, options = {}, fn) {
+-  const args = ['growlnotify'];
++  const args = [];
+   if (options.title) args.push(options.title);
+   args.push(msg);
+-  exec(args.join(' '), fn);
++  const cmd = 'growlnotify';
++  return spawn(cmd, args);
+ }

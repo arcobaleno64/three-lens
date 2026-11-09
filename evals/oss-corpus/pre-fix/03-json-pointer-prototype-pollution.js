@@ -1,5 +1,5 @@
 /**
- * Authentic slice of json-pointer (CVE-2020-7751)
+ * Authentic slice of json-pointer (CVE-2020-7709)
  * Prototype Pollution in json-pointer before 0.6.1 via set().
  */
 export function set(obj, pointer, value) {

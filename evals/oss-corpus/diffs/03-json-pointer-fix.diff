@@ -1,20 +1,15 @@
 --- a/evals/oss-corpus/03-json-pointer-prototype-pollution.js
 +++ b/evals/oss-corpus/03-json-pointer-prototype-pollution.js
-@@ -4,2 +4,4 @@
-+const FORBIDDEN = new Set(['__proto__', 'constructor', 'prototype']);
-+
- export function set(obj, pointer, value) {
-   const parts = pointer.split('/').slice(1);
-@@ -8,2 +10,5 @@
+@@ -8,2 +8,5 @@
    for (let i = 0; i < parts.length - 1; i++) {
      const part = parts[i];
-+    if (FORBIDDEN.has(part)) {
-+      return obj;
++    if (part === '__proto__' || part === 'constructor' || part === 'prototype') {
++      continue; // CVE-2020-7709 official fix
 +    }
      if (current[part] === undefined) {
-@@ -14,2 +19,5 @@
+@@ -14,2 +19,4 @@
    const last = parts[parts.length - 1];
-+  if (FORBIDDEN.has(last)) {
-+    return obj;
-+  }
++  if (last !== '__proto__' && last !== 'constructor' && last !== 'prototype') {
    current[last] = value;
++  }
+   return obj;
