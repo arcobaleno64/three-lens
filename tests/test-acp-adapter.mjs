@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import * as acpModule from '../scripts/adapters/acp-adapter.mjs';
 import {
   ACP_DIAGNOSTIC_SEVERITY,
   assertFindingDispositionAuthority,
@@ -15,12 +16,23 @@ import {
   handleInitialize,
   parseJsonRpcMessage,
   createAcpDiagnosticEmitter,
-  signFindingAuthorityProof,
-  withTestSupervisorRootKey
+  signFindingAuthorityProof
 } from '../scripts/adapters/acp-adapter.mjs';
+import {
+  TEST_SUPERVISOR_ROOT_TOKEN,
+  withTestSupervisorRootKey
+} from '../scripts/adapters/internal/test-root-capability.mjs';
 import { validateAcpHandshake } from '../scripts/adapters/acp-transport-adapter.mjs';
 import { parseGitRemoteOriginUrl, getCanonicalRealPath } from '../scripts/fetch-upstream-oss-fixture.mjs';
 import { extractEntry } from '../evals/oss-corpus/post-fix/07-adm-zip-path-traversal.js';
+
+test('ACP Adapter Capability Isolation (R09-F01): withTestSupervisorRootKey is NOT exported on public adapter API', () => {
+  assert.equal(typeof acpModule.withTestSupervisorRootKey, 'undefined', 'withTestSupervisorRootKey must not be publicly exported');
+  assert.throws(
+    () => withTestSupervisorRootKey(Symbol('FAKE_TOKEN'), 'fake-pem', () => {}),
+    /Unauthorized: invalid test capability token/
+  );
+});
 
 test('ACP Adapter: mapSeverityToAcpDiagnostic severity mapping and Default-Deny clamping', () => {
   // Confirmed reportable findings map to appropriate severity
@@ -70,7 +82,7 @@ test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata'
   };
   finding.authorityProof = signFindingAuthorityProof(finding, keyPair.privateKey, 'SUPERVISOR_ROOT', pubPem);
 
-  withTestSupervisorRootKey(pubPem, () => {
+  withTestSupervisorRootKey(TEST_SUPERVISOR_ROOT_TOKEN, pubPem, () => {
     const diag = formatAcpDiagnostic(finding);
 
     assert.equal(diag.code, 'CWE-89');
@@ -243,7 +255,7 @@ test('ACP Adapter: R04-F01 / R05-F01 / R06-F01 Spoofed authority claims strictly
   );
 
   // R08-F02: Inside scoped test supervisor root key context, verification succeeds
-  withTestSupervisorRootKey(pubPem, () => {
+  withTestSupervisorRootKey(TEST_SUPERVISOR_ROOT_TOKEN, pubPem, () => {
     const diagCrypto = formatAcpDiagnostic(validCryptoCandidate);
     assert.equal(diagCrypto.data.authorityConfirmed, true);
     assert.equal(diagCrypto.severity, ACP_DIAGNOSTIC_SEVERITY.ERROR);
@@ -396,7 +408,7 @@ test('ACP Adapter: formatPublishDiagnosticsNotification formats full notificatio
   ];
   findings[0].authorityProof = signFindingAuthorityProof(findings[0], keyPair.privateKey, 'SUPERVISOR_ROOT', pubPem);
 
-  withTestSupervisorRootKey(pubPem, () => {
+  withTestSupervisorRootKey(TEST_SUPERVISOR_ROOT_TOKEN, pubPem, () => {
     const raw = formatPublishDiagnosticsNotification('file:///path/to/app.js', findings);
     const parsed = JSON.parse(raw.trim());
 
@@ -479,18 +491,28 @@ test('ACP Adapter: R03-F04 / R04-F02 / R05-F02 / R06-F02 / R06-F03 session cance
   assert.equal(updateObj.params.update.sessionUpdate, 'agent_message_chunk');
   assert.deepEqual(updateObj.params.update.content, { type: 'text', text: 'analyzing workspace' });
 
-  // 4. New prompt turn for sess-1 increments turn generation and resets cancellation state (R05-F02 & R06-F03)
+  // 4. New prompt turn for sess-1 increments turn generation, marks pending, and resets cancellation state (R05-F02, R06-F03 & R09-F02)
   const promptResp = emitter.handleMessage('{"jsonrpc": "2.0", "id": 201, "method": "session/prompt", "params": {"sessionId": "sess-1"}}\n');
-  assert.equal(promptResp.result.status, 'completed');
-  assert.equal(promptResp.result.stopReason, 'end_turn');
-  assert.equal(promptResp.result.turnId, 2, 'New prompt must advance to turn generation 2');
+  assert.equal(promptResp.status, 'processing');
+  assert.equal(promptResp.pending, true);
+  assert.equal(promptResp.turnId, 2, 'New prompt must advance to turn generation 2');
   assert.equal(emitter.isCancelled('sess-1'), false, 'session/prompt must clear prior session cancellation');
+  assert.equal(emitter.isPromptPending('sess-1'), true);
 
   // R06-F03 & R08-F04 Invariant: Stale emission from old generation turn 1 is rejected, while current turn 2 is allowed
   const staleTurnEmission = emitter.emitSessionUpdate('sess-1', { progress: 0.1 }, { turnId: 1 });
   assert.equal(staleTurnEmission, null, 'Stale turn 1 emission must be rejected under Generation Token invariant');
   const restoredUpdate = emitter.emitSessionUpdate('sess-1', { progress: 0.2 }, { turnId: 2 });
   assert.ok(restoredUpdate !== null, 'Current generation turn 2 emission must be allowed');
+
+  // R09-F02 Defense: Prompt completion binds to pending request ID 201 and emits completion response to stream
+  const completionResp = emitter.completePromptTurn('sess-1');
+  assert.equal(completionResp.id, 201);
+  assert.equal(completionResp.result.status, 'completed');
+  assert.equal(completionResp.result.stopReason, 'end_turn');
+  assert.equal(completionResp.result.turnId, 2);
+  assert.equal(emitter.isPromptPending('sess-1'), false);
+  assert.equal(emitter.getSessionState('sess-1'), 'COMPLETED');
 
   // R08-F04 Invariant: Mandatory Generation Handle - omitting turnId MUST fail closed
   const missingTurnEmission = emitter.emitSessionUpdate('sess-1', { progress: 0.25 });
@@ -589,7 +611,7 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting
   assert.equal(emitter.emitDiagnostic('src/index.js', finding, { sessionId: 'unknown-sess', turnId: 1 }), null);
 
   // Inside withTestSupervisorRootKey, verified finding emits with valid turnId
-  withTestSupervisorRootKey(pubPem, () => {
+  withTestSupervisorRootKey(TEST_SUPERVISOR_ROOT_TOKEN, pubPem, () => {
     emitter.emitDiagnostic('src/index.js', finding, { sessionId: sid, turnId: 1 });
     emitter.emitBallotProgress('CAND-01', 'DEFENSES', 'REFUTES', 'Sanitizer active', { sessionId: sid, turnId: 1 });
   });
@@ -605,27 +627,39 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting
   assert.ok(ballotParsed.params.message.includes('DEFENSES: REFUTES'));
 });
 
-test('Harness Governance (R08-F07): parseGitRemoteOriginUrl strictly ignores comments and extracts active remote URL', () => {
+test('Harness Governance (R08-F07 & R09-F04): parseGitRemoteOriginUrl strictly matches expected remote name (default origin)', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-config-test-'));
   try {
     const configPath = path.join(tmpDir, 'config');
 
-    // 1. Config with misleading comments containing expected remote
-    const spoofedConfig = `
+    // 1. Config with [remote "decoy"] first, then [remote "origin"]
+    const decoyConfig = `
 [core]
   repositoryformatversion = 0
-  filemode = true
-# [remote "origin"]
-#   url = https://github.com/cthackers/adm-zip.git
-; url = https://github.com/cthackers/adm-zip.git
-[remote "actual"]
-  url = https://github.com/malicious/repo.git
+[remote "decoy"]
+  url = https://attacker.com/malicious.git
+[remote "origin"]
+  url = https://github.com/cthackers/adm-zip.git
 `;
-    fs.writeFileSync(configPath, spoofedConfig, 'utf8');
-    const parsedUrl = parseGitRemoteOriginUrl(configPath);
-    assert.equal(parsedUrl, 'https://github.com/malicious/repo.git');
+    fs.writeFileSync(configPath, decoyConfig, 'utf8');
+    // Default call MUST resolve origin, NOT decoy! (R09-F04)
+    assert.equal(parseGitRemoteOriginUrl(configPath), 'https://github.com/cthackers/adm-zip.git');
+    // Explicit remote name matches specific section
+    assert.equal(parseGitRemoteOriginUrl(configPath, 'decoy'), 'https://attacker.com/malicious.git');
+    assert.equal(parseGitRemoteOriginUrl(configPath, 'nonexistent'), null);
 
-    // 2. Legitimate remote origin config
+    // 2. Config without origin returns null
+    const noOriginConfig = `
+[core]
+  repositoryformatversion = 0
+[remote "upstream"]
+  url = https://github.com/upstream/repo.git
+`;
+    fs.writeFileSync(configPath, noOriginConfig, 'utf8');
+    assert.equal(parseGitRemoteOriginUrl(configPath), null);
+    assert.equal(parseGitRemoteOriginUrl(configPath, 'upstream'), 'https://github.com/upstream/repo.git');
+
+    // 3. Legitimate remote origin config
     const legitConfig = `
 [core]
   repositoryformatversion = 0
@@ -636,14 +670,14 @@ test('Harness Governance (R08-F07): parseGitRemoteOriginUrl strictly ignores com
     fs.writeFileSync(configPath, legitConfig, 'utf8');
     assert.equal(parseGitRemoteOriginUrl(configPath), 'https://github.com/cthackers/adm-zip.git');
 
-    // 3. Nonexistent config returns null
+    // 4. Nonexistent config returns null
     assert.equal(parseGitRemoteOriginUrl(path.join(tmpDir, 'nonexistent')), null);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 
-test('Harness Governance (R08-F05 & R08-F06): getCanonicalRealPath and adm-zip path containment defense', () => {
+test('Harness Governance (R08-F05, R08-F06 & R09-F03): getCanonicalRealPath and adm-zip path containment defense with ancestor protection', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'admzip-test-'));
   try {
     const sandboxDir = path.join(tmpDir, 'target');
@@ -655,7 +689,7 @@ test('Harness Governance (R08-F05 & R08-F06): getCanonicalRealPath and adm-zip p
       /INVALID_FILENAME/
     );
 
-    // 2. Normal extraction creates file safely
+    // 2. Normal extraction creates file safely via staging and atomic rename
     const created = extractEntry(sandboxDir, 'subdir/normal.txt', 'hello world');
     assert.ok(fs.existsSync(created));
     assert.equal(fs.readFileSync(created, 'utf8'), 'hello world');
@@ -669,10 +703,64 @@ test('Harness Governance (R08-F05 & R08-F06): getCanonicalRealPath and adm-zip p
         /SECURITY_ERROR/
       );
     } catch (symlinkErr) {
-      // If OS / permissions do not permit symlinks in unprivileged mode, skip symlink creation
+      if (symlinkErr.code !== 'EPERM') throw symlinkErr;
+    }
+
+    // 4. Ancestor directory symlink redirection is detected and rejected (R09-F03)
+    const ancestorSubdir = path.join(sandboxDir, 'ancestor-test');
+    fs.mkdirSync(ancestorSubdir, { recursive: true });
+    const externalDir = path.join(tmpDir, 'external-escaped');
+    fs.mkdirSync(externalDir, { recursive: true });
+    try {
+      const symlinkAncestor = path.join(ancestorSubdir, 'symlink-parent');
+      fs.symlinkSync(externalDir, symlinkAncestor, 'dir');
+      assert.throws(
+        () => extractEntry(sandboxDir, 'ancestor-test/symlink-parent/escape.txt', 'payload'),
+        /SECURITY_ERROR/
+      );
+    } catch (symlinkErr) {
       if (symlinkErr.code !== 'EPERM') throw symlinkErr;
     }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test('ACP Adapter Emission Gate (R09-F05): numerical requestId 0 cancellation is strictly enforced', () => {
+  const chunks = [];
+  const emitter = createAcpDiagnosticEmitter({ write(c) { chunks.push(c); } });
+  emitter.createSession('sess-req0');
+
+  // Cancel request with numerical requestId: 0
+  emitter.handleMessage('{"jsonrpc": "2.0", "method": "$/cancel_request", "params": {"requestId": 0}}\n');
+
+  // Emission with requestId: 0 MUST be blocked fail-closed
+  const blockedEmission = emitter.emitSessionUpdate('sess-req0', { message: 'test' }, { turnId: 1, requestId: 0 });
+  assert.equal(blockedEmission, null, 'requestId: 0 must not bypass cancellation check (R09-F05)');
+
+  // Emission with another uncancelled requestId is allowed
+  const allowedEmission = emitter.emitSessionUpdate('sess-req0', { message: 'allowed' }, { turnId: 1, requestId: 1 });
+  assert.ok(allowedEmission !== null);
+});
+
+test('ACP Adapter Lifecycle (R09-F02): pending session/prompt request is cancelled with bound ID when session/cancel is received', () => {
+  const chunks = [];
+  const emitter = createAcpDiagnosticEmitter({ write(c) { chunks.push(c); } });
+  emitter.createSession('sess-cancel-prompt');
+
+  // Receive prompt request
+  const promptResp = emitter.handleMessage('{"jsonrpc": "2.0", "id": 555, "method": "session/prompt", "params": {"sessionId": "sess-cancel-prompt"}}\n');
+  assert.equal(promptResp.pending, true);
+  assert.equal(promptResp.id, 555);
+  assert.equal(chunks.length, 0, 'No completion written before analysis completes');
+
+  // Receive session/cancel notification while prompt is pending
+  emitter.handleMessage('{"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "sess-cancel-prompt"}}\n');
+  assert.equal(chunks.length, 1, 'Cancellation response emitted for pending prompt request');
+  const cancelResp = JSON.parse(chunks[0].trim());
+  assert.equal(cancelResp.id, 555);
+  assert.equal(cancelResp.result.status, 'cancelled');
+  assert.equal(cancelResp.result.stopReason, 'cancelled');
+  assert.equal(emitter.isPromptPending('sess-cancel-prompt'), false);
+  assert.equal(emitter.getSessionState('sess-cancel-prompt'), 'CANCELLED');
 });

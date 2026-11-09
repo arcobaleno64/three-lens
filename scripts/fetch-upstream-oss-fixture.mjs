@@ -52,30 +52,33 @@ export function getCanonicalRealPath(p) {
 }
 
 /**
- * Extracts and parses the active git remote URL from .git/config (R08-F07).
- * Strictly parses INI remote sections and ignores comments or non-remote entries.
+ * Extracts and parses the designated git remote URL from .git/config (R08-F07 & R09-F04).
+ * Strictly matches the specified remote section name (default 'origin') and ignores comments,
+ * other remotes (e.g., [remote "decoy"]), or non-remote sections.
  * @param {string} gitConfigPath
+ * @param {string} [expectedRemoteName='origin']
  * @returns {string|null}
  */
-export function parseGitRemoteOriginUrl(gitConfigPath) {
+export function parseGitRemoteOriginUrl(gitConfigPath, expectedRemoteName = 'origin') {
   if (!fs.existsSync(gitConfigPath)) return null;
   try {
     const content = fs.readFileSync(gitConfigPath, 'utf8');
     const lines = content.split('\n');
-    let inRemoteSection = false;
+    let inTargetRemoteSection = false;
+    const target = String(expectedRemoteName || 'origin').trim().toLowerCase();
     for (const rawLine of lines) {
       const line = rawLine.trim();
       if (!line || line.startsWith('#') || line.startsWith(';')) continue;
       const remoteMatch = line.match(/^\[remote\s+"([^"]+)"\]/i);
       if (remoteMatch) {
-        inRemoteSection = true;
+        inTargetRemoteSection = remoteMatch[1].trim().toLowerCase() === target;
         continue;
       }
       if (line.startsWith('[')) {
-        inRemoteSection = false;
+        inTargetRemoteSection = false;
         continue;
       }
-      if (inRemoteSection) {
+      if (inTargetRemoteSection) {
         const urlMatch = line.match(/^url\s*=\s*(.+)$/i);
         if (urlMatch) {
           return urlMatch[1].trim();
