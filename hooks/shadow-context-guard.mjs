@@ -169,6 +169,77 @@ function recordTelemetry(contextInfo, payload, toolName, targetPath, decision, a
   } catch {}
 }
 
+// Resolves realpath of an existing target or its deepest existing ancestor (for not-yet-existing write targets),
+// failing closed if a symlink or junction along the path escapes rootDir.
+function isWriteTargetRealPathContained(rootDir, targetPath) {
+  if (!rootDir || !targetPath || typeof rootDir !== 'string' || typeof targetPath !== 'string') {
+    return false;
+  }
+  if (
+    targetPath.includes('..\\') ||
+    targetPath.includes('../') ||
+    targetPath === '..' ||
+    targetPath.endsWith('/..') ||
+    targetPath.endsWith('\\..')
+  ) {
+    return false;
+  }
+  const resolvedRoot = path.resolve(rootDir);
+  const resolvedTarget = path.resolve(targetPath);
+
+  let rootReal;
+  try {
+    rootReal = fs.realpathSync(resolvedRoot);
+  } catch {
+    // Root directory may not exist yet (e.g. artifactDirectoryPath before first write);
+    // walk up to the deepest existing ancestor of rootDir to canonicalize symlinked prefixes (like os.tmpdir()).
+    let curRoot = resolvedRoot;
+    const rootTail = [];
+    while (true) {
+      try {
+        const ancestorReal = fs.realpathSync(curRoot);
+        rootReal = path.resolve(ancestorReal, ...rootTail);
+        break;
+      } catch {
+        const parent = path.dirname(curRoot);
+        if (parent === curRoot) return false;
+        rootTail.unshift(path.basename(curRoot));
+        curRoot = parent;
+      }
+    }
+  }
+
+  let current = resolvedTarget;
+  const tailSegments = [];
+  while (true) {
+    let lstat = null;
+    try {
+      lstat = fs.lstatSync(current);
+    } catch {
+      lstat = null;
+    }
+
+    if (lstat !== null) {
+      try {
+        const currentReal = fs.realpathSync(current);
+        const projectedReal = path.resolve(currentReal, ...tailSegments);
+        const rel = path.relative(rootReal, projectedReal);
+        return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+      } catch {
+        // Dangling symlink or unresolvable existing node fails closed
+        return false;
+      }
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return false;
+    }
+    tailSegments.unshift(path.basename(current));
+    current = parent;
+  }
+}
+
 async function main() {
   let rawInput = '';
   try {
@@ -276,10 +347,18 @@ async function main() {
     const artifactDir = payload?.artifactDirectoryPath ? path.resolve(payload.artifactDirectoryPath) : null;
     const tmpDir = os.tmpdir() ? path.resolve(os.tmpdir()) : null;
 
-    const isInsideScratch = isRealPathContained(scratchDir, resolvedTarget) || isPathContained(scratchDir, resolvedTarget);
-    const isInsideArtifact = artifactDir && (isRealPathContained(artifactDir, resolvedTarget) || isPathContained(artifactDir, resolvedTarget));
-    const isInsideRepo = isRealPathContained(repoRoot, resolvedTarget) || isPathContained(repoRoot, resolvedTarget);
-    const isInsideTmp = !isInsideRepo && tmpDir && (isRealPathContained(tmpDir, resolvedTarget) || isPathContained(tmpDir, resolvedTarget));
+    const isInsideScratch = isPathContained(scratchDir, resolvedTarget) && isWriteTargetRealPathContained(scratchDir, resolvedTarget);
+    const isInsideArtifact = Boolean(
+      artifactDir &&
+      isPathContained(artifactDir, resolvedTarget) &&
+      isWriteTargetRealPathContained(artifactDir, resolvedTarget)
+    );
+    const isInsideRepo = isPathContained(repoRoot, resolvedTarget) || isWriteTargetRealPathContained(repoRoot, resolvedTarget);
+    const isInsideTmp = Boolean(
+      !isInsideRepo &&
+      tmpDir &&
+      isWriteTargetRealPathContained(tmpDir, resolvedTarget)
+    );
 
     if (isInsideScratch || isInsideArtifact || isInsideTmp) {
       recordTelemetry(contextInfo, payload, toolName, resolvedTarget, 'allow', 'ALLOWED_SANDBOX_WRITE', 'Filesystem write within authorized sandbox boundary permitted.');
@@ -308,8 +387,8 @@ async function main() {
 
   const resolvedTarget = path.resolve(targetPathArg);
 
-  // 1. If path is already inside contextRoot, allow sanitized inspection
-  if (isRealPathContained(contextRoot, resolvedTarget) || isPathContained(contextRoot, resolvedTarget)) {
+  // 1. If path is already inside contextRoot, allow sanitized inspection (both lexical and realpath containment must hold)
+  if (isPathContained(contextRoot, resolvedTarget) && isRealPathContained(contextRoot, resolvedTarget)) {
     recordTelemetry(contextInfo, payload, toolName, resolvedTarget, 'allow', 'ALLOWED_SHADOW', 'Access to sanitized shadow context permitted.');
     return emit({ decision: 'allow' });
   }

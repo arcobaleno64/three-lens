@@ -97,7 +97,7 @@ Auditing untrusted source code requires multi-layered defense to prevent prompt 
 | **Layer 1** | **Terminal Sandbox**<br>`agy --sandbox` | OS-level container / namespaces / seatbelt isolation | Blocks arbitrary shell command execution, malicious network egress, and persistent filesystem corruption from untrusted audited code. |
 | **Layer 2** | **Permission Engine**<br>`recommended-security-audit-permissions.json` | AGY CLI runtime tool dispatch (`deny > ask > allow`) | Enforces role-based least privilege (`coordinator`, `discovery`, `verifiers`, `remediation`), preventing subagents from invoking unauthorized tools or exfiltrating data. |
 | **Layer 3** | **Shadow Context Guard**<br>`hooks/shadow-context-guard.mjs` | PreToolUse lifecycle hook | Transparently redirects file reads to sanitized shadow copies under `scratch/context/`, blocking symlink traversal (CWE-59) escaping repository boundaries. |
-| **Layer 4** | **Deterministic TCB**<br>`path-containment.mjs` | Atomic file descriptor verification (`fs.openSync` + `fs.fstatSync`) | Eliminates filesystem race conditions (TOCTOU) and sibling-prefix path collisions (e.g. `scratch/context-evil`). |
+| **Layer 4** | **Deterministic TCB**<br>`path-containment.mjs` | Descriptor-bound file verification (`fs.openSync` + `fs.fstatSync` + 64-bit `dev`/`ino` realpath identity check) | Mitigates filesystem race conditions (TOCTOU) and blocks sibling-prefix path collisions (e.g. `scratch/context-evil`). |
 
 > [!NOTE]
 > **Boundary & Failure Semantics**:
@@ -213,7 +213,7 @@ three-lens/
         │   ├── safe-proof-policy.md      # Safe defensive-proof policy and prohibited commands
         │   └── model-independence.md     # Model and provider independence specification
         └── scripts/
-            ├── path-containment.mjs      # Authoritative TCB path containment & TOCTOU-resistant atomic file reading
+            ├── path-containment.mjs      # Authoritative TCB path containment & descriptor-bound TOCTOU-resistant file reading
             ├── safe-git.mjs              # Hardened, isolated git-execution wrapper
             ├── finalize-scan.mjs         # Authoritative deterministic finalizer and standards integration
             ├── standards-mapping.mjs     # Industry-standards mapping and dependency-boundary detector

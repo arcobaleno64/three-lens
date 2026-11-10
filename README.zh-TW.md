@@ -97,7 +97,7 @@ agy
 | **Layer 1** | **終端沙盒**<br>`agy --sandbox` | OS 層級容器 / 命名空間 / Seatbelt 隔離 | 阻斷不受信任目標代碼在終端執行任意指令、惡意網路外聯或持久破壞檔案系統。 |
 | **Layer 2** | **權限引擎**<br>`recommended-security-audit-permissions.json` | AGY CLI 執行期工具調度 (`deny > ask > allow`) | 依審計角色 (`coordinator`、`discovery`、`verifiers`、`remediation`) 限縮可用工具，杜絕越權調度或資料外洩。 |
 | **Layer 3** | **陰影上下文守衛**<br>`hooks/shadow-context-guard.mjs` | PreToolUse 生命週期勾點 | 攔截檔案讀取操作，透明重定向至 `scratch/context/` 去敏沙盒複本，阻斷符號連結目錄逃逸 (CWE-59)。 |
-| **Layer 4** | **確定性 TCB**<br>`path-containment.mjs` | 原子檔案描述子檢驗 (`fs.openSync` + `fs.fstatSync`) | 消除檔案系統競爭條件 (TOCTOU) 與同級目錄欺騙 (如 `scratch/context-evil`)。 |
+| **Layer 4** | **確定性 TCB**<br>`path-containment.mjs` | 綁定檔案描述子之檢驗 (`fs.openSync` + `fs.fstatSync` + 64 位元 `dev`/`ino` 實質路徑身分比對) | 緩解檔案系統競爭條件 (TOCTOU) 並阻斷同級目錄欺騙 (如 `scratch/context-evil`)。 |
 
 ### 推薦權限設定檔使用方式
 
@@ -208,7 +208,7 @@ three-lens/
         │   ├── safe-proof-policy.md      # 安全防禦證明政策與禁止指令
         │   └── model-independence.md     # 模型與供應商獨立性規格
         └── scripts/
-            ├── path-containment.mjs      # 權威 TCB 路徑包容與抗 TOCTOU 原子檔案讀取器
+            ├── path-containment.mjs      # 權威 TCB 路徑包容與綁定描述子之抗 TOCTOU 檔案讀取器
             ├── safe-git.mjs              # 強化安全 Git 執行隔離器
             ├── finalize-scan.mjs         # 權威確定性終審器與標準整合
             ├── standards-mapping.mjs     # 業界標準映射與依賴邊界檢測器
