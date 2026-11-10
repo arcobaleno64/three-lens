@@ -169,6 +169,50 @@ test('PreInvocation Secret Guard - Installation path with spaces executes direct
   }
 });
 
+test('PreInvocation Secret Guard - Executes and blocks when the hook is reached through a symlinked directory', async (t) => {
+  const os = await import('node:os');
+  const fs = await import('node:fs');
+  // Canonicalize the temp root so the "real" side is genuinely different from the symlinked side.
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'secret-guard-link-'));
+  try {
+    const realDir = path.join(root, 'real');
+    const linkDir = path.join(root, 'link');
+    fs.mkdirSync(realDir);
+    fs.copyFileSync(HOOK_SCRIPT, path.join(realDir, 'pre-invocation-secret-guard.mjs'));
+    try {
+      try {
+        fs.symlinkSync(realDir, linkDir, 'dir');
+      } catch {
+        fs.symlinkSync(realDir, linkDir, 'junction');
+      }
+    } catch (err) {
+      t.skip(`cannot create a directory symlink on this runner: ${err.code || err.message}`);
+      return;
+    }
+
+    const payload = JSON.stringify({ prompt: '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0...' });
+    const run = (dir) => spawnSync(process.execPath, [path.join(dir, 'pre-invocation-secret-guard.mjs')], {
+      input: payload,
+      encoding: 'utf8',
+      timeout: 3000
+    });
+
+    // Control: via the real path the hook blocks.
+    const viaReal = run(realDir);
+    assert.equal(JSON.parse(viaReal.stdout.trim()).terminationBehavior, 'terminate');
+
+    // Regression: via the symlinked path it must block too, not exit 0 with empty output.
+    const viaLink = run(linkDir);
+    assert.equal(viaLink.status, 0, `exit ${viaLink.status}, stderr: ${viaLink.stderr}`);
+    assert.notEqual(viaLink.stdout.trim(), '', 'hook produced no output when invoked through a symlinked directory');
+    const parsed = JSON.parse(viaLink.stdout.trim());
+    assert.equal(parsed.terminationBehavior, 'terminate');
+    assert.ok(parsed.injectSteps[0].errorMessage.userMessage.includes('PRIVATE_KEY'));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('PreInvocation Secret Guard - Tool Continuation Turn (invocationNum > 1 with empty input)', () => {
   const payload = {
     conversationId: 'test-continuation',

@@ -4,8 +4,8 @@
   "protocolVersion": "2.0.0",
   "frameworkReference": "evals/protocols/v2.0-three-layer-evaluation-framework.md",
   "status": "FROZEN_BEFORE_RUN",
-  "frozenAt": "2026-10-12T00:00:00Z",
-  "targetSystem": "@arcobaleno64/agy-security-audit",
+  "frozenAt": "2026-11-09T16:00:00Z",
+  "targetSystem": "@arcobaleno64/three-lens",
   "governance": {
     "authority": "Antigravity Security Governance & Assurance Directorate",
     "nonEquivalencePrinciple": "Sample sufficiency != evaluation success",
@@ -20,13 +20,13 @@
     "layer2": {
       "name": "External Validity Corpus",
       "minTotalCases": 12,
-      "maxTotalCases": 16,
+      "maxTotalCases": 32,
       "minVulnerableCases": 6,
-      "maxVulnerableCases": 8,
+      "maxVulnerableCases": 16,
       "minFixedCounterparts": 3,
-      "maxFixedCounterparts": 4,
+      "maxFixedCounterparts": 10,
       "minCleanControls": 3,
-      "maxCleanControls": 4,
+      "maxCleanControls": 10,
       "minVulnerabilityFamilies": 7
     },
     "layer3": {

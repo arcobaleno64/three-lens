@@ -804,6 +804,10 @@ export function runAgyDiscoveryOnFixture(fixture, repoRoot = DEFAULT_REPO_ROOT, 
     if (modelId) {
       agyArgs.push('--model', modelId);
     }
+    const effort = options.effort || options.reasoningProfile || options.tier;
+    if (effort) {
+      agyArgs.push('--effort', effort);
+    }
     agyArgs.push('--print', prompt);
 
     let stdout = '';
@@ -2148,7 +2152,7 @@ Options:
   --fixture <id>       Run discovery only on a specific fixture (e.g. SEM-03)
   --model <modelId>    Override target model ID (default: gemini-3.8-flash-high)
   --base-model <model> Base model architecture (e.g. gemini-3.8-flash)
-  --reasoning-profile <profile> Reasoning/thinking profile (e.g. medium, high, low)
+  --reasoning-profile, --effort <profile> Reasoning/thinking profile (e.g. low, medium, high)
   --out-dir <dir>      Directory to write benchmark envelope JSON files (default: evals/live-runs or evals/holdout-live-runs if passes > 1)
   --output <path>      Path to output JSON benchmark envelope (for single pass)
   --report <path>      Path to write formal Markdown empirical baseline report
@@ -2197,7 +2201,7 @@ Options:
   const reportPath = getArg('--report');
   const model = getArg('--model');
   const baseModel = getArg('--base-model');
-  const reasoningProfile = getArg('--reasoning-profile');
+  const reasoningProfile = getArg('--reasoning-profile') || getArg('--effort') || getArg('--tier');
   const retriesArg = getArg('--retries');
   const retries = retriesArg ? parseInt(retriesArg, 10) : undefined;
   const timeoutArg = getArg('--timeout') || getArg('--timeout-ms');

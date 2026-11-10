@@ -1,4 +1,4 @@
-# Three-Lens (3lens) v1.12.0
+# Three-Lens (3lens) v1.13.0
 
 three-lens 是以證據為本、多階段的安全保證與弱點驗證外掛，專為 Antigravity CLI（`agy`）打造。
 
@@ -56,7 +56,7 @@ agy
 
 ## 核心公理：權威聲明以不通過為前提 (Default-Deny on Authority Claims)
 
-所有權威聲明（弱點候選項目、補丁修復與覆蓋率完整性）預設為 **`UNVERIFIED`**。受審代碼本身不預設存在漏洞，審查合理產生 0 候選項（Zero Findings，無配額壓力）；候選項目無法自行宣告 `CONFIRMED` 或 `REPORTABLE`；在無驗證者共識、法定人數不足（< 2 票）或 0 票狀態下一律強制歸類為 `DEFERRED` (`NEEDS_MANUAL_REVIEW`)。當目錄核算覆蓋率不完整時，系統嚴格禁止宣告代碼庫為乾淨（Clean Claim Fail-Closed）。宣告乾淨（Clean）代表在界定範圍內無已驗證且未修復之實質弱點與證據缺口，屬於有界保證（Bounded Assurance），而非萬無一失的絕對認證。
+所有權威聲明（弱點候選項目、補丁修復與覆蓋率完整性）預設視為未驗證：候選項目的預設處置是 **`DEFERRED`** (`NEEDS_MANUAL_REVIEW`)，`UNVERIFIED` 是狀態或顯示用的標籤（例如「沒有觀察到驗證小組委派」時的驗證狀態），不是處置。受審代碼本身不預設存在漏洞，審查合理產生 0 候選項（Zero Findings，無配額壓力）；候選項目無法自行宣告 `CONFIRMED` 或 `REPORTABLE`；在無驗證者共識、法定人數不足（< 2 票）或 0 票狀態下一律強制歸類為 `DEFERRED` (`NEEDS_MANUAL_REVIEW`)。當目錄核算覆蓋率不完整時，系統嚴格禁止宣告代碼庫為乾淨（Clean Claim Fail-Closed）。宣告乾淨（Clean）代表在界定範圍內無已驗證且未修復之實質弱點與證據缺口，屬於有界保證（Bounded Assurance），而非萬無一失的絕對認證。
 
 ---
 
@@ -97,7 +97,7 @@ agy
 | **Layer 1** | **終端沙盒**<br>`agy --sandbox` | OS 層級容器 / 命名空間 / Seatbelt 隔離 | 阻斷不受信任目標代碼在終端執行任意指令、惡意網路外聯或持久破壞檔案系統。 |
 | **Layer 2** | **權限引擎**<br>`recommended-security-audit-permissions.json` | AGY CLI 執行期工具調度 (`deny > ask > allow`) | 依審計角色 (`coordinator`、`discovery`、`verifiers`、`remediation`) 限縮可用工具，杜絕越權調度或資料外洩。 |
 | **Layer 3** | **陰影上下文守衛**<br>`hooks/shadow-context-guard.mjs` | PreToolUse 生命週期勾點 | 攔截檔案讀取操作，透明重定向至 `scratch/context/` 去敏沙盒複本，阻斷符號連結目錄逃逸 (CWE-59)。 |
-| **Layer 4** | **確定性 TCB**<br>`path-containment.mjs` | 原子檔案描述子檢驗 (`fs.openSync` + `fs.fstatSync`) | 消除檔案系統競爭條件 (TOCTOU) 與同級目錄欺騙 (如 `scratch/context-evil`)。 |
+| **Layer 4** | **確定性 TCB**<br>`path-containment.mjs` | 綁定檔案描述子之檢驗 (`fs.openSync` + `fs.fstatSync` + 64 位元 `dev`/`ino` 實質路徑身分比對) | 緩解檔案系統競爭條件 (TOCTOU) 並阻斷同級目錄欺騙 (如 `scratch/context-evil`)。 |
 
 ### 推薦權限設定檔使用方式
 
@@ -120,7 +120,7 @@ agy --sandbox "audit this repository for security vulnerabilities"
 
 ```text
 three-lens/
-├── package.json                          # npm test, test:evals, test:semantic, test:discovery, test:stability, check:release (1.12.0)
+├── package.json                          # npm test, test:evals, test:semantic, test:discovery, test:stability, check:release (1.13.0)
 ├── plugin.json                           # Antigravity 外掛清單 (含 schema，無 BOM)
 ├── hooks.json                            # Antigravity hook 註冊（PreInvocation、PreToolUse）
 ├── hooks/                                # 生命週期勾點實作
@@ -208,7 +208,7 @@ three-lens/
         │   ├── safe-proof-policy.md      # 安全防禦證明政策與禁止指令
         │   └── model-independence.md     # 模型與供應商獨立性規格
         └── scripts/
-            ├── path-containment.mjs      # 權威 TCB 路徑包容與抗 TOCTOU 原子檔案讀取器
+            ├── path-containment.mjs      # 權威 TCB 路徑包容與綁定描述子之抗 TOCTOU 檔案讀取器
             ├── safe-git.mjs              # 強化安全 Git 執行隔離器
             ├── finalize-scan.mjs         # 權威確定性終審器與標準整合
             ├── standards-mapping.mjs     # 業界標準映射與依賴邊界檢測器

@@ -25,7 +25,7 @@ export { isPathContained, isRealPathContained, assertContainedPath, safeReadFile
 // baselines, and the TCB manifest. `scripts/bump-version.mjs` rewrites this line
 // (and package.json, and tool-integrity-manifest.json) together so a release
 // cannot bump one without the others going stale.
-export const TOOL_VERSION = '1.12.0';
+export const TOOL_VERSION = '1.13.0';
 import {
   loadProjectSecurityContext,
   detectContextDrift,
@@ -3614,8 +3614,10 @@ export function finalizeScan({
     if (toolIntegrity.status === 'SELF_AUDIT_MODE') {
       assuranceLabel = 'SELF_AUDIT_BOUNDED_CLEAN';
     } else if (!hasConfirmedProjectContext) {
-      // R9-T10: Project Security Context absent -> assurance CONTEXT_LIMITED
+      // R9-T10 & R01-F08: Project Security Context absent -> assurance CONTEXT_LIMITED
+      // Under Default-Deny, CONTEXT_LIMITED cannot declare clean (preventing downstream misinterpretation as Clean Attestation)
       assuranceLabel = 'CONTEXT_LIMITED';
+      canDeclareClean = false;
     } else {
       // R9-T11: confirmed Project Security Context -> eligible for BOUNDED_CLEAN
       assuranceLabel = 'BOUNDED_CLEAN';
@@ -4709,6 +4711,8 @@ export function renderMarkdownFromCanonical({
  * Canonical required critical scripts set (R6-P1-01 / v1.1.0 P0/P1).
  */
 export const REQUIRED_CRITICAL_SCRIPTS = [
+  'scripts/adapters/acp-adapter.mjs',
+  'scripts/adapters/acp-transport-adapter.mjs',
   'scripts/adapters/cloudflare-adapter.mjs',
   'scripts/adapters/plugin-data-adapter.mjs',
   'scripts/compact-guard.mjs',

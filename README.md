@@ -1,4 +1,4 @@
-# Three-Lens (3lens) v1.12.0
+# Three-Lens (3lens) v1.13.0
 
 three-lens is an evidence-backed, multi-stage security assurance and vulnerability verification plugin for Antigravity CLI (agy).
 
@@ -56,7 +56,7 @@ Upon completion of the 5-stage orchestration pipeline (Stages 1–4, with Stage 
 
 ## Foundational Axiom: Presumption of Non-Pass (Default-Deny on Authority Claims)
 
-All authority claims (candidate findings, patch remediations, and coverage completeness) default to **`UNVERIFIED`**. An audited codebase is not presumed vulnerable; a review may legitimately produce zero candidates (zero findings, no quota pressure). A candidate cannot self-declare `CONFIRMED` or `REPORTABLE`; without verifier consensus, below quorum (< 2 votes), or with zero votes, it is strictly classified `DEFERRED` (`NEEDS_MANUAL_REVIEW`). When directory-accounting coverage is incomplete, the system strictly forbids declaring the codebase clean (Clean Claim Fail-Closed). A "Clean" declaration means no validated, unremediated substantive findings and no evidence gaps remain within declared scope — a bounded assurance, not an absolute, universal certification.
+All authority claims (candidate findings, patch remediations, and coverage completeness) are unverified by default: a candidate's default disposition is **`DEFERRED`** (`NEEDS_MANUAL_REVIEW`), and `UNVERIFIED` is a status or display label (for example the verification status when no panel delegation was observed), not a disposition. An audited codebase is not presumed vulnerable; a review may legitimately produce zero candidates (zero findings, no quota pressure). A candidate cannot self-declare `CONFIRMED` or `REPORTABLE`; without verifier consensus, below quorum (< 2 votes), or with zero votes, it is strictly classified `DEFERRED` (`NEEDS_MANUAL_REVIEW`). When directory-accounting coverage is incomplete, the system strictly forbids declaring the codebase clean (Clean Claim Fail-Closed). A "Clean" declaration means no validated, unremediated substantive findings and no evidence gaps remain within declared scope — a bounded assurance, not an absolute, universal certification.
 
 ---
 
@@ -97,7 +97,7 @@ Auditing untrusted source code requires multi-layered defense to prevent prompt 
 | **Layer 1** | **Terminal Sandbox**<br>`agy --sandbox` | OS-level container / namespaces / seatbelt isolation | Blocks arbitrary shell command execution, malicious network egress, and persistent filesystem corruption from untrusted audited code. |
 | **Layer 2** | **Permission Engine**<br>`recommended-security-audit-permissions.json` | AGY CLI runtime tool dispatch (`deny > ask > allow`) | Enforces role-based least privilege (`coordinator`, `discovery`, `verifiers`, `remediation`), preventing subagents from invoking unauthorized tools or exfiltrating data. |
 | **Layer 3** | **Shadow Context Guard**<br>`hooks/shadow-context-guard.mjs` | PreToolUse lifecycle hook | Transparently redirects file reads to sanitized shadow copies under `scratch/context/`, blocking symlink traversal (CWE-59) escaping repository boundaries. |
-| **Layer 4** | **Deterministic TCB**<br>`path-containment.mjs` | Atomic file descriptor verification (`fs.openSync` + `fs.fstatSync`) | Eliminates filesystem race conditions (TOCTOU) and sibling-prefix path collisions (e.g. `scratch/context-evil`). |
+| **Layer 4** | **Deterministic TCB**<br>`path-containment.mjs` | Descriptor-bound file verification (`fs.openSync` + `fs.fstatSync` + 64-bit `dev`/`ino` realpath identity check) | Mitigates filesystem race conditions (TOCTOU) and blocks sibling-prefix path collisions (e.g. `scratch/context-evil`). |
 
 > [!NOTE]
 > **Boundary & Failure Semantics**:
@@ -125,7 +125,7 @@ The role permissions defined in `recommended-security-audit-permissions.json` pr
 
 ```text
 three-lens/
-├── package.json                          # npm test, test:evals, test:semantic, test:discovery, test:stability, check:release (1.12.0)
+├── package.json                          # npm test, test:evals, test:semantic, test:discovery, test:stability, check:release (1.13.0)
 ├── plugin.json                           # Antigravity plugin manifest (with schema, no BOM)
 ├── hooks.json                            # Antigravity hook registration (PreInvocation, PreToolUse)
 ├── hooks/                                # Lifecycle hook implementations
@@ -213,7 +213,7 @@ three-lens/
         │   ├── safe-proof-policy.md      # Safe defensive-proof policy and prohibited commands
         │   └── model-independence.md     # Model and provider independence specification
         └── scripts/
-            ├── path-containment.mjs      # Authoritative TCB path containment & TOCTOU-resistant atomic file reading
+            ├── path-containment.mjs      # Authoritative TCB path containment & descriptor-bound TOCTOU-resistant file reading
             ├── safe-git.mjs              # Hardened, isolated git-execution wrapper
             ├── finalize-scan.mjs         # Authoritative deterministic finalizer and standards integration
             ├── standards-mapping.mjs     # Industry-standards mapping and dependency-boundary detector

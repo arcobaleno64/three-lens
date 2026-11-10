@@ -64,6 +64,13 @@ const DOC_TARGETS = [
     replacement: (v) => `## 2. Hardening & Guardrails (v${v} / Production)`
   },
   {
+    // The skill header is what agy shows when /3lens is invoked, so users read it as the installed version.
+    // The lookahead makes anything after the closing paren fail the check instead of being silently ignored.
+    file: "skills/3lens/SKILL.md",
+    pattern: /^# Three-Lens Security Skill \(\/3lens v[^\s)]+\)(?=\r?$)/m,
+    replacement: (v) => `# Three-Lens Security Skill (/3lens v${v})`
+  },
+  {
     file: "docs/reproduction/README.md",
     pattern: /^> \*\*Frozen Baseline\*\*: `agy-security-audit v[^`]+`/m,
     replacement: (v) => `> **Frozen Baseline**: \`agy-security-audit v${v}\``

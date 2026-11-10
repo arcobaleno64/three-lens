@@ -3,7 +3,7 @@
   "schemaVersion": "1.0.0",
   "generatedAt": "2026-09-24T15:36:38.661Z",
   "targetSystem": "@arcobaleno64/agy-security-audit",
-  "version": "1.12.0",
+  "version": "1.13.0",
   "governance": {
     "standard": "NIST SSDF (SP 800-218) / Default-Deny Authority Invariant",
     "covenant": "Section 21 Holdout Covenant & v1.6.1 Evidence Integrity Correction",
@@ -38,7 +38,7 @@
         },
         {
           "path": "skills/3lens/tool-integrity-manifest.json",
-          "sha256": "421e727bf3a9396d4a77ea2364e53be184875b511829ce98bae5a381bda88543",
+          "sha256": "693e29a08b16010134561b3d12f2f1959bf7d430364957d3db3364603457cf42",
           "description": "Cryptographic TCB integrity manifest pinning critical script hashes"
         },
         {
@@ -141,7 +141,7 @@
       "artifacts": [
         {
           "path": "hooks/shadow-context-guard.mjs",
-          "sha256": "d77a833c8419b1d7853989efa51993c0b63fc31a7666a0105608256a966a3045",
+          "sha256": "1bfa903d30335d4f1ced5247935e169cd35d0dd32b42aab37d0c3a9396f5d5ed",
           "description": "PreToolUse hook enforcing shadow context redirection and runtime confinement"
         },
         {

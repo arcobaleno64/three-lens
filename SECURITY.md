@@ -23,7 +23,7 @@ The `security-audit` plugin is strictly designed for defensive security assuranc
 
 ---
 
-## 2. Hardening & Guardrails (v1.12.0 / Production)
+## 2. Hardening & Guardrails (v1.13.0 / Production)
 
 ### 2.1 Presumption of Non-Pass (Default-Deny on Authority Claims)
 - Under Default-Deny, all authority claims (candidate findings, remediation patches, and coverage claims) begin in an unverified state.
@@ -63,7 +63,7 @@ The `security-audit` plugin is strictly designed for defensive security assuranc
 ### 2.7 Deterministic SAST Ingestion, Funnel Corroboration & Filesystem Race Defense (R7-P0-02, R7-P1-02, v1.1.0 P0/P1)
 - **Multi-Tool Corroboration**: The plugin ingests external deterministic SAST reports (Gitleaks -> Semgrep CE -> CodeQL) via `ingestExternalEvidence()`, normalizing cross-platform URI representations (Windows `\`, POSIX `/`, percent-encoded segments, `file://` schemes).
 - **Granular Evidence Binding**: External findings are classified into authoritative binding states: `BOUND` (source line and hash verified), `UNBOUND_PATH` (line beyond EOF or syntax issue), `UNBOUND_MISSING_FILE` (target file missing), `GENERATED_DUPLICATE` (findings from generated shadow contexts such as `scratch/context/`), and `OUTSIDE_SCOPE` (paths outside repository root).
-- **Filesystem Race (TOCTOU) Defense**: Hardened via `safeReadFileContained()` in `path-containment.mjs`. Instead of sequential `fs.existsSync` -> `fs.readFileSync` windows (flagged by CodeQL `js/file-system-race`), the implementation opens a dedicated file descriptor (`fs.openSync`), inspects the handle directly (`fs.fstatSync`), asserts canonical realpath containment, reads content directly from the descriptor (`fs.readSync`), and guarantees descriptor closure via `finally`.
+- **Filesystem Race (TOCTOU) Defense**: Hardened via `safeReadFileContained()` in `path-containment.mjs`. Instead of sequential `fs.existsSync` -> `fs.readFileSync` windows (flagged by CodeQL `js/file-system-race`), the implementation opens a dedicated file descriptor (`fs.openSync`, with `O_NOFOLLOW` where supported), inspects the handle directly (`fs.fstatSync`), asserts canonical realpath containment, binds the opened handle's 64-bit `dev`/`ino` identity to `fs.statSync(realPath, { bigint: true })` (failing closed on mismatch or zero file IDs), reads content directly from the descriptor (`fs.readSync`), and guarantees descriptor closure via `finally`.
 
 ### 2.8 4-Layer Defense-in-Depth Execution Model (v1.3.0-dev / Production)
 In security audit contexts, no single security perimeter can protect against all attack vectors (e.g. prompt injection in reviewed code, symlink path traversal, arbitrary shell execution, secret exfiltration). The plugin operates under a formal four-layer defense-in-depth model:
@@ -79,14 +79,14 @@ In security audit contexts, no single security perimeter can protect against all
    - **Failure Modes & Defenses**: When the recommended profile is configured into Antigravity operator settings, if a subagent attempts privilege escalation or unauthorized actions (e.g. discovery agent attempting code edits or network access), Layer 2 blocks tool dispatch before model execution.
 
 3. **Layer 3: Shadow Context Guard (`hooks/shadow-context-guard.mjs`, PreToolUse Hook)**
-   - **Boundary**: Workspace application layer intercepting file read operations (`view_file`, `grep_search`, `list_dir`, `find_by_name`).
-   - **Objective**: Intercepts direct access to raw workspace files during active security audit sessions, transparently redirects agents to the sanitized shadow context (`scratch/context/`), and blocks symlink directory traversal escaping repository roots (CWE-59). Command-line regex matching serves to reduce accidental egress misuse.
-   - **Failure Modes & Defenses**: During an active audit session with initialized shadow context, direct inspection of raw or escaping files is intercepted and denied fail-closed. In the absence of an active audit context, or in the event of an unhandled hook exception/timeout, Layer 3 fails open to avoid breaking general, non-audit `agy` developer workflows. Hard isolation, persistent write protection, and complete outbound network blocking fundamentally rely on **Layer 1 (`agy --sandbox`)**.
+   - **Boundary**: Workspace application layer intercepting file read operations (`view_file`, `grep_search`, `list_dir`, `find_by_name`) and write operations (`write_to_file`, `replace_file_content`).
+   - **Objective**: Intercepts direct access to raw workspace files during active security audit sessions, transparently redirects agents to the sanitized shadow context (`scratch/context/`), confines writes to authorized sandbox boundaries (`scratch/`, artifact directory, external temp), and blocks symlink/junction directory traversal escaping authorized boundaries (CWE-59) by requiring both lexical and canonical realpath containment (resolving the deepest existing ancestor for not-yet-existing write targets). Command-line regex matching serves to reduce accidental egress misuse.
+   - **Failure Modes & Defenses**: During an active audit session with initialized shadow context, direct inspection of raw or escaping files and writes through escaping symlinks are intercepted and denied fail-closed. Because `run_command` is not a full shell parser, an agent with shell execution permission can still invoke filesystem commands unless constrained by Layer 1/Layer 2. In the absence of an active audit context, or in the event of an unhandled hook exception/timeout, Layer 3 fails open to avoid breaking general, non-audit `agy` developer workflows. Hard isolation, persistent write protection, and complete outbound network blocking fundamentally rely on **Layer 1 (`agy --sandbox`)**.
 
 4. **Layer 4: Deterministic Path Containment & TOCTOU-Resistant TCB (`path-containment.mjs`)**
-   - **Boundary**: Trusted Computing Base (TCB) atomic filesystem I/O boundary.
-   - **Objective**: Centralizes containment algebra and uses dedicated file descriptor inspection (`fs.openSync` + `fs.fstatSync` + `fs.readSync`) to prevent filesystem race conditions (TOCTOU) and sibling-prefix path collisions (e.g. `scratch/context-evil`).
-   - **Failure Modes & Defenses**: If a symlink or file swap occurs between validation and read, Layer 4 descriptor binding guarantees containment against race conditions and out-of-boundary access.
+   - **Boundary**: Trusted Computing Base (TCB) descriptor-bound filesystem I/O boundary.
+   - **Objective**: Centralizes containment algebra and uses dedicated file descriptor inspection (`fs.openSync` + `fs.fstatSync` + 64-bit `dev`/`ino` identity binding against `realPath` + `fs.readSync`) to mitigate filesystem race conditions (TOCTOU) and block sibling-prefix path collisions (e.g. `scratch/context-evil`).
+   - **Failure Modes & Defenses**: If a symlink or file swap occurs between `open()` and `realpathSync()`, Layer 4 compares the 64-bit `dev`/`ino` of the opened descriptor (`fstatSync(..., { bigint: true })`) against `statSync(realPath, { bigint: true })` (and pre-open `lstatSync` when symlinks are disallowed) and fails closed on mismatch or zero file IDs. On POSIX and Windows NTFS/ReFS (where libuv surfaces the 64-bit file index via `GetFileInformationByHandle`), this detects post-open path substitution; on filesystems that report `ino === 0n` or `dev === 0n`, `safeReadFileContained()` fails closed rather than returning unverified content.
 
 ### 2.9 Monotonic State & Anti-Rollback Threat Boundary (Milestone 5.4 Governance)
 - **Local Multi-Anchor Defense**: Anti-rollback for cryptographic trust registries and revocation journals relies on multi-anchor monotonic witnesses persisted across separate local storage locations (`PLUGIN_DATA` + user home directory `~/.three-lens/witness/`) combined with in-process memory tracking and unbroken historical digest commitment (`registryDigests`).
@@ -115,7 +115,8 @@ Only the current MINOR line is supported. Update this table with every MINOR bum
 
 | Version | Supported |
 |---|---|
-| 1.12.x | :white_check_mark: |
+| 1.13.x | :white_check_mark: |
+| 1.12.x | :x: |
 | 1.11.x | :x: |
 | 1.10.x | :x: |
 | 1.9.x | :x: |

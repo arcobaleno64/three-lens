@@ -102,6 +102,15 @@ export function validateV2Corpus(corpusPath = path.join(REPO_ROOT, 'evals/v2-cor
     errors.push(`Distinct vulnerability families (${families.size}) < required (${l2Criteria.minVulnerabilityFamilies})`);
   }
 
+  // R10-F06 Defense: Governance provenance discipline must be synchronized with case commitSha
+  const expectedCommitSha = cases[0]?.commitSha;
+  if (expectedCommitSha && corpus.governance?.provenanceDiscipline) {
+    const provMatch = corpus.governance.provenanceDiscipline.match(/commit\s+([0-9a-f]{40})/i);
+    if (provMatch && provMatch[1].toLowerCase() !== expectedCommitSha.toLowerCase()) {
+      errors.push(`Governance provenanceDiscipline commit (${provMatch[1]}) does not match cases commitSha (${expectedCommitSha}) (R10-F06)`);
+    }
+  }
+
   const requiredFields = [
     'caseId',
     'provenanceType',
@@ -152,6 +161,21 @@ export function validateV2Corpus(corpusPath = path.join(REPO_ROOT, 'evals/v2-cor
 
     if (c.provenanceType === 'SYNTHETIC_REGRESSION' && !['VULNERABLE', 'FIXED_COUNTERPART'].includes(c.role)) {
       errors.push(`${prefix}: SYNTHETIC_REGRESSION must have role VULNERABLE or FIXED_COUNTERPART`);
+    }
+
+    if (c.provenanceType === 'UPSTREAM_VERIFIED_OSS') {
+      if (!['VULNERABLE', 'FIXED_COUNTERPART'].includes(c.role)) {
+        errors.push(`${prefix}: UPSTREAM_VERIFIED_OSS must have role VULNERABLE or FIXED_COUNTERPART`);
+      }
+      if (!c.cveId || !/^CVE-\d{4}-\d{4,}$/.test(c.cveId)) {
+        errors.push(`${prefix}: UPSTREAM_VERIFIED_OSS must have valid cveId (e.g. CVE-2020-7598), found '${c.cveId}'`);
+      }
+      if (!c.upstreamCommitSha || !/^[0-9a-f]{40}$/i.test(c.upstreamCommitSha)) {
+        errors.push(`${prefix}: UPSTREAM_VERIFIED_OSS must have valid 40-character hex upstreamCommitSha, found '${c.upstreamCommitSha}'`);
+      }
+      if (!c.upstreamRepo || !/^https:\/\/github\.com\/[^/]+\/[^/]+/i.test(c.upstreamRepo)) {
+        errors.push(`${prefix}: UPSTREAM_VERIFIED_OSS must have valid upstreamRepo URL, found '${c.upstreamRepo}'`);
+      }
     }
 
     if (!['VULNERABLE', 'FIXED_COUNTERPART', 'CLEAN_CONTROL'].includes(c.role)) {
@@ -238,11 +262,13 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       process.exit(1);
     }
 
+    const criteria = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'evals/protocols/v2.0-acceptance-criteria.json'), 'utf8'));
+    const l2 = criteria.sampleSizeRequirements.layer2;
     console.log('✔ V2.0 Layer 2 External Validity Corpus PASSED:');
-    console.log(`  - Total Cases: ${result.summary.totalCases} (Target: 12-16)`);
-    console.log(`  - Vulnerable Cases: ${result.summary.vulnerable} (Target: 6-8)`);
-    console.log(`  - Fixed Counterparts: ${result.summary.fixed} (Target: 3-4)`);
-    console.log(`  - Clean Negative Controls: ${result.summary.clean} (Target: 3-4)`);
+    console.log(`  - Total Cases: ${result.summary.totalCases} (Target: ${l2.minTotalCases}-${l2.maxTotalCases})`);
+    console.log(`  - Vulnerable Cases: ${result.summary.vulnerable} (Target: ${l2.minVulnerableCases}-${l2.maxVulnerableCases})`);
+    console.log(`  - Fixed Counterparts: ${result.summary.fixed} (Target: ${l2.minFixedCounterparts}-${l2.maxFixedCounterparts})`);
+    console.log(`  - Clean Negative Controls: ${result.summary.clean} (Target: ${l2.minCleanControls}-${l2.maxCleanControls})`);
     console.log(`  - Vulnerability Families: ${result.summary.familiesCount} (Target: >= 7)`);
     console.log('  - Physical File Integrity: 100% Verified on Disk');
     process.exit(0);

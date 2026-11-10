@@ -1479,7 +1479,7 @@ export function runTests() {
     const cleanExtractDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sec-audit-zip-clean-'));
     try {
       // Copy project files (excluding .git) to simulate freshly extracted zip archive
-      const copyItems = ['package.json', 'LICENSE', 'README.md', 'SECURITY.md', 'plugin.json', 'hooks.json', 'hooks', 'rules', 'agents', 'skills', 'evals', 'schemas', '.security-audit', 'recommended-security-audit-permissions.json', 'scripts', 'tests'];
+      const copyItems = ['package.json', 'LICENSE', 'README.md', 'SECURITY.md', 'plugin.json', 'hooks.json', 'hooks', 'rules', 'agents', 'skills', 'evals', 'schemas', '.security-audit', 'recommended-security-audit-permissions.json', 'scripts', 'tests', 'tool-integrity-manifest.json'];
       for (const item of copyItems) {
         const srcPath = path.resolve(process.cwd(), item);
         if (fs.existsSync(srcPath)) {
@@ -4027,6 +4027,10 @@ export default appName;`;
     });
     if (finalized90.summary.assuranceLabel !== 'CONTEXT_LIMITED') {
       throw new Error(`R9-T10 VIOLATION: Scan without .security-audit/ yielded ${finalized90.summary.assuranceLabel} instead of CONTEXT_LIMITED`);
+    }
+    // R01-F08 Verification: canDeclareClean must be false when context is limited
+    if (finalized90.summary.canDeclareClean !== false) {
+      throw new Error(`R9-T10 VIOLATION: canDeclareClean must be strictly false under CONTEXT_LIMITED, got: ${finalized90.summary.canDeclareClean}`);
     }
   } finally {
     fs.rmSync(testRoot90, { recursive: true, force: true });
