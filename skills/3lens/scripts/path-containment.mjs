@@ -8,9 +8,10 @@
  *    drive-letter confusion, and sibling-prefix collisions like scratch/context-evil).
  * 2. Symlink-aware canonical realpath containment (CWE-59 defense), failing closed
  *    on dangling links, inaccessible paths, or boundary escapes.
- * 3. Atomic, TOCTOU-resistant file reading (open -> fstat -> realpath assertion ->
- *    readSync from descriptor -> closeSync) to prevent time-of-check to time-of-use
- *    filesystem race conditions (CodeQL js/file-system-race).
+ * 3. Descriptor-bound, TOCTOU-resistant file reading (open -> fstat -> realpath
+ *    containment + 64-bit dev/ino identity binding -> readSync from descriptor ->
+ *    closeSync) to mitigate time-of-check to time-of-use filesystem race conditions
+ *    (CodeQL js/file-system-race).
  *
  * Zero external npm dependencies. Pure Node.js builtins.
  */
@@ -98,15 +99,21 @@ export function assertContainedPath(rootDir, candidatePath, label = 'Path') {
 }
 
 /**
- * Safely and atomically reads a file contained within rootDir, eliminating TOCTOU
- * race windows (stat -> read) and symlink bypasses.
+ * Reads a file contained within rootDir via a dedicated file descriptor, binding
+ * the post-open realpath containment check to the opened descriptor's identity.
  *
  * Sequence:
  * 1. Lexical boundary assertion (isPathContained).
  * 2. If allowSymlinks is false, lstat check rejects symbolic links.
- * 3. Open dedicated file descriptor (fs.openSync).
+ * 3. Open dedicated file descriptor (fs.openSync, with O_NOFOLLOW when allowSymlinks is false and supported by OS).
  * 4. Inspect opened file handle via fs.fstatSync (asserts isFile and size limit).
- * 5. Verify fs.realpathSync containment on target.
+ * 5. Verify fs.realpathSync containment on target and bind the opened descriptor's
+ *    64-bit device/file-ID identity (fstatSync bigint dev/ino) to statSync(realPath, { bigint: true })
+ *    (and pre-open lstatSync when allowSymlinks is false), failing closed on mismatch or zero identity.
+ *    Guarantee & platform limits: on POSIX and Windows NTFS/ReFS (via libuv GetFileInformationByHandle),
+ *    64-bit dev/ino uniquely identifies the opened file and detects post-open path swaps (e.g. symlink
+ *    to regular file replacement between open and realpath). On filesystems that do not report stable
+ *    non-zero file IDs (ino === 0n or dev === 0n), identity binding cannot be proven and fails closed.
  * 6. Read content directly from file descriptor into buffer via fs.readSync.
  * 7. Guaranteed closeSync in finally block.
  *
@@ -140,10 +147,11 @@ export function safeReadFileContained(rootDir, candidatePath, options = {}) {
     : path.resolve(resolvedRoot, candidatePath);
 
   // 2. Symlink rejection on declared path if symlinks not allowed
+  let preOpenLstatBig = null;
   if (!allowSymlinks) {
     try {
-      const lstat = fs.lstatSync(resolvedPath);
-      if (lstat.isSymbolicLink()) {
+      preOpenLstatBig = fs.lstatSync(resolvedPath, { bigint: true });
+      if (preOpenLstatBig.isSymbolicLink()) {
         return { ok: false, error: `File is a symbolic link; symlinks are rejected under default-deny: '${candidatePath}'`, content: null, stat: null };
       }
     } catch (err) {
@@ -153,8 +161,11 @@ export function safeReadFileContained(rootDir, candidatePath, options = {}) {
 
   // 3. Open file descriptor to anchor the target against substitution races
   let fd = null;
+  const openFlags = !allowSymlinks && typeof fs.constants?.O_NOFOLLOW === 'number'
+    ? (fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+    : 'r';
   try {
-    fd = fs.openSync(resolvedPath, 'r');
+    fd = fs.openSync(resolvedPath, openFlags);
   } catch (err) {
     return { ok: false, error: `Failed opening file: ${err.message}`, content: null, stat: null };
   }
@@ -170,7 +181,7 @@ export function safeReadFileContained(rootDir, candidatePath, options = {}) {
       return { ok: false, error: `File size (${fstat.size} bytes) exceeds maximum bound (${maxSizeBytes} bytes)`, content: null, stat: null };
     }
 
-    // 5. Assert realpath containment on opened file
+    // 5. Assert realpath containment on opened file and bind descriptor identity
     let realPath;
     try {
       realPath = fs.realpathSync(resolvedPath);
@@ -180,6 +191,32 @@ export function safeReadFileContained(rootDir, candidatePath, options = {}) {
 
     if (!isRealPathContained(resolvedRoot, realPath)) {
       return { ok: false, error: `Resolved target realpath escapes root directory: '${realPath}'`, content: null, stat: null };
+    }
+
+    let fdStatBig;
+    let realStatBig;
+    try {
+      fdStatBig = fs.fstatSync(fd, { bigint: true });
+      realStatBig = fs.statSync(realPath, { bigint: true });
+    } catch (err) {
+      return { ok: false, error: `Failed verifying file descriptor identity: ${err.message}`, content: null, stat: null };
+    }
+
+    if (
+      fdStatBig.ino === 0n ||
+      realStatBig.ino === 0n ||
+      fdStatBig.dev === 0n ||
+      realStatBig.dev === 0n ||
+      fdStatBig.dev !== realStatBig.dev ||
+      fdStatBig.ino !== realStatBig.ino ||
+      (preOpenLstatBig !== null && (fdStatBig.dev !== preOpenLstatBig.dev || fdStatBig.ino !== preOpenLstatBig.ino))
+    ) {
+      return {
+        ok: false,
+        error: `File descriptor identity mismatch between opened handle and resolved realpath: '${candidatePath}'`,
+        content: null,
+        stat: null
+      };
     }
 
     // 6. Read content directly from file descriptor

@@ -1,8 +1,8 @@
 {
   "schemaVersion": "1.0.0",
   "toolVersion": "1.13.0",
-  "generatedAt": "2026-11-10T01:03:36.308Z",
-  "manifestDigest": "1fa1557c3d05a096340afa52270438c3add65c23eb03c4984545c14e2ae970a5",
+  "generatedAt": "2026-11-10T01:41:50.301Z",
+  "manifestDigest": "f0784e1eadddfa72374003b1b8e140753842389f55a97c1b82421ff312471c00",
   "criticalScripts": {
     "scripts/adapters/acp-adapter.mjs": "677e868a52678c377895f3f18a2476f6a4994e8eaf6738d8ed1309c24e47c01c",
     "scripts/adapters/acp-transport-adapter.mjs": "d1c5837036a609898ec2c55745852f89b6511277396d36750657fd387710b60d",
@@ -12,7 +12,7 @@
     "scripts/build-threat-model.mjs": "b71c553f1bd61da374753d9f05891c839ae684f80103716afce1e6fbc4bae9e2",
     "scripts/compact-guard.mjs": "170aacd1b3cb5843c9d06dcd2eaf4bbe99d66f2c2f9e531b5ca1d0af8379f785",
     "scripts/finalize-scan.mjs": "1a67626e17ef06ec2119f6b77f5c12ac53e67436eba3b3e798231e7cf5e9b103",
-    "scripts/path-containment.mjs": "8044a629e15bc113998417823359e5fdf1286e228ae1c384220c006559ffcbf8",
+    "scripts/path-containment.mjs": "00025a4e3c380193a52142e9b874db281272b3a78bc45cdf4091df516ea69708",
     "scripts/prepare-review-context.mjs": "ddbf271d330963d8b70ce6bc0c6dd585a468da7a6bf35c01a151276ea77fa2c8",
     "scripts/project-context.mjs": "63ffb3d89f3df1ff247e98b6a42b6cd618f0e74a23c468ad3df5995af3773929",
     "scripts/render-sarif.mjs": "75096ae91df3591a6d80af73e9fbbd232005c664d65af802282412cbe4ecf890",

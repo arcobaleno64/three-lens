@@ -38,7 +38,7 @@
         },
         {
           "path": "skills/3lens/tool-integrity-manifest.json",
-          "sha256": "a55107f64e5c12e024164c8fbbbbc1f5284df5617819717e122b61ba17fe66da",
+          "sha256": "9ce40c43f3f4b7e1c93516beb07e7ec236250907761713dc88d4569e53e98839",
           "description": "Cryptographic TCB integrity manifest pinning critical script hashes"
         },
         {
@@ -141,7 +141,7 @@
       "artifacts": [
         {
           "path": "hooks/shadow-context-guard.mjs",
-          "sha256": "d77a833c8419b1d7853989efa51993c0b63fc31a7666a0105608256a966a3045",
+          "sha256": "1bfa903d30335d4f1ced5247935e169cd35d0dd32b42aab37d0c3a9396f5d5ed",
           "description": "PreToolUse hook enforcing shadow context redirection and runtime confinement"
         },
         {
