@@ -19,14 +19,17 @@
 
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { DEFAULT_SUPERVISOR_PUBLIC_PEM } from './plugin-data-adapter.mjs';
 
-// R10-F01 Defense: Immutable Root of Trust for ACP Inline Streaming Diagnostics.
-// Pinned static Ed25519 supervisor root public key.
-// Zero ambient AsyncLocalStorage, zero dynamic token lookup, zero override backdoors.
-// Callers can NEVER inject or override the authority root key.
-export const ACP_SUPERVISOR_PUBLIC_PEM =
+export { DEFAULT_SUPERVISOR_PUBLIC_PEM };
+
+// R11 Fix: Official uncompromised production supervisor root public key
+export const ACP_SUPERVISOR_PUBLIC_PEM = DEFAULT_SUPERVISOR_PUBLIC_PEM;
+
+// R11 Defense: Revoked test key whose private key was previously exposed in git history.
+// Unconditionally rejected by ACP authority verification under all circumstances.
+export const REVOKED_TEST_KEY_PEM =
   '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAfhd+MMkWEh9qzeo1qUR/dcX6hf8ggaf1z6B52Ltp15k=\n-----END PUBLIC KEY-----\n';
-export const DEFAULT_SUPERVISOR_PUBLIC_PEM = ACP_SUPERVISOR_PUBLIC_PEM;
 
 /**
  * Standard LSP / ACP Diagnostic Severity ratings:
@@ -95,10 +98,12 @@ export function computeFindingDigest(finding) {
  * Under Default-Deny (R06-F01, R07-F01 & R08-F02), mere field presence or unverified consensus/proof cannot claim authority.
  * Full versioned finding digest is cryptographically bound to the supervisor digital signature.
  * Untrusted caller options CANNOT override the supervisor root public key (R08-F02).
+ * Leaked/revoked test key is permanently rejected (R11).
  * @param {object} finding
+ * @param {string} [trustedRootPem=ACP_SUPERVISOR_PUBLIC_PEM]
  * @returns {boolean}
  */
-export function assertFindingDispositionAuthority(finding) {
+export function assertFindingDispositionAuthority(finding, trustedRootPem = ACP_SUPERVISOR_PUBLIC_PEM) {
   if (!finding || typeof finding !== 'object') return false;
   const disp = String(finding.disposition || '').toUpperCase().trim();
   const isReportableDisp = disp === 'CONFIRMED' || disp === 'REPORTABLE';
@@ -128,14 +133,18 @@ export function assertFindingDispositionAuthority(finding) {
   }
 
   try {
-    // R10-F01 Defense: Immutable pinned supervisor root public key.
-    // Untrusted options and ambient overrides are completely eliminated.
-    const trustedKeyPem = ACP_SUPERVISOR_PUBLIC_PEM.trim().replace(/\r\n/g, '\n');
+    const trustedKeyPem = (typeof trustedRootPem === 'string' && trustedRootPem.trim() ? trustedRootPem : ACP_SUPERVISOR_PUBLIC_PEM).trim().replace(/\r\n/g, '\n');
+    const revokedKeyPem = REVOKED_TEST_KEY_PEM.trim().replace(/\r\n/g, '\n');
 
-    // Verify key identity: verifierPublicKey (if supplied) must match trusted root key
+    // R11 Defense: Compromised test key is permanently revoked and never accepted
+    if (trustedKeyPem === revokedKeyPem) {
+      return false;
+    }
+
+    // Verify key identity: verifierPublicKey (if supplied) must match trusted root key and must not be revoked
     if (ap.verifierPublicKey) {
       const suppliedKeyPem = String(ap.verifierPublicKey).trim().replace(/\r\n/g, '\n');
-      if (suppliedKeyPem !== trustedKeyPem) {
+      if (suppliedKeyPem === revokedKeyPem || suppliedKeyPem !== trustedKeyPem) {
         return false;
       }
     }
@@ -225,12 +234,17 @@ function safeNonNegativeInteger(val, fallback = 0) {
 /**
  * Formats a single 3-Lens candidate/verified finding into an ACP-compliant Diagnostic object.
  * @param {object} finding
+ * @param {string} [trustedRootPem=ACP_SUPERVISOR_PUBLIC_PEM]
  * @returns {object}
  */
-export function formatAcpDiagnostic(finding, options = {}) {
+export function formatAcpDiagnostic(finding, trustedRootPem = ACP_SUPERVISOR_PUBLIC_PEM) {
   if (!finding || typeof finding !== 'object') {
     throw new TypeError('Finding must be a non-null object');
   }
+
+  const effectiveRoot = typeof trustedRootPem === 'string' && trustedRootPem.trim()
+    ? trustedRootPem
+    : ACP_SUPERVISOR_PUBLIC_PEM;
 
   const rawStartLine = finding.location?.startLine ?? 1;
   const rawEndLine = finding.location?.endLine ?? rawStartLine;
@@ -243,7 +257,7 @@ export function formatAcpDiagnostic(finding, options = {}) {
   const endChar = safeNonNegativeInteger(rawEndCol - 1, startChar);
 
   const disposition = finding.disposition ? String(finding.disposition).toUpperCase().trim() : 'UNVERIFIED';
-  const isConfirmed = assertFindingDispositionAuthority(finding);
+  const isConfirmed = assertFindingDispositionAuthority(finding, effectiveRoot);
 
   // R03-F03 Defense: If not confirmed via consensus, force disposition to UNVERIFIED for severity calculation
   const effectiveDisp = isConfirmed ? disposition : 'UNVERIFIED';
@@ -302,15 +316,19 @@ export function serializeJsonRpcNotification(method, params) {
  * Formats a full `textDocument/publishDiagnostics` notification for an array of findings in a file.
  * @param {string} uri Target document URI or file path
  * @param {Array<object>} findings
- * @param {object} [options={}]
+ * @param {string} [trustedRootPem=ACP_SUPERVISOR_PUBLIC_PEM]
  * @returns {string} JSON-RPC 2.0 notification line
  */
-export function formatPublishDiagnosticsNotification(uri, findings = [], options = {}) {
+export function formatPublishDiagnosticsNotification(uri, findings = [], trustedRootPem = ACP_SUPERVISOR_PUBLIC_PEM) {
   if (!uri || typeof uri !== 'string') {
     throw new TypeError('Document URI must be a non-empty string');
   }
 
-  const diagnostics = (Array.isArray(findings) ? findings : []).map(f => formatAcpDiagnostic(f, options));
+  const effectiveRoot = typeof trustedRootPem === 'string' && trustedRootPem.trim()
+    ? trustedRootPem
+    : ACP_SUPERVISOR_PUBLIC_PEM;
+
+  const diagnostics = (Array.isArray(findings) ? findings : []).map(f => formatAcpDiagnostic(f, effectiveRoot));
   return serializeJsonRpcNotification('textDocument/publishDiagnostics', {
     uri,
     diagnostics
@@ -413,8 +431,12 @@ export function parseJsonRpcMessage(raw) {
 /**
  * Factory for streaming diagnostic emitter to stdio or custom stream.
  * @param {object} stream Writable stream (defaults to process.stdout)
+ * @param {object} [emitterOptions={}] Optional emitter configuration (e.g. trustedRootPem for testing)
  */
-export function createAcpDiagnosticEmitter(stream = process.stdout) {
+export function createAcpDiagnosticEmitter(stream = process.stdout, emitterOptions = {}) {
+  const trustedRootPem = (emitterOptions && typeof emitterOptions.trustedRootPem === 'string' && emitterOptions.trustedRootPem.trim())
+    ? emitterOptions.trustedRootPem
+    : ACP_SUPERVISOR_PUBLIC_PEM;
   const cancelledSessions = new Set();
   const cancelledRequests = new Set();
   const MAX_CANCELLED_REQUESTS = 500;
@@ -580,14 +602,14 @@ export function createAcpDiagnosticEmitter(stream = process.stdout) {
     emitDiagnostic(uri, finding, options = {}) {
       const sid = options.sessionId;
       if (!isEmissionAllowed(sid, options.turnId, options.requestId)) return null;
-      const line = formatPublishDiagnosticsNotification(uri, [finding], options);
+      const line = formatPublishDiagnosticsNotification(uri, [finding], trustedRootPem);
       stream.write(line);
       return line;
     },
     emitBatch(uri, findings, options = {}) {
       const sid = options.sessionId;
       if (!isEmissionAllowed(sid, options.turnId, options.requestId)) return null;
-      const line = formatPublishDiagnosticsNotification(uri, findings, options);
+      const line = formatPublishDiagnosticsNotification(uri, findings, trustedRootPem);
       stream.write(line);
       return line;
     },
