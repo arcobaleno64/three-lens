@@ -797,7 +797,9 @@ test('Harness Governance (R08-F07, R09-F04 & R10-F04): parseGitRemoteOriginUrl s
 });
 
 test('Harness Governance (R08-F05, R08-F06, R09-F03 & R10-F03): getCanonicalRealPath and adm-zip path containment defense', () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'admzip-test-'));
+  // Canonicalize the temp root: on macOS os.tmpdir() is under /var, a symlink to /private/var, and the
+  // adm-zip fixture compares fs.realpathSync(parent) against a non-canonical boundary prefix.
+  const tmpDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'admzip-test-'));
   try {
     const sandboxDir = path.join(tmpDir, 'target');
     fs.mkdirSync(sandboxDir, { recursive: true });
