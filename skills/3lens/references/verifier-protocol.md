@@ -2,11 +2,11 @@
 
 ## 1. Presumption of Non-Pass & Fixed 3-Lens Verification Panel
 
-Every candidate finding begins in the state of `UNVERIFIED / NON_PASS`.
+Every candidate finding begins in the state of `NON_PASS`: its default disposition is `DEFERRED` (`NEEDS_MANUAL_REVIEW`).
 Under the **Default-Deny** standard, findings are verified strictly by the **Fixed 3-Lens Verifier Panel**:
 
 ```
-                       [ Candidate Finding (Default: UNVERIFIED) ]
+                       [ Candidate Finding (Default: DEFERRED) ]
                                             │
                ┌────────────────────────────┼────────────────────────────┐
                ▼                            ▼                            ▼

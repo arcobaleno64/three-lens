@@ -3,7 +3,7 @@
 ## 1. Presumption of Non-Pass (Default-Deny Engine)
 
 The consensus engine operates strictly under the **Default-Deny** axiom:
-- **Null Hypothesis**: Authority claims (candidate findings, patches, and coverage claims) are `UNVERIFIED` by default until conclusive affirmative proof is established. An audited component is not presumed vulnerable; a completed review may legitimately produce zero candidates.
+- **Null Hypothesis**: Authority claims (candidate findings, patches, and coverage claims) are unverified by default (a candidate's default disposition is `DEFERRED`; `UNVERIFIED` is a status or display label, not a disposition) until conclusive affirmative proof is established. An audited component is not presumed vulnerable; a completed review may legitimately produce zero candidates.
 - **Burden of Proof**: The burden of proof rests entirely on the party asserting an authority transition. A candidate cannot transition to `REPORTABLE` without independent 3-lens quorum and verified evidence, and cannot be dismissed as `SUPPRESSED / FALSE_POSITIVE` without an affirmative, reproducible proof of mitigation (exact in-repo file path and line number).
 - **Fallback on Deadlock**: If consensus cannot be achieved, or if verifier subagents time out, fail to produce ballots, or exhibit proof gaps, the candidate automatically falls back to `DEFERRED / NEEDS_MANUAL_REVIEW`.
 
