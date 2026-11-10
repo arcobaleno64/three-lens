@@ -39,6 +39,11 @@ const JSON_TARGETS = [
 
 const DOC_TARGETS = [
   {
+    file: "skills/3lens/SKILL.md",
+    pattern: /^# Three-Lens Security Skill \(\/3lens v[^\s)]+\)(?=\r?$)/m,
+    replacement: (v) => `# Three-Lens Security Skill (/3lens v${v})`
+  },
+  {
     file: "README.md",
     pattern: /^# Three-Lens \(3lens\) v[^\s]+/m,
     replacement: (v) => `# Three-Lens (3lens) v${v}`
