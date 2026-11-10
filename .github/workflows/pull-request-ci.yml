@@ -45,7 +45,10 @@ jobs:
       - run: npm run test:plugin-data
       - run: npm run test:compact
       - run: npm run validate:v2-corpus
+      # windows-latest defaults to pwsh, which does not expand the glob, and Node 20's
+      # `node --test` does not either. Run under bash so all three runners expand it alike.
       - run: node --test tests/test-*.mjs
+        shell: bash
       - run: npm run check:docs
       - run: node scripts/bundle-release-evidence.mjs --check
       - run: npm run check:release
