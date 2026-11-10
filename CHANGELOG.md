@@ -24,7 +24,7 @@ This release concludes Milestone 5.5 across 12 rounds of rigorous independent Ap
   - Official ACP authority gate immutably bound to sovereign supervisor root (`DEFAULT_SUPERVISOR_PUBLIC_PEM`).
   - SPKI DER SHA-256 fingerprint comparison (`computePublicKeyFingerprint`) ensuring robust, format-independent identification of revoked keys.
   - Zero caller override parameters in formal public verification APIs.
-  - In-memory dynamic ephemeral keypairs for cryptographic testing with zero static test keys on disk.
+  - In-memory dynamic ephemeral keypairs for cryptographic testing with zero unrevoked static test keys; historical leaked test keys strictly confined to negative regression tests verifying fail-closed fingerprint revocation.
 
 ---
 

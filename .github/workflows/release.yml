@@ -50,6 +50,12 @@ jobs:
       - run: npm run test:reproducibility
       - run: npm run test:micro-corpus
       - run: npm run test:operator-metrics
+      - run: npm run test:acp
+      - run: npm run test:acp-adapter
+      - run: npm run test:plugin-data
+      - run: npm run test:compact
+      - run: npm run validate:v2-corpus
+      - run: node --test tests/test-*.mjs
       - run: npm run check-version
       - run: npm run check:docs
       - run: npm run check:release

@@ -142,7 +142,12 @@ export function assertFindingDispositionAuthority(finding) {
   }
 
   const ap = finding.authorityProof;
-  if (ap.finalizerAttestation !== true || !ap.signature) {
+  // R12-F05 Defense: Strict 128-character hex validation for 64-byte Ed25519 signature
+  if (
+    ap.finalizerAttestation !== true ||
+    typeof ap.signature !== 'string' ||
+    !/^[0-9a-fA-F]{128}$/.test(ap.signature)
+  ) {
     return false;
   }
 
@@ -192,7 +197,14 @@ export function assertFindingDispositionAuthority(finding) {
  * @returns {boolean}
  */
 export function verifyFindingSignature(finding, publicKey) {
-  if (!finding?.authorityProof?.signature || !publicKey) return false;
+  if (
+    !finding?.authorityProof ||
+    typeof finding.authorityProof.signature !== 'string' ||
+    !/^[0-9a-fA-F]{128}$/.test(finding.authorityProof.signature) ||
+    !publicKey
+  ) {
+    return false;
+  }
   try {
     const keyFp = computePublicKeyFingerprint(publicKey);
     if (keyFp === REVOKED_TEST_KEY_FINGERPRINT) {
@@ -279,13 +291,37 @@ function safeNonNegativeInteger(val, fallback = 0) {
 }
 
 /**
+ * Normalizes document URIs by converting Windows backslashes, resolving relative path prefixes,
+ * and stripping file:// scheme or trailing slashes for canonical equivalence (R12-F01).
+ * @param {string} rawUri
+ * @returns {string}
+ */
+export function normalizeDocumentUri(rawUri) {
+  if (!rawUri || typeof rawUri !== 'string') return '';
+  let norm = rawUri.trim().replace(/\\/g, '/');
+  if (norm.startsWith('file:///')) {
+    norm = norm.slice(7);
+  } else if (norm.startsWith('file://')) {
+    norm = norm.slice(6);
+  }
+  if (/^\/[a-zA-Z]:/.test(norm)) {
+    norm = norm.slice(1);
+  }
+  return norm.replace(/\/+$/, '');
+}
+
+/**
  * Formats a single 3-Lens candidate/verified finding into an ACP-compliant Diagnostic object.
  * Under Default-Deny, authority is strictly validated against the immutable supervisor root key.
+ * R12-F01 Defense: When expectedDocumentUri is supplied (e.g. from publishDiagnostics notification or emitter),
+ * the signed finding location URI must canonically match the target publication URI.
+ * Mismatched or missing location URI strictly suppresses authority status for that document.
  * Zero caller override options (R11-F01).
  * @param {object} finding
+ * @param {string|null} [expectedDocumentUri=null] Target publication document URI
  * @returns {object}
  */
-export function formatAcpDiagnostic(finding) {
+export function formatAcpDiagnostic(finding, expectedDocumentUri = null) {
   if (!finding || typeof finding !== 'object') {
     throw new TypeError('Finding must be a non-null object');
   }
@@ -301,7 +337,16 @@ export function formatAcpDiagnostic(finding) {
   const endChar = safeNonNegativeInteger(rawEndCol - 1, startChar);
 
   const disposition = finding.disposition ? String(finding.disposition).toUpperCase().trim() : 'UNVERIFIED';
-  const isConfirmed = assertFindingDispositionAuthority(finding);
+  let isConfirmed = assertFindingDispositionAuthority(finding);
+
+  // R12-F01 Defense: Canonical URI binding check
+  if (isConfirmed && expectedDocumentUri && typeof expectedDocumentUri === 'string') {
+    const findingUri = normalizeDocumentUri(finding.location?.uri);
+    const targetUri = normalizeDocumentUri(expectedDocumentUri);
+    if (!findingUri || !targetUri || (findingUri !== targetUri && !targetUri.endsWith('/' + findingUri) && !findingUri.endsWith('/' + targetUri))) {
+      isConfirmed = false;
+    }
+  }
 
   // R03-F03 Defense: If not confirmed via consensus, force disposition to UNVERIFIED for severity calculation
   const effectiveDisp = isConfirmed ? disposition : 'UNVERIFIED';
@@ -358,6 +403,7 @@ export function serializeJsonRpcNotification(method, params) {
 
 /**
  * Formats a full `textDocument/publishDiagnostics` notification for an array of findings in a file.
+ * R12-F01 Defense: Canonical publication URI is bound into each diagnostic to prevent cross-file misattribution.
  * @param {string} uri Target document URI or file path
  * @param {Array<object>} findings
  * @returns {string} JSON-RPC 2.0 notification line
@@ -367,7 +413,8 @@ export function formatPublishDiagnosticsNotification(uri, findings = []) {
     throw new TypeError('Document URI must be a non-empty string');
   }
 
-  const diagnostics = (Array.isArray(findings) ? findings : []).map(f => formatAcpDiagnostic(f));
+  // R12-F01 Defense: Pass uri to formatAcpDiagnostic to enforce signed URI binding
+  const diagnostics = (Array.isArray(findings) ? findings : []).map(f => formatAcpDiagnostic(f, uri));
   return serializeJsonRpcNotification('textDocument/publishDiagnostics', {
     uri,
     diagnostics

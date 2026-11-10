@@ -894,3 +894,122 @@ test('ACP Adapter Lifecycle (R09-F02): pending session/prompt request is cancell
   assert.equal(emitter.isPromptPending('sess-cancel-prompt'), false);
   assert.equal(emitter.getSessionState('sess-cancel-prompt'), 'CANCELLED');
 });
+
+test('ACP Adapter Round 12 Hardening (R12-F01, R12-F02, R12-F05): Cross-document misattribution, TCB integrity inclusion, strict 128-hex signature validation', () => {
+  // --- R12-F01: Cross-Document Misattribution Protection ---
+  const validCandidate = {
+    id: 'CAND-URI-01',
+    ruleId: 'CWE-79',
+    severity: 'HIGH',
+    disposition: 'REPORTABLE',
+    title: 'XSS candidate',
+    location: {
+      uri: 'file:///workspace/src/app.js',
+      startLine: 42,
+      startColumn: 1,
+      endLine: 42,
+      endColumn: 20
+    }
+  };
+
+  // Sign candidate with in-memory test supervisor key
+  validCandidate.authorityProof = signFindingAuthorityProof(
+    validCandidate,
+    testSupervisorPrivateKey,
+    'SUPERVISOR_ROOT',
+    pubPem
+  );
+
+  // When formatAcpDiagnostic is passed a mismatched document URI, it MUST downgrade fail-closed
+  const mismatchedDiag = formatAcpDiagnostic(validCandidate, 'file:///workspace/src/other.js');
+  assert.equal(mismatchedDiag.severity, ACP_DIAGNOSTIC_SEVERITY.HINT, 'Mismatched document URI must downgrade severity to HINT (4)');
+  assert.ok(mismatchedDiag.message.startsWith('[UNVERIFIED CANDIDATE]'), 'Mismatched document URI must prepend [UNVERIFIED CANDIDATE]');
+  assert.equal(mismatchedDiag.data.authorityConfirmed, false, 'authorityConfirmed must be false on document mismatch');
+
+  // When formatPublishDiagnosticsNotification publishes to another URI, diagnostics MUST be downgraded
+  const notifStr = formatPublishDiagnosticsNotification('file:///workspace/src/other.js', [validCandidate]);
+  const notifObj = JSON.parse(notifStr);
+  const notifDiag = notifObj.params.diagnostics[0];
+  assert.equal(notifDiag.severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
+  assert.ok(notifDiag.message.startsWith('[UNVERIFIED CANDIDATE]'));
+  assert.equal(notifDiag.data.authorityConfirmed, false);
+
+  // --- R12-F02: TCB Self-Integrity Protection for ACP Adapters ---
+  const rootDir = path.resolve(new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+  const adapterSrc = path.join(rootDir, 'scripts', 'adapters', 'acp-adapter.mjs');
+  const tcbAdapter = path.join(rootDir, 'skills', '3lens', 'scripts', 'adapters', 'acp-adapter.mjs');
+  const transportSrc = path.join(rootDir, 'scripts', 'adapters', 'acp-transport-adapter.mjs');
+  const tcbTransport = path.join(rootDir, 'skills', '3lens', 'scripts', 'adapters', 'acp-transport-adapter.mjs');
+
+  assert.ok(fs.existsSync(tcbAdapter), 'skills/3lens/scripts/adapters/acp-adapter.mjs must exist in TCB');
+  assert.ok(fs.existsSync(tcbTransport), 'skills/3lens/scripts/adapters/acp-transport-adapter.mjs must exist in TCB');
+
+  assert.equal(
+    crypto.createHash('sha256').update(fs.readFileSync(adapterSrc)).digest('hex'),
+    crypto.createHash('sha256').update(fs.readFileSync(tcbAdapter)).digest('hex'),
+    'TCB acp-adapter.mjs must strictly mirror scripts/adapters/acp-adapter.mjs'
+  );
+  assert.equal(
+    crypto.createHash('sha256').update(fs.readFileSync(transportSrc)).digest('hex'),
+    crypto.createHash('sha256').update(fs.readFileSync(tcbTransport)).digest('hex'),
+    'TCB acp-transport-adapter.mjs must strictly mirror scripts/adapters/acp-transport-adapter.mjs'
+  );
+
+  const manifestPath = path.join(rootDir, 'skills', '3lens', 'tool-integrity-manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  assert.ok(manifest.criticalScripts['scripts/adapters/acp-adapter.mjs'], 'Manifest must track scripts/adapters/acp-adapter.mjs');
+  assert.ok(manifest.criticalScripts['scripts/adapters/acp-transport-adapter.mjs'], 'Manifest must track scripts/adapters/acp-transport-adapter.mjs');
+
+  const finalizeScanPath = path.join(rootDir, 'skills', '3lens', 'scripts', 'finalize-scan.mjs');
+  const finalizeScanSrc = fs.readFileSync(finalizeScanPath, 'utf8');
+  assert.ok(
+    finalizeScanSrc.includes("'scripts/adapters/acp-adapter.mjs'"),
+    'REQUIRED_CRITICAL_SCRIPTS in finalize-scan.mjs must include scripts/adapters/acp-adapter.mjs'
+  );
+  assert.ok(
+    finalizeScanSrc.includes("'scripts/adapters/acp-transport-adapter.mjs'"),
+    'REQUIRED_CRITICAL_SCRIPTS in finalize-scan.mjs must include scripts/adapters/acp-transport-adapter.mjs'
+  );
+
+  // --- R12-F05: Strict 128-Hex Signature Representation ---
+  const invalidHexCandidate = {
+    id: 'CAND-HEX-01',
+    ruleId: 'CWE-89',
+    severity: 'HIGH',
+    disposition: 'REPORTABLE',
+    title: 'SQLi candidate with malformed hex signature',
+    authorityProof: {
+      keyId: 'SUPERVISOR_ROOT',
+      rootFingerprint: SUPERVISOR_ROOT_FINGERPRINT,
+      signature: '0'.repeat(128) + 'zz', // Malformed trailing non-hex characters
+      signedAt: new Date().toISOString()
+    }
+  };
+
+  assert.equal(
+    assertFindingDispositionAuthority(invalidHexCandidate),
+    false,
+    'Trailing invalid characters after 128 chars must fail closed'
+  );
+
+  invalidHexCandidate.authorityProof.signature = 'deadbeef'; // Too short
+  assert.equal(
+    assertFindingDispositionAuthority(invalidHexCandidate),
+    false,
+    'Short hex signature must fail closed'
+  );
+
+  invalidHexCandidate.authorityProof.signature = 12345678; // Non-string
+  assert.equal(
+    assertFindingDispositionAuthority(invalidHexCandidate),
+    false,
+    'Non-string signature must fail closed'
+  );
+
+  invalidHexCandidate.authorityProof.signature = 'g'.repeat(128); // Non-hex characters
+  assert.equal(
+    assertFindingDispositionAuthority(invalidHexCandidate),
+    false,
+    '128 non-hex chars must fail closed'
+  );
+});

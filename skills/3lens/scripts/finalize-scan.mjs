@@ -4711,6 +4711,8 @@ export function renderMarkdownFromCanonical({
  * Canonical required critical scripts set (R6-P1-01 / v1.1.0 P0/P1).
  */
 export const REQUIRED_CRITICAL_SCRIPTS = [
+  'scripts/adapters/acp-adapter.mjs',
+  'scripts/adapters/acp-transport-adapter.mjs',
   'scripts/adapters/cloudflare-adapter.mjs',
   'scripts/adapters/plugin-data-adapter.mjs',
   'scripts/compact-guard.mjs',
