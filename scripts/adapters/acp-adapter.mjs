@@ -26,10 +26,36 @@ export { DEFAULT_SUPERVISOR_PUBLIC_PEM };
 // R11 Fix: Official uncompromised production supervisor root public key
 export const ACP_SUPERVISOR_PUBLIC_PEM = DEFAULT_SUPERVISOR_PUBLIC_PEM;
 
+// R11-F02 Defense: Cryptographic SPKI DER SHA-256 fingerprints for normalized key identity comparison.
+// Independent of PEM whitespace, formatting, or line wrapping.
+export const SUPERVISOR_ROOT_FINGERPRINT =
+  '49b267dd3d8824319e0264d4fe66c2efed32dd7ead65e5154552f9da7d2ba36b';
+export const REVOKED_TEST_KEY_FINGERPRINT =
+  'ffd048f234ad15a085701c5920ce73143bbf4bd367386c3f568e7eef3dfa0cbc';
+
 // R11 Defense: Revoked test key whose private key was previously exposed in git history.
 // Unconditionally rejected by ACP authority verification under all circumstances.
 export const REVOKED_TEST_KEY_PEM =
   '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAfhd+MMkWEh9qzeo1qUR/dcX6hf8ggaf1z6B52Ltp15k=\n-----END PUBLIC KEY-----\n';
+
+/**
+ * Computes deterministic 64-char lowercase hex SHA-256 digest of normalized SPKI DER bytes.
+ * Robust against arbitrary PEM formatting, whitespace, line lengths, and CRLF differences.
+ * @param {string|crypto.KeyObject} keyInput
+ * @returns {string} 64-character hex digest, or empty string on error
+ */
+export function computePublicKeyFingerprint(keyInput) {
+  if (!keyInput) return '';
+  try {
+    const keyObj = typeof keyInput === 'string'
+      ? crypto.createPublicKey(keyInput)
+      : (keyInput instanceof crypto.KeyObject ? keyInput : crypto.createPublicKey(keyInput));
+    const spkiDer = keyObj.export({ type: 'spki', format: 'der' });
+    return crypto.createHash('sha256').update(spkiDer).digest('hex');
+  } catch {
+    return '';
+  }
+}
 
 /**
  * Standard LSP / ACP Diagnostic Severity ratings:
@@ -97,13 +123,12 @@ export function computeFindingDigest(finding) {
  * Checks whether a finding has passed 3-lens consensus and achieved authoritative reportable status.
  * Under Default-Deny (R06-F01, R07-F01 & R08-F02), mere field presence or unverified consensus/proof cannot claim authority.
  * Full versioned finding digest is cryptographically bound to the supervisor digital signature.
- * Untrusted caller options CANNOT override the supervisor root public key (R08-F02).
- * Leaked/revoked test key is permanently rejected (R11).
+ * Untrusted caller options CANNOT override the supervisor root public key (R08-F02 / R11-F01).
+ * Leaked/revoked test key is permanently rejected by normalized SPKI DER fingerprint (R11-F02).
  * @param {object} finding
- * @param {string} [trustedRootPem=ACP_SUPERVISOR_PUBLIC_PEM]
  * @returns {boolean}
  */
-export function assertFindingDispositionAuthority(finding, trustedRootPem = ACP_SUPERVISOR_PUBLIC_PEM) {
+export function assertFindingDispositionAuthority(finding) {
   if (!finding || typeof finding !== 'object') return false;
   const disp = String(finding.disposition || '').toUpperCase().trim();
   const isReportableDisp = disp === 'CONFIRMED' || disp === 'REPORTABLE';
@@ -133,18 +158,15 @@ export function assertFindingDispositionAuthority(finding, trustedRootPem = ACP_
   }
 
   try {
-    const trustedKeyPem = (typeof trustedRootPem === 'string' && trustedRootPem.trim() ? trustedRootPem : ACP_SUPERVISOR_PUBLIC_PEM).trim().replace(/\r\n/g, '\n');
-    const revokedKeyPem = REVOKED_TEST_KEY_PEM.trim().replace(/\r\n/g, '\n');
-
-    // R11 Defense: Compromised test key is permanently revoked and never accepted
-    if (trustedKeyPem === revokedKeyPem) {
-      return false;
-    }
-
-    // Verify key identity: verifierPublicKey (if supplied) must match trusted root key and must not be revoked
+    // R11-F01 & R11-F02 Defense: Verify key identity against cryptographic fingerprints
     if (ap.verifierPublicKey) {
-      const suppliedKeyPem = String(ap.verifierPublicKey).trim().replace(/\r\n/g, '\n');
-      if (suppliedKeyPem === revokedKeyPem || suppliedKeyPem !== trustedKeyPem) {
+      const verifierFp = computePublicKeyFingerprint(ap.verifierPublicKey);
+      // R11-F02: Unconditionally reject the compromised test key regardless of PEM formatting
+      if (verifierFp === REVOKED_TEST_KEY_FINGERPRINT) {
+        return false;
+      }
+      // Must match official supervisor root fingerprint
+      if (verifierFp !== SUPERVISOR_ROOT_FINGERPRINT) {
         return false;
       }
     }
@@ -153,8 +175,33 @@ export function assertFindingDispositionAuthority(finding, trustedRootPem = ACP_
     const digest = computeFindingDigest(finding);
     const payload = Buffer.from(`${digest}:${ap.signedBy || 'SUPERVISOR_ROOT'}`, 'utf8');
     const sigBuf = Buffer.from(ap.signature, 'hex');
-    const isValid = crypto.verify(null, payload, trustedKeyPem, sigBuf);
+    const isValid = crypto.verify(null, payload, ACP_SUPERVISOR_PUBLIC_PEM, sigBuf);
     return isValid === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Verifies the cryptographic signature binding of a finding against a supplied public key.
+ * Used for low-level cryptographic verification, algorithm correctness, and tamper-evidence testing.
+ * NOTE: Does NOT confer ACP diagnostic authority or grant Error/Warning escalation (only assertFindingDispositionAuthority does).
+ * Rejects compromised test key by SPKI DER fingerprint (R11-F02).
+ * @param {object} finding
+ * @param {string|crypto.KeyObject} publicKey
+ * @returns {boolean}
+ */
+export function verifyFindingSignature(finding, publicKey) {
+  if (!finding?.authorityProof?.signature || !publicKey) return false;
+  try {
+    const keyFp = computePublicKeyFingerprint(publicKey);
+    if (keyFp === REVOKED_TEST_KEY_FINGERPRINT) {
+      return false; // Compromised key is permanently revoked even from signature verification
+    }
+    const digest = computeFindingDigest(finding);
+    const payload = Buffer.from(`${digest}:${finding.authorityProof.signedBy || 'SUPERVISOR_ROOT'}`, 'utf8');
+    const sigBuf = Buffer.from(finding.authorityProof.signature, 'hex');
+    return crypto.verify(null, payload, publicKey, sigBuf) === true;
   } catch {
     return false;
   }
@@ -233,18 +280,15 @@ function safeNonNegativeInteger(val, fallback = 0) {
 
 /**
  * Formats a single 3-Lens candidate/verified finding into an ACP-compliant Diagnostic object.
+ * Under Default-Deny, authority is strictly validated against the immutable supervisor root key.
+ * Zero caller override options (R11-F01).
  * @param {object} finding
- * @param {string} [trustedRootPem=ACP_SUPERVISOR_PUBLIC_PEM]
  * @returns {object}
  */
-export function formatAcpDiagnostic(finding, trustedRootPem = ACP_SUPERVISOR_PUBLIC_PEM) {
+export function formatAcpDiagnostic(finding) {
   if (!finding || typeof finding !== 'object') {
     throw new TypeError('Finding must be a non-null object');
   }
-
-  const effectiveRoot = typeof trustedRootPem === 'string' && trustedRootPem.trim()
-    ? trustedRootPem
-    : ACP_SUPERVISOR_PUBLIC_PEM;
 
   const rawStartLine = finding.location?.startLine ?? 1;
   const rawEndLine = finding.location?.endLine ?? rawStartLine;
@@ -257,7 +301,7 @@ export function formatAcpDiagnostic(finding, trustedRootPem = ACP_SUPERVISOR_PUB
   const endChar = safeNonNegativeInteger(rawEndCol - 1, startChar);
 
   const disposition = finding.disposition ? String(finding.disposition).toUpperCase().trim() : 'UNVERIFIED';
-  const isConfirmed = assertFindingDispositionAuthority(finding, effectiveRoot);
+  const isConfirmed = assertFindingDispositionAuthority(finding);
 
   // R03-F03 Defense: If not confirmed via consensus, force disposition to UNVERIFIED for severity calculation
   const effectiveDisp = isConfirmed ? disposition : 'UNVERIFIED';
@@ -316,19 +360,14 @@ export function serializeJsonRpcNotification(method, params) {
  * Formats a full `textDocument/publishDiagnostics` notification for an array of findings in a file.
  * @param {string} uri Target document URI or file path
  * @param {Array<object>} findings
- * @param {string} [trustedRootPem=ACP_SUPERVISOR_PUBLIC_PEM]
  * @returns {string} JSON-RPC 2.0 notification line
  */
-export function formatPublishDiagnosticsNotification(uri, findings = [], trustedRootPem = ACP_SUPERVISOR_PUBLIC_PEM) {
+export function formatPublishDiagnosticsNotification(uri, findings = []) {
   if (!uri || typeof uri !== 'string') {
     throw new TypeError('Document URI must be a non-empty string');
   }
 
-  const effectiveRoot = typeof trustedRootPem === 'string' && trustedRootPem.trim()
-    ? trustedRootPem
-    : ACP_SUPERVISOR_PUBLIC_PEM;
-
-  const diagnostics = (Array.isArray(findings) ? findings : []).map(f => formatAcpDiagnostic(f, effectiveRoot));
+  const diagnostics = (Array.isArray(findings) ? findings : []).map(f => formatAcpDiagnostic(f));
   return serializeJsonRpcNotification('textDocument/publishDiagnostics', {
     uri,
     diagnostics
@@ -431,12 +470,8 @@ export function parseJsonRpcMessage(raw) {
 /**
  * Factory for streaming diagnostic emitter to stdio or custom stream.
  * @param {object} stream Writable stream (defaults to process.stdout)
- * @param {object} [emitterOptions={}] Optional emitter configuration (e.g. trustedRootPem for testing)
  */
-export function createAcpDiagnosticEmitter(stream = process.stdout, emitterOptions = {}) {
-  const trustedRootPem = (emitterOptions && typeof emitterOptions.trustedRootPem === 'string' && emitterOptions.trustedRootPem.trim())
-    ? emitterOptions.trustedRootPem
-    : ACP_SUPERVISOR_PUBLIC_PEM;
+export function createAcpDiagnosticEmitter(stream = process.stdout) {
   const cancelledSessions = new Set();
   const cancelledRequests = new Set();
   const MAX_CANCELLED_REQUESTS = 500;
@@ -602,14 +637,14 @@ export function createAcpDiagnosticEmitter(stream = process.stdout, emitterOptio
     emitDiagnostic(uri, finding, options = {}) {
       const sid = options.sessionId;
       if (!isEmissionAllowed(sid, options.turnId, options.requestId)) return null;
-      const line = formatPublishDiagnosticsNotification(uri, [finding], trustedRootPem);
+      const line = formatPublishDiagnosticsNotification(uri, [finding]);
       stream.write(line);
       return line;
     },
     emitBatch(uri, findings, options = {}) {
       const sid = options.sessionId;
       if (!isEmissionAllowed(sid, options.turnId, options.requestId)) return null;
-      const line = formatPublishDiagnosticsNotification(uri, findings, trustedRootPem);
+      const line = formatPublishDiagnosticsNotification(uri, findings);
       stream.write(line);
       return line;
     },

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.13.0] - 2026-11-10
+
+### Milestone 5.5: Multi-Tier Empirical Calibration, Upstream Verified OSS Ground Truth & ACP Inline Streaming Diagnostics
+This release concludes Milestone 5.5 across 12 rounds of rigorous independent AppSec and architectural review. It introduces an upstream-verified open-source ground-truth corpus (Layer 2), Agent Client Protocol (ACP) inline streaming diagnostics for IDE integration, and cryptographic authority root hardening with zero ambient bypasses.
+
+### Added
+- **Layer 2 Upstream Verified OSS Ground-Truth Corpus**:
+  - Expanded external validity corpus to 26 cases (13 Vulnerable, 10 Fixed Counterparts, 3 Clean Controls) spanning 7 distinct CWE families.
+  - Curated 12 real-world upstream open-source CVE pairs with 100% physical file integrity and immutable git blob SHA-256 anchoring.
+- **Agent Client Protocol (ACP) Inline Streaming Diagnostics Adapter**:
+  - Implemented bidirectional JSON-RPC 2.0 streaming adapter (`scripts/adapters/acp-adapter.mjs`) for real-time IDE diagnostics and ballot notifications.
+  - Strict Default-Deny Authority Invariant: Unverified candidates are strictly clamped to `severity: HINT (4)` with `[UNVERIFIED CANDIDATE]` prefix; only findings cryptographically attested by the supervisor root key can escalate to `ERROR` or `WARNING`.
+  - Session/turn scoped cancellation tracking, monotonic turn handles, and race-free diagnostic emission.
+- **Cryptographic Authority Root Hardening & In-Memory Test Isolation**:
+  - Official ACP authority gate immutably bound to sovereign supervisor root (`DEFAULT_SUPERVISOR_PUBLIC_PEM`).
+  - SPKI DER SHA-256 fingerprint comparison (`computePublicKeyFingerprint`) ensuring robust, format-independent identification of revoked keys.
+  - Zero caller override parameters in formal public verification APIs.
+  - In-memory dynamic ephemeral keypairs for cryptographic testing with zero static test keys on disk.
+
+---
+
 ## [1.12.0] - 2026-11-09
 
 ### Milestone 5.4 Phase 2: Multi-Tier Reasoning, Dual-Anchor Governance & Context Compression Contracts

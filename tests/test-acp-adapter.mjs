@@ -10,6 +10,10 @@ import {
   ACP_SUPERVISOR_PUBLIC_PEM,
   DEFAULT_SUPERVISOR_PUBLIC_PEM,
   REVOKED_TEST_KEY_PEM,
+  SUPERVISOR_ROOT_FINGERPRINT,
+  REVOKED_TEST_KEY_FINGERPRINT,
+  computePublicKeyFingerprint,
+  verifyFindingSignature,
   assertFindingDispositionAuthority,
   mapSeverityToAcpDiagnostic,
   formatAcpDiagnostic,
@@ -31,7 +35,7 @@ const testKeyPair = crypto.generateKeyPairSync('ed25519');
 const testSupervisorPrivateKey = testKeyPair.privateKey;
 const pubPem = testKeyPair.publicKey.export({ type: 'spki', format: 'pem' });
 
-test('ACP Adapter Capability Isolation (R09-F01, R10-F01 & R11): Zero root override backdoor and revoked compromised key fail-closed', () => {
+test('ACP Adapter Authority Gate & Revocation (R11-F01, R11-F02 & R11-F03): Zero root override, real signature with re-encoded revoked key rejected fail-closed', () => {
   // withTestSupervisorRootKey and testKeyStorage are completely ELIMINATED
   assert.equal(typeof acpModule.withTestSupervisorRootKey, 'undefined', 'withTestSupervisorRootKey must not exist');
   assert.equal(typeof acpModule.testKeyStorage, 'undefined', 'testKeyStorage must not exist');
@@ -46,8 +50,67 @@ test('ACP Adapter Capability Isolation (R09-F01, R10-F01 & R11): Zero root overr
     'fixtures/acp-supervisor-test-key.pem must be completely removed'
   );
 
-  // Production root key must be DEFAULT_SUPERVISOR_PUBLIC_PEM
+  // R11-F01: Function signatures strictly take ONLY finding/stream — zero caller-injected root parameter
+  assert.equal(assertFindingDispositionAuthority.length, 1, 'assertFindingDispositionAuthority must accept exactly 1 argument (finding)');
+  assert.equal(formatAcpDiagnostic.length, 1, 'formatAcpDiagnostic must accept exactly 1 argument (finding)');
+  assert.equal(formatPublishDiagnosticsNotification.length, 1, 'formatPublishDiagnosticsNotification must accept at most (uri, findings)');
+  assert.equal(createAcpDiagnosticEmitter.length, 0, 'createAcpDiagnosticEmitter must accept at most (stream)');
+
+  // Production root key must match DEFAULT_SUPERVISOR_PUBLIC_PEM
   assert.equal(ACP_SUPERVISOR_PUBLIC_PEM, DEFAULT_SUPERVISOR_PUBLIC_PEM);
+  assert.equal(computePublicKeyFingerprint(ACP_SUPERVISOR_PUBLIC_PEM), SUPERVISOR_ROOT_FINGERPRINT);
+
+  // R11-F02 & R11-F03: Compromised leaked test key signed with REAL VALID Ed25519 signature
+  // Using the historical leaked private key from commit c603641
+  const leakedPrivKeyPem = '-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAO6vG6yXQM77Ip9tAzUn41DYYKdVq3mBZzPjUaa3tZv\n-----END PRIVATE KEY-----\n';
+  const leakedPrivateKey = crypto.createPrivateKey(leakedPrivKeyPem);
+
+  // Re-encoded / re-wrapped PEM with alternate line length and whitespace
+  const alternateRevokedPem = '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAfhd+\nMMkWEh9qzeo1qUR/\ndcX6hf8ggaf1z6B52Ltp15k=\n-----END PUBLIC KEY-----\n';
+
+  // Verify that computePublicKeyFingerprint normalizes the alternate formatting to REVOKED_TEST_KEY_FINGERPRINT
+  assert.equal(
+    computePublicKeyFingerprint(alternateRevokedPem),
+    REVOKED_TEST_KEY_FINGERPRINT,
+    'Fingerprint of alternate PEM must match REVOKED_TEST_KEY_FINGERPRINT'
+  );
+
+  const revokedCandidate = {
+    id: 'CAND-REVOKED-01',
+    ruleId: 'CWE-89',
+    severity: 'CRITICAL',
+    disposition: 'REPORTABLE',
+    title: 'SQL injection candidate signed with leaked key',
+    location: { startLine: 10 }
+  };
+
+  // Sign with the real leaked private key — valid cryptographic signature!
+  revokedCandidate.authorityProof = signFindingAuthorityProof(
+    revokedCandidate,
+    leakedPrivateKey,
+    'SUPERVISOR_ROOT',
+    alternateRevokedPem
+  );
+
+  // R11-F03 Verification: assertFindingDispositionAuthority MUST reject it fail-closed
+  assert.equal(
+    assertFindingDispositionAuthority(revokedCandidate),
+    false,
+    'assertFindingDispositionAuthority must reject finding signed with revoked test key'
+  );
+
+  // verifyFindingSignature MUST reject it fail-closed due to revoked key fingerprint
+  assert.equal(
+    verifyFindingSignature(revokedCandidate, alternateRevokedPem),
+    false,
+    'verifyFindingSignature must reject revoked test key'
+  );
+
+  // formatAcpDiagnostic MUST clamp to HINT (severity 4) with [UNVERIFIED CANDIDATE]
+  const diag = formatAcpDiagnostic(revokedCandidate);
+  assert.equal(diag.data.authorityConfirmed, false);
+  assert.equal(diag.severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
+  assert.ok(diag.message.startsWith('[UNVERIFIED CANDIDATE]'));
 
   // Attacker cannot forge findings with arbitrary keys against production root
   const attackerKeyPair = crypto.generateKeyPairSync('ed25519');
@@ -68,24 +131,6 @@ test('ACP Adapter Capability Isolation (R09-F01, R10-F01 & R11): Zero root overr
   assert.equal(assertFindingDispositionAuthority(attackerFinding), false);
   assert.equal(formatAcpDiagnostic(attackerFinding).data.authorityConfirmed, false);
   assert.equal(formatAcpDiagnostic(attackerFinding).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
-
-  // R11 Defense: Leaked compromised key REVOKED_TEST_KEY_PEM is permanently revoked and fails closed
-  const revokedFinding = {
-    id: 'REVOKED-001',
-    ruleId: 'CWE-89',
-    severity: 'CRITICAL',
-    disposition: 'REPORTABLE',
-    location: { startLine: 1 },
-    authorityProof: {
-      finalizerAttestation: true,
-      signedBy: 'SUPERVISOR_ROOT',
-      signature: '00'.repeat(64),
-      verifierPublicKey: REVOKED_TEST_KEY_PEM
-    }
-  };
-  assert.equal(assertFindingDispositionAuthority(revokedFinding, REVOKED_TEST_KEY_PEM), false);
-  assert.equal(formatAcpDiagnostic(revokedFinding, REVOKED_TEST_KEY_PEM).data.authorityConfirmed, false);
-  assert.equal(formatAcpDiagnostic(revokedFinding, REVOKED_TEST_KEY_PEM).severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
 });
 
 test('ACP Adapter: mapSeverityToAcpDiagnostic severity mapping and Default-Deny clamping', () => {
@@ -137,27 +182,25 @@ test('ACP Adapter: formatAcpDiagnostic produces standard LSP range and metadata'
   };
   finding.authorityProof = signFindingAuthorityProof(finding, testSupervisorPrivateKey, 'SUPERVISOR_ROOT', pubPem);
 
-  // Authenticated finding with valid trustedRootPem verifies and maps to severity Error
-  const diag = formatAcpDiagnostic(finding, pubPem);
+  // Cryptographic signature binding verification passes with matching key
+  assert.equal(verifyFindingSignature(finding, pubPem), true);
+
+  // Diagnostic format produces standard LSP range, metadata, and fail-closed Default-Deny clamping
+  const diag = formatAcpDiagnostic(finding);
 
   assert.equal(diag.code, 'CWE-89');
   assert.equal(diag.source, 'Three-Lens');
-  assert.equal(diag.severity, 1);
-  assert.equal(diag.message, 'SQL Injection via query concatenation');
+  assert.equal(diag.severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
+  assert.ok(diag.message.includes('SQL Injection via query concatenation'));
+  assert.ok(diag.message.startsWith('[UNVERIFIED CANDIDATE]'));
   assert.deepEqual(diag.range, {
     start: { line: 41, character: 4 },
     end: { line: 44, character: 29 }
   });
   assert.equal(diag.data.id, 'FIND-001');
   assert.equal(diag.data.lineageId, 'lin-abc-123');
-  assert.equal(diag.data.authorityConfirmed, true);
+  assert.equal(diag.data.authorityConfirmed, false);
   assert.equal(diag.data.remediation, 'Use parameterized queries');
-
-  // Calling without trustedRootPem verifies against DEFAULT_SUPERVISOR_PUBLIC_PEM and strictly fails closed
-  const defaultDiag = formatAcpDiagnostic(finding);
-  assert.equal(defaultDiag.data.authorityConfirmed, false);
-  assert.equal(defaultDiag.severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
-  assert.ok(defaultDiag.message.startsWith('[UNVERIFIED CANDIDATE]'));
 });
 
 test('ACP Adapter: R04-F01 / R05-F01 / R06-F01 Spoofed authority claims strictly fail closed to HINT', () => {
@@ -306,9 +349,14 @@ test('ACP Adapter: R04-F01 / R05-F01 / R06-F01 Spoofed authority claims strictly
     pubPem
   );
 
-  const diagCrypto = formatAcpDiagnostic(validCryptoCandidate, pubPem);
-  assert.equal(diagCrypto.data.authorityConfirmed, true);
-  assert.equal(diagCrypto.severity, ACP_DIAGNOSTIC_SEVERITY.ERROR);
+  // Cryptographic signature is valid against the matching key
+  assert.equal(verifyFindingSignature(validCryptoCandidate, pubPem), true);
+
+  // In production, authority is strictly denied (test key != supervisor root)
+  assert.equal(assertFindingDispositionAuthority(validCryptoCandidate), false);
+  const diagCrypto = formatAcpDiagnostic(validCryptoCandidate);
+  assert.equal(diagCrypto.data.authorityConfirmed, false);
+  assert.equal(diagCrypto.severity, ACP_DIAGNOSTIC_SEVERITY.HINT);
 
   // 10. R07-F01 & R08-F01 Defense: Tampering with ANY field breaks cryptographic signature binding
   const fieldsToTamper = [
@@ -330,17 +378,22 @@ test('ACP Adapter: R04-F01 / R05-F01 / R06-F01 Spoofed authority claims strictly
       [field]: value
     };
     assert.equal(
-      assertFindingDispositionAuthority(tamperedCandidate, pubPem),
-      false,
-      `Tampering with field '${field}' must fail assertFindingDispositionAuthority`
-    );
-    assert.equal(
-      formatAcpDiagnostic(tamperedCandidate, pubPem).data.authorityConfirmed,
+      verifyFindingSignature(tamperedCandidate, pubPem),
       false,
       `Tampering with field '${field}' must invalidate cryptographic signature`
     );
     assert.equal(
-      formatAcpDiagnostic(tamperedCandidate, pubPem).severity,
+      assertFindingDispositionAuthority(tamperedCandidate),
+      false,
+      `Tampering with field '${field}' must fail assertFindingDispositionAuthority`
+    );
+    assert.equal(
+      formatAcpDiagnostic(tamperedCandidate).data.authorityConfirmed,
+      false,
+      `Tampering with field '${field}' must fail authority confirmation`
+    );
+    assert.equal(
+      formatAcpDiagnostic(tamperedCandidate).severity,
       ACP_DIAGNOSTIC_SEVERITY.HINT,
       `Tampering with field '${field}' must clamp severity to HINT`
     );
@@ -456,7 +509,7 @@ test('ACP Adapter: formatPublishDiagnosticsNotification formats full notificatio
   ];
   findings[0].authorityProof = signFindingAuthorityProof(findings[0], testSupervisorPrivateKey, 'SUPERVISOR_ROOT', pubPem);
 
-  const raw = formatPublishDiagnosticsNotification('file:///path/to/app.js', findings, pubPem);
+  const raw = formatPublishDiagnosticsNotification('file:///path/to/app.js', findings);
   const parsed = JSON.parse(raw.trim());
 
   assert.equal(parsed.jsonrpc, '2.0');
@@ -464,12 +517,7 @@ test('ACP Adapter: formatPublishDiagnosticsNotification formats full notificatio
   assert.equal(parsed.params.uri, 'file:///path/to/app.js');
   assert.equal(parsed.params.diagnostics.length, 1);
   assert.equal(parsed.params.diagnostics[0].code, 'CWE-79');
-  assert.equal(parsed.params.diagnostics[0].severity, 2);
-
-  // Calling without trustedRootPem verifies against production root and clamps to HINT
-  const defaultRaw = formatPublishDiagnosticsNotification('file:///path/to/app.js', findings);
-  const defaultParsed = JSON.parse(defaultRaw.trim());
-  assert.equal(defaultParsed.params.diagnostics[0].severity, 4);
+  assert.equal(parsed.params.diagnostics[0].severity, 4);
 });
 
 test('ACP Adapter: R01-F03 formatBallotProgressNotification emits window/logMessage', () => {
@@ -662,7 +710,7 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting
     }
   };
 
-  const emitter = createAcpDiagnosticEmitter(mockStream, { trustedRootPem: pubPem });
+  const emitter = createAcpDiagnosticEmitter(mockStream);
   const sid = emitter.createSession('sess-stream-test');
 
   const finding = {
@@ -691,7 +739,7 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting
   assert.equal(emitter.emitDiagnostic('src/index.js', finding, { sessionId: sid }), null);
   assert.equal(emitter.emitDiagnostic('src/index.js', finding, { sessionId: 'unknown-sess', turnId: 1 }), null);
 
-  // Authenticated finding emits with valid turnId and maps to severity 1
+  // Diagnostic emits with valid turnId, strictly clamped to HINT (4) under Default-Deny
   emitter.emitDiagnostic('src/index.js', finding, { sessionId: sid, turnId: 1 });
   emitter.emitBallotProgress('CAND-01', 'DEFENSES', 'REFUTES', 'Sanitizer active', { sessionId: sid, turnId: 1 });
 
@@ -699,20 +747,12 @@ test('ACP Adapter: createAcpDiagnosticEmitter stream writing and ballot emitting
   const diagParsed = JSON.parse(chunks[0].trim());
   assert.equal(diagParsed.method, 'textDocument/publishDiagnostics');
   assert.equal(diagParsed.params.diagnostics[0].code, 'CWE-22');
-  assert.equal(diagParsed.params.diagnostics[0].severity, 1);
+  assert.equal(diagParsed.params.diagnostics[0].severity, 4);
+  assert.ok(diagParsed.params.diagnostics[0].message.startsWith('[UNVERIFIED CANDIDATE]'));
 
   const ballotParsed = JSON.parse(chunks[1].trim());
   assert.equal(ballotParsed.method, 'window/logMessage');
   assert.ok(ballotParsed.params.message.includes('DEFENSES: REFUTES'));
-
-  // Default emitter without trustedRootPem verifies against production root and clamps to HINT (severity 4)
-  const defaultChunks = [];
-  const defaultEmitter = createAcpDiagnosticEmitter({ write(c) { defaultChunks.push(c); } });
-  const defaultSid = defaultEmitter.createSession('sess-default-root');
-  defaultEmitter.emitDiagnostic('src/index.js', finding, { sessionId: defaultSid, turnId: 1 });
-  assert.equal(defaultChunks.length, 1);
-  const defaultDiagParsed = JSON.parse(defaultChunks[0].trim());
-  assert.equal(defaultDiagParsed.params.diagnostics[0].severity, 4);
 });
 
 test('Harness Governance (R08-F07, R09-F04 & R10-F04): parseGitRemoteOriginUrl strictly respects case-sensitive remote subsections', () => {

@@ -25,7 +25,7 @@ export { isPathContained, isRealPathContained, assertContainedPath, safeReadFile
 // baselines, and the TCB manifest. `scripts/bump-version.mjs` rewrites this line
 // (and package.json, and tool-integrity-manifest.json) together so a release
 // cannot bump one without the others going stale.
-export const TOOL_VERSION = '1.12.0';
+export const TOOL_VERSION = '1.13.0';
 import {
   loadProjectSecurityContext,
   detectContextDrift,

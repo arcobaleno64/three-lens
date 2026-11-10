@@ -1,4 +1,4 @@
-# Three-Lens (3lens) v1.12.0
+# Three-Lens (3lens) v1.13.0
 
 three-lens 是以證據為本、多階段的安全保證與弱點驗證外掛，專為 Antigravity CLI（`agy`）打造。
 
@@ -120,7 +120,7 @@ agy --sandbox "audit this repository for security vulnerabilities"
 
 ```text
 three-lens/
-├── package.json                          # npm test, test:evals, test:semantic, test:discovery, test:stability, check:release (1.12.0)
+├── package.json                          # npm test, test:evals, test:semantic, test:discovery, test:stability, check:release (1.13.0)
 ├── plugin.json                           # Antigravity 外掛清單 (含 schema，無 BOM)
 ├── hooks.json                            # Antigravity hook 註冊（PreInvocation、PreToolUse）
 ├── hooks/                                # 生命週期勾點實作
