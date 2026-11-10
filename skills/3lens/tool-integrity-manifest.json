@@ -1,10 +1,10 @@
 {
   "schemaVersion": "1.0.0",
   "toolVersion": "1.13.0",
-  "generatedAt": "2026-11-10T01:41:50.301Z",
-  "manifestDigest": "f0784e1eadddfa72374003b1b8e140753842389f55a97c1b82421ff312471c00",
+  "generatedAt": "2026-11-10T06:37:12.221Z",
+  "manifestDigest": "49ff0db4458ed2f4c7e1be07d19bf2edb939420300ae572603906946df82c197",
   "criticalScripts": {
-    "scripts/adapters/acp-adapter.mjs": "677e868a52678c377895f3f18a2476f6a4994e8eaf6738d8ed1309c24e47c01c",
+    "scripts/adapters/acp-adapter.mjs": "1f01d6fb67cbdc7c4a28e990ca9255924a8914ab23834ea35ea66bedaa2981ce",
     "scripts/adapters/acp-transport-adapter.mjs": "d1c5837036a609898ec2c55745852f89b6511277396d36750657fd387710b60d",
     "scripts/adapters/cloudflare-adapter.mjs": "36c3eac48d828b2d582ac411db35c7bab4522d679d7d7a855de12fa6ef0ef2a0",
     "scripts/adapters/plugin-data-adapter.mjs": "70d1ce8a3380ecab4af86c5252a1d71e4f706078198c73a46cd286f37709e65c",
