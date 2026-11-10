@@ -265,8 +265,24 @@ export async function main() {
   return emit({});
 }
 
-// Direct execution guard (handles file paths with spaces and special characters via fileURLToPath)
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
+// Direct execution guard (handles file paths with spaces and special characters via fileURLToPath).
+// Node resolves the main module's import.meta.url to its realpath while process.argv[1] keeps the path
+// as invoked, so a lexical compare silently skips main() when the hook is reached through a symlink
+// (for example macOS /var -> /private/var). Compare realpaths; if either cannot be resolved, fall back
+// to the lexical compare so behavior never gets looser than before.
+function isDirectRun() {
+  if (!process.argv[1]) return false;
+  const invoked = path.resolve(process.argv[1]);
+  const self = path.resolve(fileURLToPath(import.meta.url));
+  if (invoked === self) return true;
+  try {
+    return fs.realpathSync(invoked) === fs.realpathSync(self);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectRun()) {
   main().catch((err) => {
     emit({
       injectSteps: [
