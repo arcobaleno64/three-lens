@@ -23,7 +23,8 @@ import {
   handleInitialize,
   parseJsonRpcMessage,
   createAcpDiagnosticEmitter,
-  signFindingAuthorityProof
+  signFindingAuthorityProof,
+  isSameDocumentUri
 } from '../scripts/adapters/acp-adapter.mjs';
 import { validateAcpHandshake } from '../scripts/adapters/acp-transport-adapter.mjs';
 import { parseGitRemoteOriginUrl, getCanonicalRealPath } from '../scripts/fetch-upstream-oss-fixture.mjs';
@@ -1014,4 +1015,67 @@ test('ACP Adapter Round 12 Hardening (R12-F01, R12-F02, R12-F05): Cross-document
     false,
     '128 non-hex chars must fail closed'
   );
+});
+
+// R13-F01: document identity is exact. Rows 3-5 are the counterexamples from the Round 13 review (#67).
+test('ACP Adapter R13-F01: isSameDocumentUri accepts only the same document (no suffix matching)', () => {
+  const rows = [
+    // [signed finding URI, publish target URI, same document?]
+    ['/workspace/src/app.js', '/workspace/src/app.js', true],
+    ['/workspace/src/app.js', '/other/workspace/src/app.js', false],
+    ['src/app.js', '/other-project/src/app.js', false],
+    ['/workspace/src/app.js', 'src/app.js', false],
+    ['file://fileserver/share/app.js', 'file:///fileserver/share/app.js', false],
+    ['file://FileServer/share/app.js', 'file://fileserver/share/app.js', true],
+    ['file:///workspace/src/app.js', '/workspace/src/app.js', true],
+    ['file:///C:/w/a.js', 'c:\\w\\a.js', true],
+    ['file:///c:/w/a.js', 'C:/w/a.js', true],
+    ['file:///w/my%20file.js', '/w/my file.js', true],
+    ['file:///w/a.js', 'file:///w/b.js', false],
+    ['src/app.js', 'src/app.js', true],
+    ['src\\app.js', 'src/app.js', true],
+    ['\\\\fileserver\\share\\a.js', 'file://fileserver/share/a.js', true],
+    ['/a/b.js', '/a/b.js/', true],
+    ['/w/../etc/passwd', '/etc/passwd', false],
+    ['file:///w/a%2F..%2Fb.js', '/w/b.js', false],
+    ['file:///w/a.js?x=1', 'file:///w/a.js', false],
+    ['http://host/a.js', 'http://host/a.js', false],
+    ['', '', false],
+    [null, '/a.js', false],
+    ['/a.js', undefined, false]
+  ];
+  for (const [signed, target, expected] of rows) {
+    assert.equal(
+      isSameDocumentUri(signed, target),
+      expected,
+      `isSameDocumentUri(${JSON.stringify(signed)}, ${JSON.stringify(target)}) must be ${expected}`
+    );
+  }
+});
+
+// R13-F02: the R12 test signs with a random key, so its finding is unconfirmed before the URI check
+// runs and its assertions pass even with the binding deleted. documentBound is computed regardless of
+// authority, so this test fails if the call site in formatAcpDiagnostic is removed or loosened.
+test('ACP Adapter R13-F02: formatAcpDiagnostic reports documentBound independently of authority', () => {
+  const finding = {
+    id: 'CAND-URI-02',
+    ruleId: 'CWE-79',
+    severity: 'HIGH',
+    disposition: 'REPORTABLE',
+    title: 'XSS candidate',
+    location: { uri: 'src/app.js', startLine: 3, startColumn: 1, endLine: 3, endColumn: 9 }
+  };
+
+  const noTarget = formatAcpDiagnostic(finding);
+  assert.equal('documentBound' in noTarget.data, false, 'no target URI: documentBound must be absent');
+
+  assert.equal(formatAcpDiagnostic(finding, 'src/app.js').data.documentBound, true);
+  assert.equal(formatAcpDiagnostic(finding, '/other-project/src/app.js').data.documentBound, false);
+  assert.equal(formatAcpDiagnostic(finding, 'file:///work/src/app.js').data.documentBound, false);
+
+  const hostFinding = { ...finding, location: { ...finding.location, uri: 'file://fileserver/share/app.js' } };
+  assert.equal(formatAcpDiagnostic(hostFinding, 'file:///fileserver/share/app.js').data.documentBound, false);
+
+  const notification = JSON.parse(formatPublishDiagnosticsNotification('/other-project/src/app.js', [finding]));
+  assert.equal(notification.params.diagnostics[0].data.documentBound, false);
 });

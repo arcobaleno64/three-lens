@@ -311,6 +311,78 @@ export function normalizeDocumentUri(rawUri) {
 }
 
 /**
+ * Canonical identity of a document URI or path: { absolute, host, path }, or null when it cannot
+ * be classified safely (R13-F01). Unlike normalizeDocumentUri this keeps the file: authority
+ * (file://fileserver/x and file:///fileserver/x are different documents), percent-decodes
+ * file: URLs, folds only the drive letter, and rejects any '..' that survives normalization.
+ * @param {*} raw
+ * @returns {{absolute: boolean, host: string, path: string}|null}
+ */
+function canonicalizeDocumentIdentity(raw) {
+  if (typeof raw !== 'string') return null;
+  const text = raw.trim();
+  if (!text || text.includes('\0')) return null;
+
+  let host = '';
+  let pathPart;
+  let absolute = true;
+  if (/^file:/i.test(text)) {
+    let url;
+    try { url = new URL(text); } catch { return null; }
+    if (url.protocol !== 'file:' || url.search || url.hash) return null;
+    host = url.hostname.toLowerCase();
+    try { pathPart = decodeURIComponent(url.pathname); } catch { return null; }
+  } else if (/^[a-zA-Z]:[\\/]/.test(text)) {
+    pathPart = text.replace(/\\/g, '/');
+  } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(text)) {
+    return null; // another scheme, or a bare "c:" drive-relative path
+  } else {
+    pathPart = text.replace(/\\/g, '/');
+    if (pathPart.startsWith('//')) {
+      const rest = pathPart.slice(2);
+      const slash = rest.indexOf('/');
+      host = (slash < 0 ? rest : rest.slice(0, slash)).toLowerCase();
+      pathPart = slash < 0 ? '' : rest.slice(slash);
+      if (!host) return null;
+    } else if (!pathPart.startsWith('/')) {
+      absolute = false;
+    }
+  }
+
+  pathPart = pathPart.replace(/\\/g, '/');
+  let drive = '';
+  const driveMatch = /^\/?([a-zA-Z]):(?:\/|$)/.exec(pathPart);
+  if (driveMatch) {
+    drive = driveMatch[1].toLowerCase() + ':';
+    pathPart = pathPart.slice(driveMatch[0].length - (driveMatch[0].endsWith('/') ? 1 : 0));
+    absolute = true;
+  }
+  const segments = [];
+  for (const seg of pathPart.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') return null;
+    segments.push(seg);
+  }
+  const joined = segments.join('/');
+  return { absolute, host, path: drive ? `${drive}/${joined}` : (absolute ? `/${joined}` : joined) };
+}
+
+/**
+ * True only when both values identify the same document: same kind (absolute vs relative),
+ * same file: authority and same canonical path. A relative path never equals an absolute one,
+ * and there is no suffix matching (R13-F01).
+ * @param {*} a
+ * @param {*} b
+ * @returns {boolean}
+ */
+export function isSameDocumentUri(a, b) {
+  const ca = canonicalizeDocumentIdentity(a);
+  const cb = canonicalizeDocumentIdentity(b);
+  if (!ca || !cb) return false;
+  return ca.absolute === cb.absolute && ca.host === cb.host && ca.path === cb.path;
+}
+
+/**
  * Formats a single 3-Lens candidate/verified finding into an ACP-compliant Diagnostic object.
  * Under Default-Deny, authority is strictly validated against the immutable supervisor root key.
  * R12-F01 Defense: When expectedDocumentUri is supplied (e.g. from publishDiagnostics notification or emitter),
@@ -339,11 +411,13 @@ export function formatAcpDiagnostic(finding, expectedDocumentUri = null) {
   const disposition = finding.disposition ? String(finding.disposition).toUpperCase().trim() : 'UNVERIFIED';
   let isConfirmed = assertFindingDispositionAuthority(finding);
 
-  // R12-F01 Defense: Canonical URI binding check
-  if (isConfirmed && expectedDocumentUri && typeof expectedDocumentUri === 'string') {
-    const findingUri = normalizeDocumentUri(finding.location?.uri);
-    const targetUri = normalizeDocumentUri(expectedDocumentUri);
-    if (!findingUri || !targetUri || (findingUri !== targetUri && !targetUri.endsWith('/' + findingUri) && !findingUri.endsWith('/' + targetUri))) {
+  // R12-F01 / R13-F01 Defense: the signed location URI must identify exactly the document being
+  // published to (see isSameDocumentUri; no suffix matching). The result is computed whether or not
+  // the finding carries authority, and exposed as data.documentBound, so the binding stays testable.
+  let documentBound = null;
+  if (expectedDocumentUri !== null && expectedDocumentUri !== undefined) {
+    documentBound = isSameDocumentUri(finding.location?.uri, expectedDocumentUri);
+    if (!documentBound) {
       isConfirmed = false;
     }
   }
@@ -375,6 +449,10 @@ export function formatAcpDiagnostic(finding, expectedDocumentUri = null) {
       authorityConfirmed: isConfirmed
     }
   };
+
+  if (documentBound !== null) {
+    diag.data.documentBound = documentBound;
+  }
 
   if (finding.remediation) {
     diag.data.remediation = finding.remediation;
