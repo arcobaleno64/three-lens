@@ -65,8 +65,9 @@ const DOC_TARGETS = [
   },
   {
     // The skill header is what agy shows when /3lens is invoked, so users read it as the installed version.
+    // The lookahead makes anything after the closing paren fail the check instead of being silently ignored.
     file: "skills/3lens/SKILL.md",
-    pattern: /^# Three-Lens Security Skill \(\/3lens v[^)\s]+\)/m,
+    pattern: /^# Three-Lens Security Skill \(\/3lens v[^\s)]+\)(?=\r?$)/m,
     replacement: (v) => `# Three-Lens Security Skill (/3lens v${v})`
   },
   {
