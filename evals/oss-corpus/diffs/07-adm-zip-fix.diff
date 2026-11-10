@@ -1,6 +1,6 @@
 --- a/evals/oss-corpus/07-adm-zip-path-traversal.js
 +++ b/evals/oss-corpus/07-adm-zip-path-traversal.js
-@@ -9,5 +9,85 @@
+@@ -9,5 +9,106 @@
 -  // Vulnerable: path.resolve concatenates entryName without directory containment assertion
 -  const target = path.resolve(targetDir, entryName);
 -  fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -48,10 +48,13 @@
 +    if (targetStat.isFile() && targetStat.nlink > 1) {
 +      throw new Error(`SECURITY_ERROR: Hardlink target detected at ${target}`);
 +    }
++    if (targetStat.isFile()) {
++      throw new Error(`SECURITY_ERROR: Destination file already exists and cannot be overwritten: ${target}`);
++    }
 +  }
 +
-+  // R09-F03 Defense: Write payload to an isolated staging directory on the same filesystem,
-+  // then atomically move into place after verifying ancestor symlink invariants.
++  // R09-F03 & R10-F03 Defense: Write payload to an isolated staging directory on the same filesystem.
++  // Use non-replacing linkSync or O_EXCL to guarantee that external files can NEVER be overwritten or lost.
 +  const stageDir = fs.mkdtempSync(path.join(resolvedTargetDir, '.admzip-stage-'));
 +  const stageFile = path.join(stageDir, 'payload.bin');
 +  const openFlags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0);
@@ -64,7 +67,7 @@
 +      fs.closeSync(fd);
 +    }
 +
-+    // Re-verify ancestors immediately prior to atomic move
++    // Re-verify ancestors immediately prior to placement
 +    let verifyCurr = path.dirname(target);
 +    while (verifyCurr.startsWith(boundaryPrefix) || verifyCurr === resolvedTargetDir) {
 +      const s = fs.lstatSync(verifyCurr, { throwIfNoEntry: false });
@@ -75,13 +78,31 @@
 +      verifyCurr = path.dirname(verifyCurr);
 +    }
 +
-+    // Atomic move into final location
-+    fs.renameSync(stageFile, target);
++    // Non-replacing placement: linkSync strictly fails with EEXIST if target already exists,
++    // completely preventing existing external file overwrite (R10-F03).
++    let placedViaLink = false;
++    try {
++      fs.linkSync(stageFile, target);
++      placedViaLink = true;
++    } catch (linkErr) {
++      if (linkErr.code === 'EEXIST') {
++        throw new Error(`SECURITY_ERROR: Refusing to overwrite existing file at ${target}`);
++      }
++      // Fallback if hard links are unsupported on filesystem
++      const destFd = fs.openSync(target, openFlags, 0o644);
++      try {
++        fs.writeFileSync(destFd, content);
++      } finally {
++        fs.closeSync(destFd);
++      }
++    }
 +
 +    // Fail-closed post-move boundary verification
 +    const realFinal = fs.realpathSync(target);
 +    if (!realFinal.startsWith(boundaryPrefix)) {
-+      try { fs.unlinkSync(target); } catch {}
++      if (placedViaLink) {
++        try { fs.unlinkSync(target); } catch {}
++      }
 +      throw new Error(`SECURITY_ERROR: Target escaped boundary after atomic placement: ${realFinal}`);
 +    }
 +  } finally {

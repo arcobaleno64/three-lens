@@ -102,6 +102,15 @@ export function validateV2Corpus(corpusPath = path.join(REPO_ROOT, 'evals/v2-cor
     errors.push(`Distinct vulnerability families (${families.size}) < required (${l2Criteria.minVulnerabilityFamilies})`);
   }
 
+  // R10-F06 Defense: Governance provenance discipline must be synchronized with case commitSha
+  const expectedCommitSha = cases[0]?.commitSha;
+  if (expectedCommitSha && corpus.governance?.provenanceDiscipline) {
+    const provMatch = corpus.governance.provenanceDiscipline.match(/commit\s+([0-9a-f]{40})/i);
+    if (provMatch && provMatch[1].toLowerCase() !== expectedCommitSha.toLowerCase()) {
+      errors.push(`Governance provenanceDiscipline commit (${provMatch[1]}) does not match cases commitSha (${expectedCommitSha}) (R10-F06)`);
+    }
+  }
+
   const requiredFields = [
     'caseId',
     'provenanceType',

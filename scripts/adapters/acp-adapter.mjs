@@ -19,32 +19,14 @@
 
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { AsyncLocalStorage } from 'node:async_hooks';
-import { DEFAULT_SUPERVISOR_PUBLIC_PEM } from './plugin-data-adapter.mjs';
-import { testKeyStorage } from './internal/test-root-capability.mjs';
 
-// R09-F01 Defense: Capability Isolation for Test Harness.
-// withTestSupervisorRootKey is completely REMOVED from public module exports.
-// Regular callers of acp-adapter can NEVER override the supervisor root public key.
-function getActiveSupervisorRootPublicKey() {
-  if (process.env.NODE_ENV === 'production') {
-    return DEFAULT_SUPERVISOR_PUBLIC_PEM.trim().replace(/\r\n/g, '\n');
-  }
-  const isTestRunner = Boolean(
-    process.env.NODE_TEST_CONTEXT ||
-    process.argv.some(a => typeof a === 'string' && a.includes('--test')) ||
-    process.execArgv.some(a => typeof a === 'string' && a.includes('--test'))
-  );
-  if (!isTestRunner) {
-    // In any non-test runner context, strictly return DEFAULT_SUPERVISOR_PUBLIC_PEM
-    return DEFAULT_SUPERVISOR_PUBLIC_PEM.trim().replace(/\r\n/g, '\n');
-  }
-  const testPem = testKeyStorage.getStore();
-  if (testPem && typeof testPem === 'string') {
-    return testPem.trim().replace(/\r\n/g, '\n');
-  }
-  return DEFAULT_SUPERVISOR_PUBLIC_PEM.trim().replace(/\r\n/g, '\n');
-}
+// R10-F01 Defense: Immutable Root of Trust for ACP Inline Streaming Diagnostics.
+// Pinned static Ed25519 supervisor root public key.
+// Zero ambient AsyncLocalStorage, zero dynamic token lookup, zero override backdoors.
+// Callers can NEVER inject or override the authority root key.
+export const ACP_SUPERVISOR_PUBLIC_PEM =
+  '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAfhd+MMkWEh9qzeo1qUR/dcX6hf8ggaf1z6B52Ltp15k=\n-----END PUBLIC KEY-----\n';
+export const DEFAULT_SUPERVISOR_PUBLIC_PEM = ACP_SUPERVISOR_PUBLIC_PEM;
 
 /**
  * Standard LSP / ACP Diagnostic Severity ratings:
@@ -146,10 +128,9 @@ export function assertFindingDispositionAuthority(finding) {
   }
 
   try {
-    // R08-F02 Defense: Caller options CANNOT override supervisor root public key.
-    // Untrusted options are completely eliminated from the authority gate.
-    // Only the active supervisor root key (default or isolated AsyncLocalStorage test scope) is trusted.
-    const trustedKeyPem = getActiveSupervisorRootPublicKey();
+    // R10-F01 Defense: Immutable pinned supervisor root public key.
+    // Untrusted options and ambient overrides are completely eliminated.
+    const trustedKeyPem = ACP_SUPERVISOR_PUBLIC_PEM.trim().replace(/\r\n/g, '\n');
 
     // Verify key identity: verifierPublicKey (if supplied) must match trusted root key
     if (ap.verifierPublicKey) {
@@ -235,7 +216,9 @@ export function mapSeverityToAcpDiagnostic(severity, disposition = 'UNVERIFIED')
  * @returns {number}
  */
 function safeNonNegativeInteger(val, fallback = 0) {
-  if (typeof val !== 'number' || !Number.isFinite(val) || Number.isNaN(val)) return fallback;
+  if (typeof val !== 'number' || !Number.isFinite(val) || Number.isNaN(val) || !Number.isSafeInteger(Math.floor(val))) {
+    return fallback;
+  }
   return Math.max(0, Math.floor(val));
 }
 
@@ -434,11 +417,21 @@ export function parseJsonRpcMessage(raw) {
 export function createAcpDiagnosticEmitter(stream = process.stdout) {
   const cancelledSessions = new Set();
   const cancelledRequests = new Set();
+  const MAX_CANCELLED_REQUESTS = 500;
   const sessionTurns = new Map(); // sessionId -> currentTurnId (monotonically increasing)
   const sessionStates = new Map(); // sessionId -> 'IDLE' | 'PROCESSING_PROMPT' | 'COMPLETED' | 'CANCELLED'
   const cancelledTurns = new Set(); // Set of `${sessionId}:${turnId}`
-  const pendingPromptRequests = new Map(); // R09-F02: sessionId -> { id, turnId }
+  const pendingPromptRequests = new Map(); // R09-F02 & R10-F02: sessionId -> { id, turnId }
   let isShutdown = false;
+
+  function trackCancelledRequest(reqId) {
+    if (reqId === undefined || reqId === null) return;
+    if (cancelledRequests.size >= MAX_CANCELLED_REQUESTS) {
+      const oldest = cancelledRequests.values().next().value;
+      cancelledRequests.delete(oldest);
+    }
+    cancelledRequests.add(reqId);
+  }
 
   function isEmissionAllowed(sessionId, turnId, requestId) {
     if (isShutdown) return false;
@@ -521,7 +514,21 @@ export function createAcpDiagnosticEmitter(stream = process.stdout) {
     resetSession(sessionId) {
       if (!sessionId || !sessionTurns.has(sessionId)) return false;
       cancelledSessions.delete(sessionId);
-      pendingPromptRequests.delete(sessionId);
+      if (pendingPromptRequests.has(sessionId)) {
+        const pending = pendingPromptRequests.get(sessionId);
+        pendingPromptRequests.delete(sessionId);
+        const cancelResp = {
+          jsonrpc: '2.0',
+          id: pending.id,
+          result: {
+            status: 'cancelled',
+            sessionId,
+            turnId: pending.turnId,
+            stopReason: 'cancelled'
+          }
+        };
+        stream.write(JSON.stringify(cancelResp) + '\n');
+      }
       sessionStates.set(sessionId, 'IDLE');
       return true;
     },
@@ -540,26 +547,29 @@ export function createAcpDiagnosticEmitter(stream = process.stdout) {
     },
     completePromptTurn(sessionId, stopReason = 'end_turn') {
       if (!sessionId || !sessionTurns.has(sessionId)) return null;
-      sessionStates.set(sessionId, 'COMPLETED');
-      const curTurn = sessionTurns.get(sessionId);
-      // R09-F02: If there is a pending prompt turn request, bind its id to the completion response
-      const pending = pendingPromptRequests.get(sessionId);
-      if (pending) {
-        pendingPromptRequests.delete(sessionId);
-        const response = {
-          jsonrpc: '2.0',
-          id: pending.id,
-          result: {
-            status: 'completed',
-            sessionId,
-            turnId: pending.turnId,
-            stopReason
-          }
-        };
-        stream.write(JSON.stringify(response) + '\n');
-        return response;
+      // R10-F02 Defense: Cancelled session CANNOT transition to COMPLETED!
+      if (sessionStates.get(sessionId) === 'CANCELLED') {
+        return null;
       }
-      return { status: 'completed', sessionId, turnId: curTurn, stopReason };
+      // R10-F02 Defense: completePromptTurn without active pending prompt does not change state or emit
+      const pending = pendingPromptRequests.get(sessionId);
+      if (!pending) {
+        return null;
+      }
+      pendingPromptRequests.delete(sessionId);
+      sessionStates.set(sessionId, 'COMPLETED');
+      const response = {
+        jsonrpc: '2.0',
+        id: pending.id,
+        result: {
+          status: 'completed',
+          sessionId,
+          turnId: pending.turnId,
+          stopReason
+        }
+      };
+      stream.write(JSON.stringify(response) + '\n');
+      return response;
     },
     getPendingPrompt(sessionId) {
       return pendingPromptRequests.get(sessionId) || null;
@@ -657,6 +667,22 @@ export function createAcpDiagnosticEmitter(stream = process.stdout) {
           }
           return null;
         }
+        // R10-F02 Defense: Reject concurrent prompts if an existing prompt is already pending on this session
+        if (pendingPromptRequests.has(sid) || sessionStates.get(sid) === 'PROCESSING_PROMPT') {
+          if (parsed.id !== undefined && parsed.id !== null) {
+            const errResp = {
+              jsonrpc: '2.0',
+              id: parsed.id,
+              error: {
+                code: -32600,
+                message: `Session '${sid}' already has an active pending prompt turn and cannot accept concurrent prompts`
+              }
+            };
+            stream.write(JSON.stringify(errResp) + '\n');
+            return errResp;
+          }
+          return null;
+        }
         // R06-F03: Monotonically increment turn generation token
         const turnId = (sessionTurns.get(sid) || 0) + 1;
         sessionTurns.set(sid, turnId);
@@ -701,7 +727,7 @@ export function createAcpDiagnosticEmitter(stream = process.stdout) {
       if (parsed.method === '$/cancel_request' || parsed.method === '$/cancelRequest') {
         const reqId = parsed.params?.id ?? parsed.params?.requestId;
         if (reqId !== undefined && reqId !== null) {
-          cancelledRequests.add(reqId);
+          trackCancelledRequest(reqId);
           // R09-F02: If this request ID matches a pending prompt turn, cancel and resolve it
           for (const [sid, pending] of pendingPromptRequests.entries()) {
             if (pending.id === reqId) {

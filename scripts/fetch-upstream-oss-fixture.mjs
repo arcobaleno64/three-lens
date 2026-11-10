@@ -65,13 +65,15 @@ export function parseGitRemoteOriginUrl(gitConfigPath, expectedRemoteName = 'ori
     const content = fs.readFileSync(gitConfigPath, 'utf8');
     const lines = content.split('\n');
     let inTargetRemoteSection = false;
-    const target = String(expectedRemoteName || 'origin').trim().toLowerCase();
+    // R10-F04 Defense: In Git configuration, section names are case-insensitive,
+    // but subsection names in quotes (e.g., [remote "origin"]) are STRICTLY case-sensitive!
+    const target = String(expectedRemoteName || 'origin').trim();
     for (const rawLine of lines) {
       const line = rawLine.trim();
       if (!line || line.startsWith('#') || line.startsWith(';')) continue;
       const remoteMatch = line.match(/^\[remote\s+"([^"]+)"\]/i);
       if (remoteMatch) {
-        inTargetRemoteSection = remoteMatch[1].trim().toLowerCase() === target;
+        inTargetRemoteSection = remoteMatch[1].trim() === target;
         continue;
       }
       if (line.startsWith('[')) {
