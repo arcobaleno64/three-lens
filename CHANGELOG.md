@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.13.0] - 2026-11-10
 
 ### Milestone 5.5: Multi-Tier Empirical Calibration, Upstream Verified OSS Ground Truth & ACP Inline Streaming Diagnostics
-This release concludes Milestone 5.5 across 12 rounds of rigorous independent AppSec and architectural review. It introduces an upstream-verified open-source ground-truth corpus (Layer 2), Agent Client Protocol (ACP) inline streaming diagnostics for IDE integration, and cryptographic authority root hardening with zero ambient bypasses.
+This release delivers Milestone 5.5 workstreams 2-4 (upstream verified OSS corpus, ACP inline diagnostics, specification alignment) and only a single-fixture pilot of workstream 1. It went through 12 rounds of independent review; a 13th round on `301b672` returned NOT APPROVED, its findings were fixed afterwards (see Security and Fixed) and have not been re-reviewed.
 
 ### Added
 - **Layer 2 Upstream Verified OSS Ground-Truth Corpus**:
@@ -25,6 +25,23 @@ This release concludes Milestone 5.5 across 12 rounds of rigorous independent Ap
   - SPKI DER SHA-256 fingerprint comparison (`computePublicKeyFingerprint`) ensuring robust, format-independent identification of revoked keys.
   - Zero caller override parameters in formal public verification APIs.
   - In-memory dynamic ephemeral keypairs for cryptographic testing with zero unrevoked static test keys; historical leaked test keys strictly confined to negative regression tests verifying fail-closed fingerprint revocation.
+
+### Security
+- **Layer 3 hook symlink bypass (present in v1.12.0; earlier versions not checked)**: paths under `scratch/` were allowed when the lexical check passed even if the real path left the repository, so a symlink planted there let reads and writes escape. Both checks must now pass. (#53)
+- **Layer 4 file-descriptor binding**: `safeReadFileContained` binds the opened descriptor to the checked path (dev/ino) and uses `O_NOFOLLOW` where available. (#53)
+- **ACP document binding**: a diagnostic is bound to exactly the document it is published to; suffix matching and the loss of the `file:` authority are gone, and `data.documentBound` is exposed. (#67, #69)
+
+### Changed
+- Findings signed with a repo-relative `location.uri` that are published to an absolute `file:///` URI are now downgraded to `HINT` until a trusted workspace root is supplied. (#69)
+
+### Fixed
+- The pre-invocation secret guard did not run when reached through a symlinked path. (#63)
+- The `SKILL.md` header version is now checked by `check-version`. (#57, #64, #66)
+- Docs said claims default to `UNVERIFIED`; the default disposition is `DEFERRED`. (#55, #65)
+- CI: Windows glob expansion and a macOS temp-directory test. (#58, #59, #61, #62)
+
+### Known limitations
+- Workstream 1 (multi-tier effort calibration) is a pilot: one fixture (`SEM-03`), `low` vs `medium`, one pass. The RFC 0006 target (multi-pass runs on the Layer 2 corpus across `low`, `medium`, `high`, `argon` with D1, D2, D4 metrics) was not met; the report is labelled a smoke check.
 
 ---
 
