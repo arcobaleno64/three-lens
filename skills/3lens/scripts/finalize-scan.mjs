@@ -1512,11 +1512,21 @@ export function extractVoteEvidence(vote, candidate = {}) {
  * Collects normalized repository-relative file paths that belong to a candidate's
  * location and declared attackPath topology (Issue #54).
  */
-function getCandidateScopePaths(candidate = {}) {
+function getCandidateScopePaths(candidate = {}, repoRoot = null) {
   const scope = new Set();
   const addPath = (raw) => {
     if (typeof raw === 'string' && raw.trim().length > 0) {
-      scope.add(raw.trim().replace(/\\/g, '/').replace(/^\.\//, ''));
+      let p = raw.trim().replace(/\\/g, '/');
+      if (repoRoot && path.isAbsolute(p)) {
+        const normRoot = path.resolve(repoRoot).replace(/\\/g, '/').replace(/\/+$/, '');
+        if (p === normRoot) {
+          p = '';
+        } else if (p.startsWith(normRoot + '/')) {
+          p = p.slice(normRoot.length + 1);
+        }
+      }
+      p = p.replace(/^\.\//, '');
+      if (p) scope.add(p);
     }
   };
 
@@ -1559,7 +1569,7 @@ export function validateVoteEvidence(vote, candidate = {}, repoRoot = null) {
 
   const rawDecision = String(vote.decision || vote.verdict || '').toUpperCase();
   const isRefutation = ['FALSE_POSITIVE', 'REFUTES', 'SUPPRESSED'].includes(rawDecision);
-  const candidateScopePaths = getCandidateScopePaths(candidate);
+  const candidateScopePaths = getCandidateScopePaths(candidate, repoRoot);
   const voteTopLevelQuote = typeof vote.quote === 'string'
     ? vote.quote
     : (typeof vote.lineContent === 'string' ? vote.lineContent : null);
@@ -1601,10 +1611,14 @@ export function validateVoteEvidence(vote, candidate = {}, repoRoot = null) {
         if (typeof expectedQuote === 'string') {
           const trimmedQuote = expectedQuote.trim();
           const actualLine = (lines[item.line - 1] || '').trim();
-          if (!trimmedQuote || !actualLine.includes(trimmedQuote)) {
+          const tokenizedActualLine = tokenizeSecretsForContext(actualLine).tokenizedText.trim();
+          const matchesRaw = Boolean(trimmedQuote && actualLine.includes(trimmedQuote));
+          const matchesTokenized = Boolean(trimmedQuote && tokenizedActualLine.includes(trimmedQuote));
+          if (!matchesRaw && !matchesTokenized) {
+            const safeQuote = redactSecrets(trimmedQuote);
             return {
               valid: false,
-              reason: `Evidence quote mismatch at '${normPath}:${item.line}': cited quote '${trimmedQuote}' not found on physical line`
+              reason: `Evidence quote mismatch at '${normPath}:${item.line}': cited quote '${safeQuote}' not found on physical line`
             };
           }
         }
@@ -4760,9 +4774,30 @@ export function renderMarkdownFromCanonical({
 }
 
 /**
- * Canonical required critical scripts set (R6-P1-01 / v1.1.0 P0/P1).
+ * Resolves critical script relative path to authoritative physical on-disk location.
+ * For scripts/ it resolves inside toolRoot (skills/3lens).
+ * For hooks/ it resolves at the plugin root level (two levels above skills/3lens).
+ */
+export function resolveCriticalScriptPath(resolvedTool, rel) {
+  if (rel.startsWith('hooks/')) {
+    const pluginRootHook = path.resolve(resolvedTool, '../..', rel);
+    if (fs.existsSync(pluginRootHook)) {
+      return pluginRootHook;
+    }
+    const toolRootHook = path.resolve(resolvedTool, rel);
+    if (fs.existsSync(toolRootHook)) {
+      return toolRootHook;
+    }
+    return pluginRootHook;
+  }
+  return path.resolve(resolvedTool, rel);
+}
+
+/**
+ * Canonical required critical scripts set (R6-P1-01 / v1.1.0 P0/P1, Issue #56).
  */
 export const REQUIRED_CRITICAL_SCRIPTS = [
+  'hooks/pre-invocation-secret-guard.mjs',
   'scripts/adapters/acp-adapter.mjs',
   'scripts/adapters/acp-transport-adapter.mjs',
   'scripts/adapters/cloudflare-adapter.mjs',
@@ -4790,7 +4825,7 @@ export function generateToolIntegrityManifest(toolRoot = null) {
 
   const digests = {};
   for (const rel of criticalScripts) {
-    const full = path.resolve(resolvedTool, rel);
+    const full = resolveCriticalScriptPath(resolvedTool, rel);
     if (fs.existsSync(full)) {
       const content = fs.readFileSync(full, 'utf8').replace(/\r\n/g, '\n');
       digests[rel] = crypto.createHash('sha256').update(content, 'utf8').digest('hex');
@@ -4854,7 +4889,7 @@ export function verifyToolSelfIntegrity(toolRoot = null, targetRoot = null, opti
   // 2. Authoritative script integrity verification against release manifest
   const scriptHashes = {};
   for (const rel of REQUIRED_CRITICAL_SCRIPTS) {
-    const fullPath = path.resolve(resolvedTool, rel);
+    const fullPath = resolveCriticalScriptPath(resolvedTool, rel);
     if (fs.existsSync(fullPath)) {
       const content = fs.readFileSync(fullPath, 'utf8').replace(/\r\n/g, '\n');
       const hash = crypto.createHash('sha256').update(content, 'utf8').digest('hex');

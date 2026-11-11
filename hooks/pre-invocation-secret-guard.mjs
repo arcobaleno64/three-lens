@@ -63,7 +63,7 @@ export const SECRET_PATTERNS = [
   {
     name: 'JWT_TOKEN',
     type: 'JWT_TOKEN',
-    regex: /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_.\-+/=]*/g
+    regex: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_.\-+/=]*/g
   },
   {
     name: 'CONNECTION_STRING_SECRET',
