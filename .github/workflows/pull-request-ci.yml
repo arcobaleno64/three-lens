@@ -49,6 +49,7 @@ jobs:
       # `node --test` does not either. Run under bash so all three runners expand it alike.
       - run: node --test tests/test-*.mjs
         shell: bash
+      - run: npm run check-version
       - run: npm run check:docs
       - run: node scripts/bundle-release-evidence.mjs --check
       - run: npm run check:release
