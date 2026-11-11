@@ -28,35 +28,57 @@ function emit(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
 }
 
-// Credential detection patterns
+// Common secret patterns for deterministic redaction, context tokenization, and pre-invocation prompt guard (Issue #56 single source of truth)
 export const SECRET_PATTERNS = [
   {
     name: 'PRIVATE_KEY',
-    regex: /-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----/
+    type: 'PRIVATE_KEY',
+    regex: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----(?:[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED |PGP )?PRIVATE KEY(?: BLOCK)?-----|[^\r\n]*)/g
   },
   {
     name: 'AWS_ACCESS_KEY',
-    regex: /\bAKIA[0-9A-Z]{16}\b/
+    type: 'AWS_ACCESS_KEY',
+    regex: /\b(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}\b/g
   },
   {
     name: 'GITHUB_TOKEN',
-    regex: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,}\b/
+    type: 'GITHUB_TOKEN',
+    regex: /\b(?:ghp_[a-zA-Z0-9_]{36,40}|github_pat_[a-zA-Z0-9_]{82}|gh[orpus]_[a-zA-Z0-9_]{36,40})\b/g
   },
   {
     name: 'SLACK_TOKEN',
-    regex: /\bxox[baprs]-[0-9A-Za-z]{10,48}\b/
+    type: 'SLACK_TOKEN',
+    regex: /\bxox[baprs]-[0-9A-Za-z\-]{10,48}\b/g
   },
   {
     name: 'GOOGLE_API_KEY',
-    regex: /\bAIza[0-9A-Za-z\-_]{35}\b/
+    type: 'GOOGLE_API_KEY',
+    regex: /\bAIza[0-9A-Za-z\-_]{35}\b/g
   },
   {
     name: 'BEARER_TOKEN',
-    regex: /\bBearer\s+(?:eyJ[A-Za-z0-9_\-\.=:_\+\/]{16,}|[A-Za-z0-9_\-\.=:_\+\/]{24,})\b/i
+    type: 'BEARER_TOKEN',
+    regex: /\bBearer\s+(?:eyJ[A-Za-z0-9_\-\.=:_\+\/]{16,}|[A-Za-z0-9_\-\.=:_\+\/]{20,})/gi
   },
   {
-    name: 'GENERIC_HIGH_ENTROPY_TOKEN',
-    regex: /(?:api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token)\s*[:=]\s*['"][A-Za-z0-9+/=_\-]{24,}['"]/i
+    name: 'JWT_TOKEN',
+    type: 'JWT_TOKEN',
+    regex: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_.\-+/=]*/g
+  },
+  {
+    name: 'CONNECTION_STRING_SECRET',
+    type: 'CONNECTION_STRING_SECRET',
+    regex: /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^/\s:@'"]+:([^@\s'"]{6,})@[^\s'"]+/g
+  },
+  {
+    name: 'AZURE_ACCOUNT_KEY',
+    type: 'AZURE_ACCOUNT_KEY',
+    regex: /\bAccountKey\s*=\s*([A-Za-z0-9+/=]{20,})/gi
+  },
+  {
+    name: 'GENERIC_SECRET_KV',
+    type: 'GENERIC_SECRET_KV',
+    regex: /(?:(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|password|passwd|pwd)\s*[:=]\s*(?:["']([^\r\n"']{6,})["']|([a-zA-Z0-9_\-\.\+=/@!#$%^&*]{12,}))|["']token["']\s*:\s*["']([a-zA-Z0-9_\-\.\+=/]{16,})["'])/gi
   }
 ];
 
@@ -66,9 +88,11 @@ export const SECRET_PATTERNS = [
  */
 export function scanForSecrets(text) {
   if (typeof text !== 'string' || !text.trim()) return null;
-  for (const { name, regex } of SECRET_PATTERNS) {
+  for (const { name, type, regex } of SECRET_PATTERNS) {
+    regex.lastIndex = 0;
     if (regex.test(text)) {
-      return name;
+      regex.lastIndex = 0;
+      return name || type;
     }
   }
   return null;

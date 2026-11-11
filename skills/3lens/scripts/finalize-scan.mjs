@@ -25,7 +25,7 @@ export { isPathContained, isRealPathContained, assertContainedPath, safeReadFile
 // baselines, and the TCB manifest. `scripts/bump-version.mjs` rewrites this line
 // (and package.json, and tool-integrity-manifest.json) together so a release
 // cannot bump one without the others going stale.
-export const TOOL_VERSION = '1.13.0';
+export const TOOL_VERSION = '1.14.0';
 import {
   loadProjectSecurityContext,
   detectContextDrift,
@@ -62,15 +62,9 @@ export {
 export const CVSS_V4_REGEX = /^CVSS:4\.0\/AV:[NALP]\/AC:[LH]\/AT:[NP]\/PR:[NLH]\/UI:[NPA]\/VC:[HLN]\/VI:[HLN]\/VA:[HLN]\/SC:[HLN]\/SI:[HLN]\/SA:[HLN]$/;
 
 
-// Common secret patterns for deterministic redaction
-export const SECRET_PATTERNS = [
-  { type: 'AWS_ACCESS_KEY', regex: /(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}/g },
-  { type: 'GITHUB_TOKEN', regex: /(?:ghp_[a-zA-Z0-9]{36,40}|github_pat_[a-zA-Z0-9_]{82}|gh[orpus]_[a-zA-Z0-9]{36,40})/g },
-  { type: 'BEARER_TOKEN', regex: /bearer\s+[a-zA-Z0-9_\-\.:=_\+\/]{20,}/gi },
-  { type: 'PRIVATE_KEY', regex: /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g },
-  { type: 'GENERIC_SECRET_KV', regex: /(?:api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|password|passwd|pwd)\s*[:=]\s*["']?([a-zA-Z0-9_\-\.\+=/]{16,})["']?/gi },
-  { type: 'JWT_TOKEN', regex: /eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*/g }
-];
+// Import unified secret patterns from pre-invocation-secret-guard (Issue #56 single source of truth)
+import { SECRET_PATTERNS } from '../../../hooks/pre-invocation-secret-guard.mjs';
+export { SECRET_PATTERNS };
 
 /**
  * Strips ANSI escapes, C0/C1 non-printable controls, and Bidi override characters.
@@ -175,8 +169,9 @@ export function tokenizeSecretsForContext(sourceText, options = {}) {
 
   for (const { type, regex } of SECRET_PATTERNS) {
     regex.lastIndex = 0;
-    tokenizedText = tokenizedText.replace(regex, (match, p1) => {
-      const targetSecret = (typeof p1 === 'string') ? p1 : String(match);
+    tokenizedText = tokenizedText.replace(regex, (match, ...args) => {
+      const captured = args.slice(0, -2).find(g => typeof g === 'string' && g.length > 0);
+      const targetSecret = captured || String(match);
       const hash = crypto.createHash('sha256').update(targetSecret, 'utf8').digest('hex').substring(0, 12);
       const tokenPlaceholder = `<SECRET:class=${type}:hash=${hash}>`;
 
@@ -1443,7 +1438,10 @@ export function extractVoteEvidence(vote, candidate = {}) {
     if (typeof val === 'object' && val !== null) {
       const p = val.path || val.uri || val.file || defaultPath;
       const l = Number(val.line || val.startLine);
-      return { path: p, line: (!isNaN(l) && l > 0) ? l : null, role: val.role || defaultRole };
+      const quote = typeof val.quote === 'string'
+        ? val.quote
+        : (typeof val.lineContent === 'string' ? val.lineContent : (typeof val.snippet === 'string' ? val.snippet : null));
+      return { path: p, line: (!isNaN(l) && l > 0) ? l : null, role: val.role || defaultRole, ...(quote !== null ? { quote } : {}) };
     }
     return null;
   };
@@ -1511,8 +1509,45 @@ export function extractVoteEvidence(vote, candidate = {}) {
 }
 
 /**
- * Validates vote evidence fail-closed under Default-Deny (P1-02, R1-P0-01).
+ * Collects normalized repository-relative file paths that belong to a candidate's
+ * location and declared attackPath topology (Issue #54).
+ */
+function getCandidateScopePaths(candidate = {}, repoRoot = null) {
+  const scope = new Set();
+  const addPath = (raw) => {
+    if (typeof raw === 'string' && raw.trim().length > 0) {
+      let p = raw.trim().replace(/\\/g, '/');
+      if (repoRoot && path.isAbsolute(p)) {
+        const normRoot = path.resolve(repoRoot).replace(/\\/g, '/').replace(/\/+$/, '');
+        if (p === normRoot) {
+          p = '';
+        } else if (p.startsWith(normRoot + '/')) {
+          p = p.slice(normRoot.length + 1);
+        }
+      }
+      p = p.replace(/^\.\//, '');
+      if (p) scope.add(p);
+    }
+  };
+
+  addPath(candidate?.location?.uri || candidate?.location?.path);
+  if (candidate?.attackPath && typeof candidate.attackPath === 'object') {
+    addPath(candidate.attackPath.source?.uri || candidate.attackPath.source?.path);
+    addPath(candidate.attackPath.sink?.uri || candidate.attackPath.sink?.path);
+    if (Array.isArray(candidate.attackPath.steps)) {
+      for (const s of candidate.attackPath.steps) {
+        addPath(s?.uri || s?.path);
+      }
+    }
+  }
+  return scope;
+}
+
+/**
+ * Validates vote evidence fail-closed under Default-Deny (P1-02, R1-P0-01, Issue #54).
  * Both SUPPORTS and REFUTES decisions mandate verified evidence binding.
+ * For REFUTES decisions, cited evidence paths must intersect the candidate's target/dataflow topology,
+ * and any supplied quote/lineContent must match the physical source line.
  */
 export function validateVoteEvidence(vote, candidate = {}, repoRoot = null) {
   if (!vote || typeof vote !== 'object') {
@@ -1531,6 +1566,13 @@ export function validateVoteEvidence(vote, candidate = {}, repoRoot = null) {
   if (evidenceItems.length === 0) {
     return { valid: false, reason: 'Vote requires non-empty evidence binding' };
   }
+
+  const rawDecision = String(vote.decision || vote.verdict || '').toUpperCase();
+  const isRefutation = ['FALSE_POSITIVE', 'REFUTES', 'SUPPRESSED'].includes(rawDecision);
+  const candidateScopePaths = getCandidateScopePaths(candidate, repoRoot);
+  const voteTopLevelQuote = typeof vote.quote === 'string'
+    ? vote.quote
+    : (typeof vote.lineContent === 'string' ? vote.lineContent : null);
 
   // 3. Validate Each Evidence Item
   for (const item of evidenceItems) {
@@ -1560,13 +1602,37 @@ export function validateVoteEvidence(vote, candidate = {}, repoRoot = null) {
       }
       try {
         const fileContent = fs.readFileSync(fullTarget, 'utf8');
-        const lineCount = fileContent.split('\n').length;
+        const lines = fileContent.split(/\r?\n/);
+        const lineCount = lines.length;
         if (item.line > lineCount) {
           return { valid: false, reason: `Evidence line ${item.line} exceeds file length (${lineCount} lines) in '${normPath}'` };
+        }
+        const expectedQuote = typeof item.quote === 'string' ? item.quote : voteTopLevelQuote;
+        if (typeof expectedQuote === 'string') {
+          const trimmedQuote = expectedQuote.trim();
+          const actualLine = (lines[item.line - 1] || '').trim();
+          const tokenizedActualLine = tokenizeSecretsForContext(actualLine).tokenizedText.trim();
+          const matchesRaw = Boolean(trimmedQuote && actualLine.includes(trimmedQuote));
+          const matchesTokenized = Boolean(trimmedQuote && tokenizedActualLine.includes(trimmedQuote));
+          if (!matchesRaw && !matchesTokenized) {
+            const safeQuote = redactSecrets(trimmedQuote);
+            return {
+              valid: false,
+              reason: `Evidence quote mismatch at '${normPath}:${item.line}': cited quote '${safeQuote}' not found on physical line`
+            };
+          }
         }
       } catch (e) {
         return { valid: false, reason: `Failed to inspect evidence file '${normPath}': ${e.message}` };
       }
+    }
+
+    // Issue #54: Refutation evidence must correlate with the candidate's target file or attackPath scope
+    if (isRefutation && candidateScopePaths.size > 0 && !candidateScopePaths.has(normPath)) {
+      return {
+        valid: false,
+        reason: `Evidence path '${normPath}' does not correlate with candidate target/dataflow scope [${Array.from(candidateScopePaths).join(', ')}] (Issue #54)`
+      };
     }
   }
 
@@ -4708,9 +4774,30 @@ export function renderMarkdownFromCanonical({
 }
 
 /**
- * Canonical required critical scripts set (R6-P1-01 / v1.1.0 P0/P1).
+ * Resolves critical script relative path to authoritative physical on-disk location.
+ * For scripts/ it resolves inside toolRoot (skills/3lens).
+ * For hooks/ it resolves at the plugin root level (two levels above skills/3lens).
+ */
+export function resolveCriticalScriptPath(resolvedTool, rel) {
+  if (rel.startsWith('hooks/')) {
+    const pluginRootHook = path.resolve(resolvedTool, '../..', rel);
+    if (fs.existsSync(pluginRootHook)) {
+      return pluginRootHook;
+    }
+    const toolRootHook = path.resolve(resolvedTool, rel);
+    if (fs.existsSync(toolRootHook)) {
+      return toolRootHook;
+    }
+    return pluginRootHook;
+  }
+  return path.resolve(resolvedTool, rel);
+}
+
+/**
+ * Canonical required critical scripts set (R6-P1-01 / v1.1.0 P0/P1, Issue #56).
  */
 export const REQUIRED_CRITICAL_SCRIPTS = [
+  'hooks/pre-invocation-secret-guard.mjs',
   'scripts/adapters/acp-adapter.mjs',
   'scripts/adapters/acp-transport-adapter.mjs',
   'scripts/adapters/cloudflare-adapter.mjs',
@@ -4738,7 +4825,7 @@ export function generateToolIntegrityManifest(toolRoot = null) {
 
   const digests = {};
   for (const rel of criticalScripts) {
-    const full = path.resolve(resolvedTool, rel);
+    const full = resolveCriticalScriptPath(resolvedTool, rel);
     if (fs.existsSync(full)) {
       const content = fs.readFileSync(full, 'utf8').replace(/\r\n/g, '\n');
       digests[rel] = crypto.createHash('sha256').update(content, 'utf8').digest('hex');
@@ -4802,7 +4889,7 @@ export function verifyToolSelfIntegrity(toolRoot = null, targetRoot = null, opti
   // 2. Authoritative script integrity verification against release manifest
   const scriptHashes = {};
   for (const rel of REQUIRED_CRITICAL_SCRIPTS) {
-    const fullPath = path.resolve(resolvedTool, rel);
+    const fullPath = resolveCriticalScriptPath(resolvedTool, rel);
     if (fs.existsSync(fullPath)) {
       const content = fs.readFileSync(fullPath, 'utf8').replace(/\r\n/g, '\n');
       const hash = crypto.createHash('sha256').update(content, 'utf8').digest('hex');

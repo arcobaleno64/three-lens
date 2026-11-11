@@ -1439,7 +1439,61 @@ export function runTests() {
   if (validEvRes.disposition !== 'SUPPRESSED' || validEvRes.mappedVerdict !== 'FALSE_POSITIVE') {
     throw new Error('P1-02 VIOLATION: Valid evidence refutation failed to suppress to FALSE_POSITIVE');
   }
-  console.log('✔ 57. P1-02 Invariant: All REFUTES decisions strictly enforce verifiable evidence binding.');
+
+  // 57.8 Issue #54 Regression: REFUTES citing an existing but unrelated file (e.g. README.md:1) must be rejected and DEFERRED
+  const unrelatedRefuteVotes = [
+    {
+      findingId: 'SEC-EV-TEST',
+      lens: 'REACHABILITY',
+      decision: 'SUPPORTS',
+      evidence: [{ path: 'skills/3lens/scripts/safe-git.mjs', line: 10, role: 'source' }]
+    },
+    {
+      findingId: 'SEC-EV-TEST',
+      lens: 'DEFENSES',
+      decision: 'REFUTES',
+      evidence: [{ path: 'README.md', line: 1, role: 'control' }]
+    },
+    {
+      findingId: 'SEC-EV-TEST',
+      lens: 'IMPACT',
+      decision: 'SUPPORTS',
+      evidence: [{ path: 'skills/3lens/scripts/safe-git.mjs', line: 20, role: 'sink' }]
+    }
+  ];
+  const unrelatedRefuteRes = deriveFinalDisposition(testCandidate, unrelatedRefuteVotes, { score: 0.9 }, process.cwd());
+  if (unrelatedRefuteRes.disposition !== 'DEFERRED' || unrelatedRefuteRes.mappedVerdict !== 'NEEDS_MANUAL_REVIEW' || !unrelatedRefuteRes.reason.includes('does not correlate with candidate target/dataflow scope')) {
+    throw new Error(`Issue #54 VIOLATION: Refutation citing unrelated file README.md:1 was not DEFERRED: ${JSON.stringify(unrelatedRefuteRes)}`);
+  }
+
+  // 57.9 Issue #54 Regression: REFUTES citing a file inside candidate.attackPath.steps is allowed; mismatched quote is rejected
+  const candidateWithCrossFileFlow = {
+    ...testCandidate,
+    attackPath: {
+      source: { uri: 'skills/3lens/scripts/safe-git.mjs', line: 10 },
+      steps: [{ uri: 'skills/3lens/scripts/path-containment.mjs', line: 15 }],
+      sink: { uri: 'skills/3lens/scripts/safe-git.mjs', line: 20 }
+    }
+  };
+  const crossFileRefuteVotes = [
+    { findingId: 'SEC-EV-TEST', lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: [{ path: 'skills/3lens/scripts/safe-git.mjs', line: 10, role: 'source' }] },
+    { findingId: 'SEC-EV-TEST', lens: 'DEFENSES', decision: 'REFUTES', evidence: [{ path: 'skills/3lens/scripts/path-containment.mjs', line: 1, role: 'guard', quote: '#!/usr/bin/env node' }] },
+    { findingId: 'SEC-EV-TEST', lens: 'IMPACT', decision: 'SUPPORTS', evidence: [{ path: 'skills/3lens/scripts/safe-git.mjs', line: 20, role: 'sink' }] }
+  ];
+  const crossFileRefuteRes = deriveFinalDisposition(candidateWithCrossFileFlow, crossFileRefuteVotes, { score: 0.9 }, process.cwd());
+  if (crossFileRefuteRes.disposition !== 'SUPPRESSED' || crossFileRefuteRes.mappedVerdict !== 'FALSE_POSITIVE') {
+    throw new Error(`Issue #54 VIOLATION: Valid cross-file attackPath refutation with matching quote failed to suppress: ${JSON.stringify(crossFileRefuteRes)}`);
+  }
+  const badQuoteRefuteVotes = [
+    { findingId: 'SEC-EV-TEST', lens: 'REACHABILITY', decision: 'SUPPORTS', evidence: [{ path: 'skills/3lens/scripts/safe-git.mjs', line: 10, role: 'source' }] },
+    { findingId: 'SEC-EV-TEST', lens: 'DEFENSES', decision: 'REFUTES', evidence: [{ path: 'skills/3lens/scripts/safe-git.mjs', line: 1, role: 'guard', quote: 'NON_EXISTENT_SNIPPET_ON_LINE_1' }] },
+    { findingId: 'SEC-EV-TEST', lens: 'IMPACT', decision: 'SUPPORTS', evidence: [{ path: 'skills/3lens/scripts/safe-git.mjs', line: 20, role: 'sink' }] }
+  ];
+  const badQuoteRes = deriveFinalDisposition(testCandidate, badQuoteRefuteVotes, { score: 0.9 }, process.cwd());
+  if (badQuoteRes.disposition !== 'DEFERRED' || !badQuoteRes.reason.includes('quote mismatch')) {
+    throw new Error(`Issue #54 VIOLATION: Refutation with mismatched quote was not DEFERRED: ${JSON.stringify(badQuoteRes)}`);
+  }
+  console.log('✔ 57. P1-02 & Issue #54 Invariant: All REFUTES decisions strictly enforce verifiable, scope-bound evidence.');
 
 
   // 58. P1-04 Invariant: Orchestration consistency & unified Fixed 3-Lens verification

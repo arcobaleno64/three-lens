@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.14.0] - 2026-11-11
+
+### Milestone 5.6: Verifier Evidence Binding Symmetry & Unified Credential Protection
+
+### Added
+- **Issue #56 Unified Credential Patterns Single Source of Truth**:
+  - Unified `SECRET_PATTERNS` covering all 15 credential shapes (PKCS#1/PKCS#8/EC/PGP/OpenSSH private keys, JWTs, cloud provider keys, DB connection strings with embedded passwords, high-entropy tokens) into a single canonical source in `hooks/pre-invocation-secret-guard.mjs`, re-exported by `skills/3lens/scripts/finalize-scan.mjs`.
+  - Comprehensive 15-credential bidirectional regression tests in `tests/test-pre-invocation-secret-guard.mjs`.
+- **Issue #54 Refutation Evidence Scope Verification**:
+  - Implemented candidate attack-path and target-file topology containment enforcement (`getCandidateScopePaths`) for `REFUTES`, `FALSE_POSITIVE`, and `SUPPRESSED` ballots in `skills/3lens/scripts/finalize-scan.mjs`.
+  - Enforced physical source line quote matching for refutation evidence items carrying cited quotes/lineContent.
+  - Added Test 57.8 and 57.9 regression assertions verifying fail-closed rejection of out-of-scope or fabricated counter-evidence.
+
+### Security
+- **Physical-to-Topological Verification Precedence**:
+  - Hardened `validateVoteEvidence` to prioritize physical file existence checks before candidate scope correlation, eliminating misleading error masks on non-existent paths.
+- **TCB Script Integrity Re-attestation**:
+  - Re-anchored `skills/3lens/tool-integrity-manifest.json` SHA-256 digest and synchronized `evals/evidence-matrix.json` deterministic harness entry.
+
+---
+
 ## [1.13.0] - 2026-11-10
 
 ### Milestone 5.5: Multi-Tier Empirical Calibration, Upstream Verified OSS Ground Truth & ACP Inline Streaming Diagnostics
