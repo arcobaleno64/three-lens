@@ -284,3 +284,38 @@ test('PreInvocation Secret Guard - Subagent Message Ingestion from .system_gener
     fs.rmSync(tempBase, { recursive: true, force: true });
   }
 });
+
+test('Issue #56 Regression: Unified SECRET_PATTERNS covers all 15 credential shapes in both context tokenizer and prompt guard', async () => {
+  const { tokenizeSecretsForContext, redactSecrets, SECRET_PATTERNS: FINALIZER_PATTERNS } = await import('../skills/3lens/scripts/finalize-scan.mjs');
+  const { SECRET_PATTERNS: GUARD_PATTERNS } = await import('../hooks/pre-invocation-secret-guard.mjs');
+
+  assert.strictEqual(GUARD_PATTERNS, FINALIZER_PATTERNS, 'Prompt guard and context tokenizer must share the exact same SECRET_PATTERNS reference');
+
+  const A36 = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  const samples = {
+    'AWS access key':             'const k = "AKIAIOSFODNN7EXAMPLE";',
+    'GitHub ghp_ token':          `const t = "ghp_${A36}";`,
+    'JWT':                        'const j = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl";',
+    'PEM RSA private key block':  '-----BEGIN RSA PRIVATE KEY-----\nMIIEfake\n-----END RSA PRIVATE KEY-----',
+    'password: 16+ plain chars':  'password: abcdefghijklmnop1234',
+    'Slack bot token':            'const s = "xoxb-123456789012-abcdefghijkl";',
+    'Google API key':             'const g = "AIzaSyA1234567890abcdefghijklmnopqrstuv";',
+    'password with symbols':      'password = "P@ssw0rd!2024#xyzABCD"',
+    'password shorter than 16':   'password = "hunter2"',
+    'DB URL with inline password':'DATABASE_URL=postgres://admin:SuperSecret123456@db.example.com/app',
+    'client_secret':              'client_secret = "abcdefghijklmnop1234567890"',
+    'bare "token" key':           '"token": "abcdef0123456789abcdef0123"',
+    'Azure AccountKey':           'AccountKey=abcdefghijklmnopqrstuvwxyz0123456789ABCDEF==;',
+    'PEM ENCRYPTED PRIVATE KEY':  '-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIfake\n-----END ENCRYPTED PRIVATE KEY-----',
+    'PGP private key block':      '-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQfake\n-----END PGP PRIVATE KEY BLOCK-----',
+  };
+
+  for (const [label, text] of Object.entries(samples)) {
+    const tok = tokenizeSecretsForContext(text);
+    assert.ok(tok.secretCount > 0, `Context tokenizer missed sample '${label}': ${text}`);
+    const red = redactSecrets(text);
+    assert.ok(red.includes('[REDACTED_'), `redactSecrets missed sample '${label}': ${text}`);
+    const guardMatch = scanForSecrets(text);
+    assert.ok(guardMatch !== null, `Prompt guard scanForSecrets missed sample '${label}': ${text}`);
+  }
+});

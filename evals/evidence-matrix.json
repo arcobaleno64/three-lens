@@ -3,7 +3,7 @@
   "schemaVersion": "1.0.0",
   "generatedAt": "2026-09-24T15:36:38.661Z",
   "targetSystem": "@arcobaleno64/agy-security-audit",
-  "version": "1.13.0",
+  "version": "1.14.0",
   "governance": {
     "standard": "NIST SSDF (SP 800-218) / Default-Deny Authority Invariant",
     "covenant": "Section 21 Holdout Covenant & v1.6.1 Evidence Integrity Correction",
@@ -38,7 +38,7 @@
         },
         {
           "path": "skills/3lens/tool-integrity-manifest.json",
-          "sha256": "693e29a08b16010134561b3d12f2f1959bf7d430364957d3db3364603457cf42",
+          "sha256": "cd82dfa25ed78e4e1d366233e1ba116c5c5cf8535df86e92a31b5b1214cbcc90",
           "description": "Cryptographic TCB integrity manifest pinning critical script hashes"
         },
         {

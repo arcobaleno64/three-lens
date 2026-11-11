@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/security-audit/permissions-profile.schema.json",
   "schemaVersion": "1.0.0",
   "profileName": "recommended-security-audit-permissions",
-  "version": "1.13.0",
+  "version": "1.14.0",
   "description": "Recommended role-based permissions profile and sandbox boundaries for AGY Security Audit under Default-Deny.",
   "defenseInDepth": {
     "layer1_terminal_sandbox": {
